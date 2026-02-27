@@ -73,7 +73,6 @@ Thumbs.db
 # Project specific
 *.log
 logs/
-data/
 
 # Node.js / Frontend
 node_modules/

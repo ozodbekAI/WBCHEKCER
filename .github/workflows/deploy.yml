@@ -13,7 +13,7 @@ jobs:
     env:
       USER: root
       SERVER_IP: 195.133.66.192
-      SERVER_DIR: /var/www/WBCHECKER
+      SERVER_DIR: /var/www/WBCHEKCER
       PORT: 8000
 
     steps:
@@ -34,9 +34,8 @@ jobs:
           rsync -avz --delete \
             --exclude '.env' \
             --exclude 'venv/' \
-            --exclude 'backend/.env' \
-            --exclude 'backend/media' \
-            --exclude 'backend/data' \
+            --exclude 'data/' \
+            --exclude 'media/' \
             --exclude 'frontend/.env' \
             ./ ${{ env.USER }}@${{ env.SERVER_IP }}:${{ env.SERVER_DIR }}
 
@@ -44,7 +43,7 @@ jobs:
         run: |
           ssh ${{ env.USER }}@${{ env.SERVER_IP }} << "EOF"
             set -e
-            cd ${{ env.SERVER_DIR }}/backend
+            cd ${{ env.SERVER_DIR }}
 
             echo ">>> [BACKEND] Venv tekshirilmoqda..."
             if [ ! -d "venv" ]; then
@@ -68,7 +67,7 @@ jobs:
             systemctl status wb-optimizer --no-pager || true
           EOF
 
-      - name: Frontend - build & restart service
+      - name: Frontend - install deps & build
         run: |
           ssh ${{ env.USER }}@${{ env.SERVER_IP }} << "EOF"
             set -e

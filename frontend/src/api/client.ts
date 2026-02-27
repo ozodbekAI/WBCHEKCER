@@ -58,10 +58,22 @@ class ApiClient {
     });
 
     if (res.status === 401) {
-      this.setToken(null);
-      localStorage.removeItem('refresh_token');
-      window.location.href = '/login';
-      throw new Error('Unauthorized');
+      const isAuthEndpoint =
+        path === '/auth/login' ||
+        path === '/auth/register' ||
+        path.startsWith('/auth/accept-invite/');
+
+      const err = await res.json().catch(() => ({ detail: 'Unauthorized' }));
+
+      if (!isAuthEndpoint) {
+        this.setToken(null);
+        localStorage.removeItem('refresh_token');
+        if (window.location.pathname !== '/login') {
+          window.location.href = '/login';
+        }
+      }
+
+      throw new Error(err.detail || 'Unauthorized');
     }
 
     if (!res.ok) {
