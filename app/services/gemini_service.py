@@ -1,0 +1,739 @@
+"""
+Gemini AI Service for card analysis
+Provides AI-powered validation and suggestions
+"""
+from __future__ import annotations
+
+import base64
+import json
+import mimetypes
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+
+from ..core.config import settings
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove code fences from response"""
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _extract_json(text: str) -> Dict[str, Any]:
+    """Extract JSON from text response — always returns a dict"""
+    text = _strip_code_fences(text)
+
+    def _ensure_dict(val):
+        """Wrap non-dict JSON values so callers always get a dict"""
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, list):
+            # Gemini sometimes returns [{...}] or [{"errors": ...}]
+            if len(val) == 1 and isinstance(val[0], dict):
+                return val[0]
+            return {"items": val}
+        return {}
+
+    try:
+        return _ensure_dict(json.loads(text))
+    except Exception:
+        pass
+
+    # Try to find JSON object in text
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return _ensure_dict(json.loads(text[start:end + 1]))
+        except Exception:
+            pass
+
+    # Try to find JSON array in text
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return _ensure_dict(json.loads(text[start:end + 1]))
+        except Exception:
+            pass
+
+    return {}
+
+
+def _guess_mime(p: str) -> str:
+    """Guess MIME type from path"""
+    p = (p or "").lower()
+    if p.endswith(".webp"):
+        return "image/webp"
+    if p.endswith(".png"):
+        return "image/png"
+    if p.endswith(".jpg") or p.endswith(".jpeg"):
+        return "image/jpeg"
+    mt, _ = mimetypes.guess_type(p)
+    return mt or "application/octet-stream"
+
+
+def _download_bytes(url: str, timeout: float = 30.0) -> bytes:
+    """Download bytes from URL"""
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        return r.content
+
+
+def _load_image_b64(image: str) -> Tuple[Optional[str], Optional[str]]:
+    """Load image as base64"""
+    if not image:
+        return None, None
+    try:
+        if image.startswith("http://") or image.startswith("https://"):
+            data = _download_bytes(image)
+            mime = _guess_mime(image)
+            return base64.b64encode(data).decode(), mime
+        # Local file
+        with open(image, "rb") as f:
+            data = f.read()
+        mime = _guess_mime(image)
+        return base64.b64encode(data).decode(), mime
+    except Exception:
+        return None, None
+
+
+def _get_card_photo(card: Dict[str, Any]) -> Optional[str]:
+    """Get first big photo from card"""
+    photos = card.get("photos") or []
+    if not photos:
+        return None
+    
+    p0 = photos[0]
+    if isinstance(p0, dict):
+        return p0.get("big") or p0.get("url")
+    if isinstance(p0, str):
+        return p0
+    return None
+
+
+class GeminiService:
+    """Gemini AI service for card analysis"""
+    
+    def __init__(self):
+        self.api_key = settings.GEMINI_API_KEY
+        self.model = settings.GEMINI_MODEL
+        self.max_output_tokens = settings.GEMINI_MAX_OUTPUT_TOKENS
+        self.temperature = settings.GEMINI_TEMPERATURE
+    
+    def is_enabled(self) -> bool:
+        """Check if AI is enabled and configured"""
+        return bool(self.api_key and settings.AI_ENABLED)
+    
+    def _call_api(
+        self, 
+        prompt: str, 
+        image_url: Optional[str] = None,
+        retry_count: int = 0,
+        max_retries: int = 3
+    ) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """Call Gemini API with JSON response and retry logic.
+        Returns (result_dict, token_usage) where token_usage =
+        {prompt_tokens, completion_tokens, total_tokens}
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+
+        if not self.api_key:
+            return {}, _empty_tokens
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        params = {"key": self.api_key}
+        
+        parts: List[Dict[str, Any]] = [{"text": prompt}]
+        
+        # Add image if provided
+        if image_url:
+            img_b64, mime = _load_image_b64(image_url)
+            if img_b64 and mime:
+                parts.insert(0, {
+                    "inline_data": {"mime_type": mime, "data": img_b64}
+                })
+        
+        payload = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "temperature": self.temperature,
+                "maxOutputTokens": self.max_output_tokens,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {
+                    "thinkingBudget": 2048,
+                },
+            },
+        }
+        
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(url, params=params, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as e:
+            # Handle 503 Service Unavailable
+            if e.response.status_code == 503:
+                if retry_count < max_retries:
+                    # Exponential backoff: 2^retry seconds
+                    wait_time = 2 ** retry_count
+                    print(f"Gemini API 503 error. Retry {retry_count + 1}/{max_retries} after {wait_time}s...")
+                    time.sleep(wait_time)
+                    return self._call_api(prompt, image_url, retry_count + 1, max_retries)
+                else:
+                    print(f"Gemini API 503 error after {max_retries} retries. Skipping AI...")
+                    return {}, _empty_tokens
+            else:
+                print(f"Gemini API HTTP error {e.response.status_code}: {e}")
+                return {}, _empty_tokens
+        except Exception as e:
+            print(f"Gemini API error: {e}")
+            return {}, _empty_tokens
+        
+        # Extract token usage from response
+        usage_meta = data.get("usageMetadata") or {}
+        tokens = {
+            "prompt_tokens": usage_meta.get("promptTokenCount", 0),
+            "completion_tokens": usage_meta.get("candidatesTokenCount", 0),
+            "thinking_tokens": usage_meta.get("thoughtsTokenCount", 0),
+            "total_tokens": usage_meta.get("totalTokenCount", 0),
+        }
+
+        # Extract text from response (skip thinking parts — gemini-2.5 returns them first)
+        try:
+            parts = data["candidates"][0]["content"]["parts"]
+            text = None
+            for part in parts:
+                if not part.get("thought", False) and "text" in part:
+                    text = part["text"]
+                    break
+        except (KeyError, IndexError):
+            return {}, tokens
+        
+        result = _extract_json(text) if text else {}
+        return result, tokens
+    
+    def audit_card(self, card: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """
+        AI audit of card - finds issues by analyzing photo + card data.
+        Returns (issues_list, token_usage).
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+        if not self.is_enabled():
+            return [], _empty_tokens
+
+        subject_name = card.get("subjectName") or card.get("subject_name") or ""
+        subject_id = card.get("subjectID") or card.get("subject_id") or ""
+
+        # Build compact card — only what AI needs
+        compact: Dict[str, Any] = {
+            "subjectID": subject_id,
+            "subjectName": subject_name,
+            "vendorCode": card.get("vendorCode") or card.get("vendor_code"),
+            "brand": card.get("brand"),
+            "title": card.get("title"),
+        }
+        # Truncate long description
+        desc = card.get("description") or ""
+        compact["description"] = desc[:1500] if len(desc) > 1500 else desc
+
+        # Build characteristics — flatten for prompt
+        chars_raw = card.get("characteristics") or []
+        if isinstance(chars_raw, list):
+            char_list = []
+            for ch in chars_raw:
+                name = ch.get("name", "")
+                val = ch.get("value", ch.get("values"))
+                cid = ch.get("id")
+                char_list.append({"id": cid, "name": name, "value": val})
+        elif isinstance(chars_raw, dict):
+            char_list = [{"name": k, "value": v} for k, v in chars_raw.items()]
+        else:
+            char_list = []
+        compact["characteristics"] = char_list
+
+        # Include valid characteristic names for this category
+        valid_char_names = card.get("_valid_char_names") or []
+        valid_chars_section = ""
+        if valid_char_names:
+            valid_chars_section = f"""
+ДОПУСТИМЫЕ ХАРАКТЕРИСТИКИ ДЛЯ КАТЕГОРИИ "{subject_name}":
+{json.dumps(valid_char_names, ensure_ascii=False)}
+Если в карточке есть характеристики НЕ из этого списка и они заполнены — это ошибка.
+"""
+
+        prompt = f"""
+РОЛЬ: Ты — старший модератор-аудитор маркетплейса Wildberries.
+
+ЗАДАЧА: Проанализируй фото товара и JSON-карточку. Найди РЕАЛЬНЫЕ ошибки
+и несоответствия. Не выдумывай — если не уверен, ставь severity="warning".
+
+КАТЕГОРИЯ ТОВАРА: "{subject_name}" (subjectID={subject_id})
+{valid_chars_section}
+ЧТО ПРОВЕРЯТЬ:
+1. ФОТО ↔ ХАРАКТЕРИСТИКИ
+   - Цвет на фото совпадает с характеристикой «Цвет»?
+   - Тип изделия на фото = категория?
+   - Комплектность: кол-во предметов на фото = «Комплектация»?
+   - Фасон/модель на фото = характеристики (рукав, длина, застежка)?
+
+2. КАТЕГОРИЯ ↔ ТЕКСТ
+   - Название/описание соответствуют категории "{subject_name}"?
+   - Нет ли упоминания другого типа товара, пола, возраста?
+
+3. ТЕКСТ ↔ ХАРАКТЕРИСТИКИ
+   - Описание не противоречит характеристикам?
+   - Нет обрезанных/неполных значений (напр. "ж" вместо "жакет")?
+   - Нет логических конфликтов (напр. "без рисунка" и "в полоску")?
+
+4. ХАРАКТЕРИСТИКИ ↔ КАТЕГОРИЯ
+   - Есть ли заполненные характеристики, которых НЕТ в списке допустимых выше?
+   - Если да — fix_action: "clear" для каждой такой характеристики
+
+5. АРТИКУЛ / VENDORCODE
+   - Если в артикуле указан цвет — совпадает с «Цвет»?
+
+CARD JSON:
+{json.dumps(compact, ensure_ascii=False)[:4000]}
+
+ФОРМАТ ОТВЕТА — строго JSON, без markdown:
+{{
+  "errors": [
+    {{
+      "charcId": <int id характеристики или null>,
+      "name": "<название характеристики или поля>",
+      "value": <текущее значение>,
+      "message": "<краткое описание проблемы, 1-2 предложения>",
+      "severity": "critical|error|warning",
+      "category": "photo|text|identification|qualification|mixed",
+      "fix_action": "replace|clear|swap|compound",
+      "swap_to_name": "<название ПРАВИЛЬНОЙ характеристики, если fix_action=swap>",
+      "swap_to_value": "<значение для правильной характеристики, если fix_action=swap>",
+      "compound_fixes": [
+        {{
+          "name": "<название поля>",
+          "charcId": <int или null>,
+          "action": "replace|set|clear",
+          "value": "<новое значение или null для clear>"
+        }}
+      ],
+      "errors": [
+        {{
+          "type": "vision_mismatch|category_mismatch|text_mismatch|contradiction|other",
+          "message": "<подробное объяснение>"
+        }}
+      ]
+    }}
+  ]
+}}
+
+ПРАВИЛА fix_action:
+• "replace" — текущее значение неправильное, нужно заменить (цвет, фасон и т.д.)
+• "clear" — характеристика не применима к товару, нужно очистить
+• "swap" — характеристика заполнена НЕ для того типа товара (1 поле ↔ 1 поле).
+  Пример: на фото брюки, но заполнена «Модель юбки» = «карандаш».
+    - fix_action: "swap", name: "Модель юбки", value: "карандаш"
+    - swap_to_name: "Модель брюк", swap_to_value: "широкие"
+• "compound" — несоответствие затрагивает 2+ полей одновременно.
+  Пример: на фото костюм (пиджак + брюки), но:
+    - «Тип низа» = «юбка» (неверно)
+    - «Модель юбки» = «карандаш» (должно быть пусто)
+    - «Модель брюк» = пусто (должно быть заполнено)
+  В этом случае:
+    - fix_action: "compound"
+    - name: "Тип низа" (главное ошибочное поле)
+    - value: "юбка" (текущее значение)
+    - compound_fixes: [
+        {{"name": "Тип низа", "charcId": <id или null>, "action": "replace", "value": "брюки"}},
+        {{"name": "Модель юбки", "charcId": <id или null>, "action": "clear", "value": null}},
+        {{"name": "Модель брюк", "charcId": <id или null>, "action": "set", "value": "карандаш"}}
+      ]
+  Используй "compound" ТОЛЬКО когда исправление ОДНОГО поля недостаточно — нужно изменить 2+ полей.
+
+Если ошибок нет — верни: {{"errors": []}}
+""".strip()
+
+        image_url = _get_card_photo(card)
+        result, tokens = self._call_api(prompt, image_url)
+
+        if isinstance(result, list):
+            return result, tokens
+        if isinstance(result, dict):
+            errors = result.get("errors") or result.get("items")
+            if isinstance(errors, list):
+                return errors, tokens
+        return [], tokens
+    
+    def generate_fixes(
+        self,
+        card: Dict[str, Any],
+        issues: List[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+        """
+        Generate fix suggestions for a batch of issues.
+        Returns (fixes_dict, token_usage).
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+        if not self.is_enabled() or not issues:
+            return {}, _empty_tokens
+
+        # ── Build issues payload ──
+        issues_data = []
+        for issue in issues:
+            av = issue.get("allowed_values") or []
+            entry: Dict[str, Any] = {
+                "id": issue.get("id"),
+                "name": issue.get("name"),
+                "current_value": issue.get("value") or issue.get("current_value"),
+                "error_type": issue.get("error_type") or issue.get("category"),
+                "message": issue.get("message"),
+            }
+            # Include description for AI-detected issues (contradictions)
+            if issue.get("description"):
+                entry["description"] = issue["description"]
+            # Only include allowed_values/limits when they exist
+            if av:
+                entry["allowed_values"] = av[:60]
+            for err in (issue.get("errors") or []):
+                if err.get("type") == "limit":
+                    entry["min_limit"] = err.get("min")
+                    entry["max_limit"] = err.get("max")
+            issues_data.append(entry)
+
+        # ── Compact card context ──
+        subject = card.get("subjectName") or card.get("subject_name") or ""
+        desc = card.get("description") or ""
+        compact_card = {
+            "title": card.get("title"),
+            "brand": card.get("brand"),
+            "subjectName": subject,
+            "description": desc[:800] if len(desc) > 800 else desc,
+        }
+        # Add current characteristics for context
+        chars_raw = card.get("characteristics") or []
+        if isinstance(chars_raw, list):
+            compact_card["characteristics"] = [
+                {"name": ch.get("name"), "value": ch.get("value", ch.get("values"))}
+                for ch in chars_raw[:30]
+            ]
+
+        prompt = f"""
+РОЛЬ: Ты — SEO-эксперт и копирайтер Wildberries с 5-летним опытом.
+
+ЗАДАЧА: Для каждой проблемы из списка создай ГОТОВОЕ ИСПРАВЛЕНИЕ.
+У каждой проблемы ОБЯЗАТЕЛЬНО должен быть recommended_value с КОНКРЕТНЫМ готовым значением.
+
+КАРТОЧКА ТОВАРА:
+{json.dumps(compact_card, ensure_ascii=False)[:3500]}
+
+СПИСОК ПРОБЛЕМ:
+{json.dumps(issues_data, ensure_ascii=False)[:5000]}
+
+═══ ПРАВИЛА ДЛЯ ХАРАКТЕРИСТИК ═══
+• Если в проблеме есть "allowed_values" → выбирай СТРОГО из этого списка.
+  КОПИРУЙ значения ТОЧНО как написано (с тем же регистром, пробелами).
+  НЕ придумывай свои значения. Это справочник Wildberries.
+• Если есть min_limit/max_limit → верни массив ТОЧНОЙ длины (между min и max).
+• Если allowed_values нет → предложи конкретное логичное значение для категории "{subject}".
+• Выбирай самые релевантные значения для КОНКРЕТНОГО товара.
+• ВСЕГДА возвращай готовое значение, которое можно сразу использовать.
+
+═══ ПРАВИЛА ДЛЯ AI-ОБНАРУЖЕННЫХ ПРОБЛЕМ (error_type начинается с "ai_") ═══
+• Это противоречия и несоответствия, обнаруженные при аудите фото и текста.
+• В поле "description" указано подробное описание проблемы.
+• В "current_value" — текущее НЕВЕРНОЕ значение характеристики.
+• Ты ОБЯЗАН вернуть КОНКРЕТНОЕ ПРАВИЛЬНОЕ значение в recommended_value.
+• ЗАПРЕЩЕНО писать абстрактные советы: «Исправьте», «Проверьте», «Измените на...».
+• ЗАПРЕЩЕНО возвращать пустую строку, null, или "".
+• ОБЯЗАТЕЛЬНО: recommended_value должно быть ГОТОВЫМ значением для вставки в карточку.
+
+• SWAP-ПРОБЛЕМЫ (когда характеристика от ДРУГОГО типа товара):
+  Если в description упоминается, что характеристика не применима к товару на фото
+  (например: фото брюк, но заполнена «Модель юбки»), тогда:
+  - recommended_value: "" (пустая строка — очистить поле)
+  - fix_action: "swap"
+  - swap_to_name: "<правильная характеристика>" (например "Модель брюк")
+  - swap_to_value: "<значение>" (например "широкие")
+  - reason: "На фото изображены брюки, характеристика 'Модель юбки' не применима. Нужно заполнить 'Модель брюк'."
+  Это значит: УДАЛИТЬ значение из неверной характеристики И предложить заполнить правильную.
+
+• Примеры ПРАВИЛЬНЫХ ответов:
+  - Покрой на фото свободный, но в характеристике «приталенный»
+    → recommended_value: "свободный", fix_action: "replace"
+  - Фото показывает цветочный принт, но в характеристике «без рисунка»
+    → recommended_value: "цветочный принт", fix_action: "replace"
+  - На товаре нет декора (тесьмы), но в характеристике указано «тесьма»
+    → recommended_value: "без отделки", fix_action: "replace"
+  - Цвет на фото бежевый, но в характеристике «черный»
+    → recommended_value: "бежевый", fix_action: "replace"
+  - На фото брюки, но заполнена «Модель юбки» = «карандаш»
+    → recommended_value: "", fix_action: "swap", swap_to_name: "Модель брюк", swap_to_value: "широкие"
+  - На фото жакет, но заполнена «Длина юбки» = «миди»
+    → recommended_value: "", fix_action: "swap", swap_to_name: "Длина рукава", swap_to_value: "длинный"
+
+• Если есть allowed_values для этой характеристики — выбирай ТОЛЬКО из них (точное совпадение).
+• Если нет allowed_values — предложи подходящее значение на основе ФОТО и описания.
+• В reason — объясни ПОЧЕМУ выбрано именно это значение (что видно на фото / в тексте).
+
+═══ ПРАВИЛА ДЛЯ НАЗВАНИЯ (error_type содержит "title") ═══
+• В recommended_value верни ПОЛНОЕ НОВОЕ ГОТОВОЕ НАЗВАНИЕ (40-100 символов).
+• НЕ пиши советы типа «Улучшите название» — дай КОНКРЕТНОЕ название целиком.
+• Структура: [Тип товара] [женский/мужской/детский] [ключевая особенность]
+  [фасон/модель] [назначение-прилагательное]
+• СТРОГО ЗАПРЕЩЕНО включать:
+  ❌ Бренд (он подставляется отдельно)
+  ❌ Цвет (черный, белый, зеленый и т.д.) — только в характеристиках
+  ❌ «для + существительное» → используй прилагательные:
+     НЕЛЬЗЯ: «для офиса» → НУЖНО: «офисный»
+     НЕЛЬЗЯ: «для праздника» → НУЖНО: «праздничный»
+     НЕЛЬЗЯ: «для прогулки» → НУЖНО: «повседневный»
+• Используй высокочастотные SEO-запросы Wildberries.
+• Примеры ПРАВИЛЬНЫХ ответов:
+  ✓ recommended_value: "Костюм женский деловой брючный с удлинённым жакетом офисный классический"
+  ✓ recommended_value: "Платье вечернее длинное с разрезом нарядное коктейльное"
+  ✓ recommended_value: "Куртка мужская зимняя с капюшоном пуховик тёплая спортивная"
+• НЕ давай альтернативы — ОДИН лучший готовый вариант.
+
+═══ ПРАВИЛА ДЛЯ ОПИСАНИЯ (error_type содержит "description") ═══
+• В recommended_value верни ПОЛНОЕ НОВОЕ ГОТОВОЕ описание (800-1200 символов).
+• СТРОГО ЗАПРЕЩЕНО писать советы: ❌ «Расширьте описание», ❌ «Добавьте детали».
+• ОБЯЗАТЕЛЬНО дай ЦЕЛЫЙ готовый текст, который можно сразу копировать в карточку.
+• Структура абзацами (обязательные части):
+  1) Вступление (2-3 предложения) — что за товар, главное преимущество
+  2) Детали (3-4 предложения) — крой, посадка, силуэт, особенности, конструкция
+  3) Материал (2-3 предложения) — состав, свойства ткани, тактильные ощущения, комфорт
+  4) Использование (2-3 предложения) — офис/прогулка/праздник, с чем сочетать, образы
+  5) Уход (1-2 предложения) — стирка, глажка, хранение
+• Пиши живым продающим языком, не шаблонно. Без восклицательных знаков.
+• ЕСТЕСТВЕННО вплети ВСЕ ключевые слова из названия товара в текст.
+• Если текущее описание есть — используй его как основу, дополни и улучши.
+• Если описания нет — создай полностью новое на основе характеристик и фото.
+
+═══ ПРАВИЛА ДЛЯ SEO (error_type = "seo_keywords_missing") ═══
+• Ключевые слова из названия отсутствуют в описании.
+• В recommended_value верни ПОЛНОЕ НОВОЕ переписанное описание (800-1200 символов),
+  в которое естественно вплетены ВСЕ ключевые слова из названия товара.
+• ОБЯЗАТЕЛЬНО используй текущее описание как основу и ДОБАВЬ в него недостающие SEO-слова.
+• НЕ пиши "Добавьте слова: ..." — дай ГОТОВЫЙ ПОЛНЫЙ текст описания.
+• Текст должен быть цельным, естественным, без повторов.
+• В reason — укажи какие конкретно ключевые слова были добавлены в текст.
+
+═══ ПРАВИЛА ДЛЯ СОСТАВА (error_type = "composition_mismatch") ═══
+• Состав в описании и характеристиках не совпадает.
+• В recommended_value верни ТОЧНЫЙ ПОЛНЫЙ правильный состав с процентами.
+• Примеры ПРАВИЛЬНЫХ ответов:
+  ✓ recommended_value: "95% хлопок, 5% эластан"
+  ✓ recommended_value: "100% полиэстер"
+  ✓ recommended_value: "70% шерсть, 25% полиамид, 5% эластан"
+• ЗАПРЕЩЕНО: ❌ «Исправьте состав на правильный», ❌ «Укажите точный состав».
+• Основывайся на:
+  1) Характеристиках товара (приоритет)
+  2) Описании товара
+  3) Типичном составе для данной категории
+• В reason — укажи какое именно несоответствие: «В характеристиках 95% хлопок, но в описании указан полиэстер».
+
+═══ ПРАВИЛА ДЛЯ ОБЯЗАТЕЛЬНЫХ ХАРАКТЕРИСТИК (error_type = "missing_required_chars") ═══
+• Не заполнены обязательные характеристики для фильтров WB.
+• В recommended_value верни СТРОКУ с перечислением характеристик И их значений.
+• Формат: "Характеристика: значение; Характеристика: значение"
+• Примеры ПРАВИЛЬНЫХ ответов:
+  ✓ recommended_value: "Состав: 95% хлопок, 5% эластан; Цвет: бежевый; Размер: 42-44; Сезон: демисезон"
+  ✓ recommended_value: "Материал верха: натуральная кожа; Материал подкладки: текстиль; Тип застежки: молния"
+• ЗАПРЕЩЕНО: ❌ «Заполните: Состав, Цвет, Размер» (без значений)
+• Определи значения на основе:
+  1) Фото товара (цвет, тип, материал)
+  2) Описания товара
+  3) Других заполненных характеристик
+  4) Категории товара (типичные значения)
+• В reason — укажи почему эти характеристики критичны: «Без этих характеристик товар не попадёт в фильтры поиска по цвету и составу».
+
+═══ ПРАВИЛА ДЛЯ КАТЕГОРИИ (error_type = "wrong_category") ═══
+• Товар размещён в неправильной категории WB.
+• В recommended_value верни ТОЧНОЕ НАЗВАНИЕ правильной категории.
+• Примеры ПРАВИЛЬНЫХ ответов:
+  ✓ recommended_value: "Женская одежда / Платья / Вечерние платья"
+  ✓ recommended_value: "Обувь / Женская обувь / Сапоги"
+  ✓ recommended_value: "Аксессуары / Сумки / Женские сумки"
+• ЗАПРЕЩЕНО: ❌ «Переместите в правильную категорию», ❌ «Проверьте категорию».
+• Определи правильную категорию по:
+  1) Фото товара
+  2) Названию и описанию
+  3) Характеристикам
+• В reason — объясни почему: «На фото видно платье, но товар находится в категории Юбки. Это снижает показы на 80%.»
+
+═══ ОБЩИЕ ПРАВИЛА (КРИТИЧЕСКИ ВАЖНО!) ═══
+• КАЖДАЯ проблема БЕЗ ИСКЛЮЧЕНИЙ должна получить recommended_value.
+• recommended_value — это ГОТОВОЕ ЗНАЧЕНИЕ для немедленного использования.
+• СТРОГО ЗАПРЕЩЕНО писать рекомендации/советы вместо значений:
+  ❌ "Расширьте описание до 1000 символов"
+  ❌ "Добавьте ключевые слова"
+  ❌ "Исправьте на правильное значение"
+  ❌ "Проверьте соответствие"
+  ❌ "Укажите точный состав"
+• ОБЯЗАТЕЛЬНО давать ГОТОВОЕ значение:
+  ✓ Для текста — ПОЛНЫЙ новый текст (не инструкция, а сам текст)
+  ✓ Для характеристики — конкретное значение или массив значений
+  ✓ Для состава — "95% хлопок, 5% эластан" (не "исправьте состав")
+• В reason — кратко объясни ПОЧЕМУ выбрано именно это значение.
+
+ФОРМАТ ОТВЕТА — строго JSON:
+{{
+  "fixes": {{
+    "<id проблемы>": {{
+      "recommended_value": "<string или array>",
+      "reason": "<почему именно это значение>",
+      "fix_action": "replace|clear|swap",
+      "swap_to_name": "<название правильной характеристики, только если fix_action=swap>",
+      "swap_to_value": "<значение для правильной характеристики, только если fix_action=swap>"
+    }}
+  }}
+}}
+""".strip()
+
+        image_url = _get_card_photo(card)
+        result, tokens = self._call_api(prompt, image_url)
+
+        if isinstance(result, dict):
+            return result.get("fixes", {}), tokens
+        return {}, tokens
+    
+    def refix_value(
+        self,
+        card: Dict[str, Any],
+        char_name: str,
+        current_value: Any,
+        failed_reason: str,
+        allowed_values: List[str],
+        limits: Optional[Dict] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """
+        Re-generate fix when previous AI fix didn't pass allowed_values/limits validation.
+        Returns (result_dict, token_usage).
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+        if not self.is_enabled():
+            return {}, _empty_tokens
+        
+        subject = card.get("subjectName") or card.get("subject_name") or ""
+        limit_hint = ""
+        if limits:
+            mn = limits.get("min")
+            mx = limits.get("max")
+            if mn is not None or mx is not None:
+                limit_hint = f"\nЛимит: от {mn} до {mx} значений. Верни массив правильной длины."
+
+        prompt = f"""
+ЗАДАЧА: Подобрать правильное значение для характеристики товара на Wildberries.
+
+Товар: "{card.get('title')}" (категория: {subject})
+Характеристика: "{char_name}"
+Текущее значение: {json.dumps(current_value, ensure_ascii=False)}
+Предыдущая попытка не прошла проверку: {failed_reason}
+
+ДОПУСТИМЫЕ ЗНАЧЕНИЯ (выбирай ТОЛЬКО из этого списка!):
+{json.dumps(allowed_values[:80], ensure_ascii=False)}
+{limit_hint}
+
+ВАЖНО:
+• Значение ДОЛЖНО быть ТОЧНО из списка допустимых — без изменений регистра,
+  окончаний, пробелов. Копируй точно как написано в списке.
+• Выбирай наиболее подходящее для данного товара.
+• Если нужно несколько значений — верни массив.
+
+Ответ строго JSON:
+{{
+  "recommended_value": "<string или array — ТОЧНО из списка>",
+  "reason": "<почему именно это>"
+}}
+""".strip()
+        
+        result, tokens = self._call_api(prompt)
+        return (result if isinstance(result, dict) else {}), tokens
+    
+    def refix_title(
+        self,
+        card: Dict[str, Any],
+        current_title: str,
+        failed_reason: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """
+        Re-generate title when previous AI suggestion failed validation.
+        Returns (result_dict, token_usage).
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+        if not self.is_enabled():
+            return {}, _empty_tokens
+
+        subject = card.get("subjectName") or card.get("subject_name") or ""
+        brand = card.get("brand") or ""
+
+        # Build characteristics context for better title
+        chars_raw = card.get("characteristics") or []
+        char_hints = []
+        if isinstance(chars_raw, list):
+            for ch in chars_raw[:15]:
+                nm = ch.get("name", "")
+                vl = ch.get("value", ch.get("values"))
+                if nm and vl:
+                    char_hints.append(f"{nm}: {vl}")
+        chars_text = "\n".join(char_hints) if char_hints else "нет данных"
+
+        prompt = f"""
+ЗАДАЧА: Исправь название товара для Wildberries.
+
+Категория: "{subject}"
+Бренд (НЕ включать!): "{brand}"
+Текущее предложение: "{current_title}"
+Причина отказа: {failed_reason}
+
+Характеристики товара:
+{chars_text}
+
+СТРОГИЕ ПРАВИЛА:
+• Длина: 40–100 символов
+• ЗАПРЕЩЕНО включать бренд "{brand}" — он подставляется автоматически
+• ЗАПРЕЩЕНО включать цвет (черный, белый, зеленый и т.д.) —
+  цвет указывается отдельно в характеристиках, НЕ в названии
+• ЗАПРЕЩЕНО использовать «для + существительное» — пиши прилагательными:
+  НЕЛЬЗЯ: «для офиса» → НУЖНО: «офисный»
+  НЕЛЬЗЯ: «для праздника» → НУЖНО: «праздничный»
+  НЕЛЬЗЯ: «для прогулки» → НУЖНО: «повседневный»
+• Структура: [Тип товара] [пол] [фасон/модель] [особенность] [назначение]
+• Верни ОДИН лучший вариант
+
+Ответ строго JSON:
+{{
+  "recommended_value": "<исправленное название>",
+  "reason": "<что исправлено>"
+}}
+""".strip()
+
+        image_url = _get_card_photo(card)
+        result, tokens = self._call_api(prompt, image_url)
+        return (result if isinstance(result, dict) else {}), tokens
+
+    def get_suggestions(
+        self, 
+        card: Dict[str, Any], 
+        issues: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+        """Legacy method — delegates to generate_fixes"""
+        return self.generate_fixes(card, issues)
+
+
+# Singleton instance
+_gemini_service: Optional[GeminiService] = None
+
+
+def get_gemini_service() -> GeminiService:
+    """Get Gemini service instance"""
+    global _gemini_service
+    if _gemini_service is None:
+        _gemini_service = GeminiService()
+    return _gemini_service
