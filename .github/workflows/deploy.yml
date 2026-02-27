@@ -1,0 +1,87 @@
+name: Deploy to VPS Server on Push
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    if: ${{ contains(github.event.head_commit.message, '[deploy]') }}
+    runs-on: ubuntu-latest
+
+    env:
+      USER: root
+      SERVER_IP: 195.133.66.192
+      SERVER_DIR: /var/www/WBCHECKER
+      PORT: 8000
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.5.3
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known_hosts
+        run: ssh-keyscan -H ${{ env.SERVER_IP }} >> ~/.ssh/known_hosts
+
+      - name: Ensure directory exists and sync files
+        run: |
+          ssh ${{ env.USER }}@${{ env.SERVER_IP }} "mkdir -p ${{ env.SERVER_DIR }}"
+          rsync -avz --delete \
+            --exclude '.env' \
+            --exclude 'venv/' \
+            --exclude 'backend/.env' \
+            --exclude 'backend/media' \
+            --exclude 'backend/data' \
+            --exclude 'frontend/.env' \
+            ./ ${{ env.USER }}@${{ env.SERVER_IP }}:${{ env.SERVER_DIR }}
+
+      - name: Backend - install deps & restart service
+        run: |
+          ssh ${{ env.USER }}@${{ env.SERVER_IP }} << "EOF"
+            set -e
+            cd ${{ env.SERVER_DIR }}/backend
+
+            echo ">>> [BACKEND] Venv tekshirilmoqda..."
+            if [ ! -d "venv" ]; then
+              python3 -m venv venv
+            fi
+            source venv/bin/activate
+
+            if [ -f "requirements.txt" ]; then
+              echo ">>> [BACKEND] pip install -r requirements.txt"
+              pip install --upgrade pip
+              pip install -r requirements.txt
+            fi
+
+            if [ -d "alembic" ]; then
+              echo ">>> [BACKEND] alembic upgrade head"
+              alembic upgrade head || echo "Alembic xato berdi, lekin deploy davom etmoqda"
+            fi
+
+            echo ">>> [BACKEND] wb-optimizer service restart"
+            systemctl restart wb-optimizer
+            systemctl status wb-optimizer --no-pager || true
+          EOF
+
+      - name: Frontend - build & restart service
+        run: |
+          ssh ${{ env.USER }}@${{ env.SERVER_IP }} << "EOF"
+            set -e
+            cd ${{ env.SERVER_DIR }}/frontend
+
+            echo ">>> [FRONTEND] npm dependencies"
+            if [ -f "package-lock.json" ]; then
+              npm ci
+            else
+              npm install
+            fi
+
+            echo ">>> [FRONTEND] npm run build"
+            npm run build
+
+          EOF

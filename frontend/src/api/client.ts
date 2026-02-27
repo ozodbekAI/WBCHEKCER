@@ -1,4 +1,8 @@
-const API_BASE = 'http://localhost:8003';
+const DEFAULT_API_BASE = '/api';
+const RAW_API_BASE = (import.meta.env.VITE_API_BASE_URL || DEFAULT_API_BASE).trim().replace(/\/+$/, '');
+const IS_LOCALHOST_BASE = /^(https?:\/\/)?(localhost|127\.0\.0\.1)(:\d+)?$/i.test(RAW_API_BASE);
+
+const API_BASE = !import.meta.env.DEV && IS_LOCALHOST_BASE ? DEFAULT_API_BASE : RAW_API_BASE;
 
 class ApiClient {
   private token: string | null = null;
@@ -20,13 +24,17 @@ class ApiClient {
     return this.token;
   }
 
+  private buildUrl(path: string): string {
+    return new URL(`${API_BASE}${path}`, window.location.origin).toString();
+  }
+
   private async request<T>(
     method: string,
     path: string,
     body?: any,
     params?: Record<string, string | number | boolean | undefined>
   ): Promise<T> {
-    const url = new URL(`${API_BASE}${path}`, window.location.origin);
+    const url = new URL(this.buildUrl(path));
     if (params) {
       Object.entries(params).forEach(([key, val]) => {
         if (val !== undefined && val !== null) {
@@ -304,7 +312,7 @@ class ApiClient {
   }
 
   async downloadFixedTemplate(storeId: number): Promise<Blob> {
-    const resp = await fetch(`/api/stores/${storeId}/fixed-file/template`, {
+    const resp = await fetch(this.buildUrl(`/stores/${storeId}/fixed-file/template`), {
       headers: { Authorization: `Bearer ${this.token || ''}` },
     });
     if (!resp.ok) throw new Error('Template download failed');
@@ -315,7 +323,7 @@ class ApiClient {
     const form = new FormData();
     form.append('file', file);
     const url = `/stores/${storeId}/fixed-file/upload?replace_all=${replaceAll}`;
-    const resp = await fetch(`/api${url}`, {
+    const resp = await fetch(this.buildUrl(url), {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.token || ''}` },
       body: form,

@@ -1,0 +1,11 @@
+#!/bin/bash
+
+TARGET=$1
+
+if [ "$TARGET" == 'deploy' ]; then
+  echo "Triggering deploy workflow..."
+  git push origin main -o workflow-target=deploy
+else
+  echo "Usage: $0 deploy"
+  exit 1
+fi
