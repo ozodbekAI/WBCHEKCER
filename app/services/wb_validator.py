@@ -7,6 +7,7 @@ Includes per-subject characteristic metadata from charcs/ and validation/ files.
 from __future__ import annotations
 
 import json
+import math
 import zipfile
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -89,9 +90,19 @@ class DataCatalog:
         # Allowed values by characteristic name
         self.sprav_by_name: Dict[str, List[str]] = {}
 
+        # SEO keywords by subject name (category)
+        self.keywords_by_subject: Dict[str, List[str]] = {}
+
         # Color values
         self.colors_allowed: Set[str] = set()
         self.colors_allowed_list: List[str] = []
+        # Color hierarchy: parent -> shades and shade -> parent
+        self.color_parent_to_children: Dict[str, List[str]] = {}
+        self.color_value_to_parent: Dict[str, str] = {}
+        self.color_parents: List[str] = []
+        # Frequency stats from cards_raw (for better "closest shades" ordering)
+        self.color_freq: Dict[str, int] = {}
+        self.color_parent_freq: Dict[str, int] = {}
 
         # Per-subject characteristic metadata: subject_id -> list of CharMetadata
         self._charcs_cache: Dict[int, List[CharMetadata]] = {}
@@ -105,6 +116,8 @@ class DataCatalog:
         self._load_limits()
         self._load_sprav()
         self._load_colors()
+        self._load_cards_raw_color_stats()
+        self._load_keywords()
         self._scan_available_subjects()
 
     def close(self) -> None:
@@ -137,6 +150,15 @@ class DataCatalog:
                 self.limits_by_name = data
         except KeyError:
             self.limits_by_name = {}
+
+    def _load_keywords(self) -> None:
+        """Load SEO keywords by subject/category from Ключевые_слова.json"""
+        try:
+            data = self._read_json("data/Ключевые_слова.json")
+            if isinstance(data, dict):
+                self.keywords_by_subject = {k.lower(): v for k, v in data.items() if isinstance(v, list)}
+        except KeyError:
+            self.keywords_by_subject = {}
 
     def _load_sprav(self) -> None:
         """Load allowed values from справочники"""
@@ -187,15 +209,27 @@ class DataCatalog:
             return
 
         vals: List[str] = []
+        parent_to_children: Dict[str, Set[str]] = {}
+        value_to_parent: Dict[str, str] = {}
+        parents_set: Set[str] = set()
         for it in items:
             if not isinstance(it, dict):
                 continue
             nm = it.get("name")
             parent = it.get("parentName")
             if isinstance(nm, str) and nm.strip():
-                vals.append(nm.strip())
+                nm_s = nm.strip()
+                vals.append(nm_s)
+            else:
+                nm_s = ""
             if isinstance(parent, str) and parent.strip():
-                vals.append(parent.strip())
+                parent_s = parent.strip()
+                vals.append(parent_s)
+                parents_set.add(parent_s)
+                if nm_s:
+                    parent_to_children.setdefault(parent_s, set()).add(nm_s)
+                    value_to_parent[_norm(nm_s)] = parent_s
+                    value_to_parent[_norm(parent_s)] = parent_s
 
         # Dedupe
         seen = set()
@@ -210,6 +244,58 @@ class DataCatalog:
 
         self.colors_allowed = set(_norm(x) for x in out_sorted)
         self.colors_allowed_list = out_sorted
+        self.color_parent_to_children = {
+            p: sorted(children, key=lambda x: _norm(x))
+            for p, children in parent_to_children.items()
+        }
+        self.color_value_to_parent = value_to_parent
+        self.color_parents = sorted(list(parents_set), key=lambda x: _norm(x))
+
+    def _load_cards_raw_color_stats(self) -> None:
+        """Load color frequencies from cards_raw to rank closest shades inside parent groups."""
+        try:
+            cards = self._read_json("data/cards_raw.json")
+        except KeyError:
+            self.color_freq = {}
+            self.color_parent_freq = {}
+            return
+        if not isinstance(cards, list):
+            self.color_freq = {}
+            self.color_parent_freq = {}
+            return
+
+        color_freq: Dict[str, int] = {}
+        parent_freq: Dict[str, int] = {}
+
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            chars = card.get("characteristics") or []
+            if not isinstance(chars, list):
+                continue
+
+            for ch in chars:
+                if not isinstance(ch, dict):
+                    continue
+                name = str(ch.get("name") or "").strip().lower()
+                if "цвет" not in name:
+                    continue
+
+                vals = ch.get("value")
+                if vals is None:
+                    vals = ch.get("values")
+                vals_l = vals if isinstance(vals, list) else _as_list(vals)
+                for v in vals_l:
+                    if not isinstance(v, str) or not v.strip():
+                        continue
+                    c = v.strip()
+                    color_freq[c] = color_freq.get(c, 0) + 1
+                    parent = self.get_color_parent(c)
+                    if parent:
+                        parent_freq[parent] = parent_freq.get(parent, 0) + 1
+
+        self.color_freq = color_freq
+        self.color_parent_freq = parent_freq
 
     # ── Per-subject metadata ────────────────────────────
 
@@ -301,6 +387,94 @@ class DataCatalog:
         if _norm(char_name) == "цвет":
             return self.colors_allowed_list or None
         return self.sprav_by_name.get(char_name)
+
+    def get_keywords_for_subject(self, subject_name: str) -> List[str]:
+        """Get SEO keywords for a subject/category name"""
+        if not subject_name:
+            return []
+        return self.keywords_by_subject.get(subject_name.lower(), [])
+
+    def get_color_parent_names(self) -> List[str]:
+        """Return normalized parent color names (compact list for AI selection)."""
+        return list(self.color_parents)
+
+    def get_color_parent(self, value: str) -> Optional[str]:
+        """Resolve color shade/parent to parent color."""
+        if not value:
+            return None
+        nv = _norm(value)
+        parent = self.color_value_to_parent.get(nv)
+        if parent:
+            return parent
+        # Fallback: try fuzzy against known parent names
+        best_parent = find_best_match(value, self.color_parents, threshold=0.78)
+        if best_parent:
+            return best_parent
+        return None
+
+    def suggest_related_colors(
+        self,
+        selected_parent_or_color: str,
+        seed_colors: Optional[List[str]] = None,
+        total_count: int = 4,
+    ) -> List[str]:
+        """
+        Build final color palette:
+        1) select parent
+        2) return main color + closest 3/4 shades from that parent
+        """
+        parent = self.get_color_parent(selected_parent_or_color) or (selected_parent_or_color or "").strip()
+        if not parent:
+            return []
+
+        children = list(self.color_parent_to_children.get(parent, []))
+        if not children:
+            # Parent exists but no children known -> fallback to parent only
+            return [parent]
+
+        seeds = [s.strip() for s in (seed_colors or []) if isinstance(s, str) and s.strip()]
+
+        # Main color:
+        # - if selected is already a child from this parent, keep it main
+        # - otherwise choose best child by seed similarity + frequency
+        selected_norm = _norm(selected_parent_or_color or "")
+        main_color = None
+        for ch in children:
+            if _norm(ch) == selected_norm:
+                main_color = ch
+                break
+        if main_color is None:
+            scored_main: List[Tuple[float, str]] = []
+            for ch in children:
+                sim = 0.0
+                if seeds:
+                    sim = max(_similarity(ch, s) for s in seeds)
+                freq = self.color_freq.get(ch, 0)
+                score = (sim * 3.0) + (math.log1p(freq) * 0.2)
+                scored_main.append((score, ch))
+            scored_main.sort(key=lambda x: (-x[0], _norm(x[1])))
+            main_color = scored_main[0][1] if scored_main else children[0]
+
+        # Other close colors within parent
+        scored: List[Tuple[float, str]] = []
+        for ch in children:
+            if _norm(ch) == _norm(main_color):
+                continue
+            sim_to_main = _similarity(ch, main_color)
+            sim_to_seed = max((_similarity(ch, s) for s in seeds), default=0.0)
+            freq = self.color_freq.get(ch, 0)
+            score = (sim_to_main * 2.5) + (sim_to_seed * 1.5) + (math.log1p(freq) * 0.2)
+            scored.append((score, ch))
+        scored.sort(key=lambda x: (-x[0], _norm(x[1])))
+
+        n = max(3, min(int(total_count or 4), 5))
+        out = [main_color]
+        for _, ch in scored:
+            if len(out) >= n:
+                break
+            out.append(ch)
+
+        return out
 
     def is_allowed(self, char_name: str, value: str) -> bool:
         """Check if value is allowed"""
@@ -524,7 +698,11 @@ class CardValidator:
         # 2) Check allowed values
         allowed = self.catalog.get_allowed_values(char_name)
         if allowed:
-            allowed_values = allowed[:50]  # Limit for response
+            if _norm(char_name) == "цвет":
+                # For AI/UI keep compact parent-color list, not hundreds of shades.
+                allowed_values = self.catalog.get_color_parent_names()
+            else:
+                allowed_values = allowed[:50]  # Limit for response
             allowed_norm = {_norm(x) for x in allowed}
             invalid = [v for v in values if _norm(str(v)) not in allowed_norm]
             if invalid:

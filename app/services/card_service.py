@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import Card, CardIssue, IssueSeverity, IssueCategory, IssueStatus
 from ..services.analyzer import card_analyzer
 from ..services.wb_validator import validate_card_characteristics, get_catalog, find_best_match
-from ..services.gemini_service import get_gemini_service
+from ..services.gemini_service import get_gemini_service, get_ai_service
+from ..services.vision_service import vision_service
 from ..services.title_policy import validate_title
 from ..services.text_policy import validate_description
 from ..services.super_validator import super_validator_service
@@ -430,12 +431,53 @@ def _collapse_compound_overlaps(issues: List[CardIssue]) -> List[CardIssue]:
     return collapsed
 
 
+def _get_subject_keywords(card: dict) -> list:
+    """Return SEO keywords for this card's subject from the catalog."""
+    subject = (
+        card.get("subjectName")
+        or card.get("subject_name")
+        or card.get("object")
+        or ""
+    )
+    if not subject:
+        return []
+    try:
+        return get_catalog().get_keywords_for_subject(str(subject))
+    except Exception:
+        return []
+
+
+def _check_seo_keywords_in_text(text: str, keywords: list, min_count: int = 2) -> tuple:
+    """
+    Check that at least `min_count` SEO keywords appear in `text`.
+    Returns (is_valid, fail_reason_with_missing_keywords).
+    """
+    if not keywords:
+        return True, ""
+    text_lower = text.lower()
+    found = [kw for kw in keywords if kw.lower() in text_lower]
+    if len(found) >= min_count:
+        return True, ""
+    missing = [kw for kw in keywords if kw.lower() not in text_lower][:5]
+    return False, f"Отсутствуют ключевые слова категории: {', '.join(missing)}"
+
+
 def _validate_title_fix(title: str, card: dict) -> tuple:
     """
-    Validate AI-generated title against WB quality rules.
+    Validate AI-generated title against WB quality rules + SEO keywords.
     Returns (is_valid, fail_reason).
     """
-    return validate_title(title, card)
+    valid, reason = validate_title(title, card)
+    if not valid:
+        return False, reason
+
+    # Title is short (40-60 chars) — require at least 1 keyword
+    keywords = _get_subject_keywords(card)
+    kw_valid, kw_reason = _check_seo_keywords_in_text(title, keywords, min_count=1)
+    if not kw_valid:
+        return False, kw_reason
+
+    return True, ""
 
 
 async def sync_cards_from_wb(
@@ -659,8 +701,31 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 )
                 issues.append(ff_issue)
 
+    # ── STEP 2.5: Generate / load Product DNA ────────────────
+    # Photo analyzed ONCE and cached in card.product_dna.
+    # All subsequent Gemini calls use this text → no re-sending photo.
+    if use_ai and vision_service.is_enabled and raw_data:
+        if not card.product_dna:
+            photo_urls: list = []
+            media = raw_data.get("photos") or raw_data.get("mediaFiles") or []
+            if isinstance(media, list) and media:
+                first = media[0]
+                url = (first.get("big") or first.get("c516x688") or first.get("square")
+                       or first.get("url") or "") if isinstance(first, dict) else str(first)
+                if url:
+                    photo_urls.append(url)
+            if photo_urls:
+                subject_name = raw_data.get("subjectName") or raw_data.get("subject_name") or ""
+                dna_text = await vision_service.generate_product_dna_text(
+                    photo_urls[0], subject_name
+                )
+                if dna_text:
+                    card.product_dna = dna_text
+                    db.add(card)
+    product_dna: str = card.product_dna or ""
+
     # ── STEP 3: AI audit (if enabled) ────────────────────
-    gemini = get_gemini_service()
+    gemini = get_ai_service()
     if use_ai and gemini.is_enabled() and raw_data:
         # Enrich raw_data with valid characteristic names for this category
         # so AI knows which characteristics belong to this category
@@ -671,7 +736,9 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             subject_chars = catalog.get_subject_chars(int(subject_id))
             if subject_chars:
                 audit_data["_valid_char_names"] = [cm.name for cm in subject_chars]
-        ai_issues, audit_tokens = await asyncio.to_thread(gemini.audit_card, audit_data)
+        ai_issues, audit_tokens = await asyncio.to_thread(
+            gemini.audit_card, audit_data, product_dna
+        )
         _add_tokens(audit_tokens)
         
         for ai_issue in ai_issues:
@@ -807,7 +874,9 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 iss.suggested_value = None
         
         if fixable_issues:
-            suggestions, fixes_tokens = await asyncio.to_thread(gemini.generate_fixes, ai_context, fixable_issues)
+            suggestions, fixes_tokens = await asyncio.to_thread(
+                gemini.generate_fixes, ai_context, fixable_issues, product_dna
+            )
             _add_tokens(fixes_tokens)
             
             # ── STEP 5–6: Validate each fix, retry if needed ──
@@ -869,6 +938,12 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                         description_fix_valid, fail_reason = validate_description(
                             str(rec_value), ai_context
                         )
+                        if description_fix_valid:
+                            kw_valid, kw_reason = _check_seo_keywords_in_text(
+                                str(rec_value), _get_subject_keywords(ai_context), min_count=2
+                            )
+                            if not kw_valid:
+                                description_fix_valid, fail_reason = False, kw_reason
                         if not description_fix_valid:
                             for _ in range(MAX_FIX_RETRIES):
                                 refix, refix_t = await asyncio.to_thread(
@@ -885,6 +960,12 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                                 description_fix_valid, fail_reason = validate_description(
                                     str(rec_value), ai_context
                                 )
+                                if description_fix_valid:
+                                    kw_valid, kw_reason = _check_seo_keywords_in_text(
+                                        str(rec_value), _get_subject_keywords(ai_context), min_count=2
+                                    )
+                                    if not kw_valid:
+                                        description_fix_valid, fail_reason = False, kw_reason
                                 if description_fix_valid:
                                     break
 
@@ -1022,7 +1103,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                     orig_idx = retry_map[ri]
                     iss = issues[orig_idx]
                     retry_result, retry_t = await asyncio.to_thread(
-                        gemini.generate_fixes, ai_context, [retry_issue]
+                        gemini.generate_fixes, ai_context, [retry_issue], product_dna
                     )
                     _add_tokens(retry_t)
                     suggestion = retry_result.get("0", {})
@@ -1096,6 +1177,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 gen_result, gen_t = await asyncio.to_thread(
                     gemini.generate_title,
                     card=ai_context,
+                    product_dna=product_dna,
                 )
                 _add_tokens(gen_t)
                 candidate = _as_text(gen_result.get("recommended_value")) or current_title
@@ -1156,6 +1238,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             gen_result, gen_t = await asyncio.to_thread(
                 gemini.generate_description,
                 card=ai_context,
+                product_dna=product_dna,
             )
             _add_tokens(gen_t)
             candidate = _as_text(gen_result.get("recommended_value")) or current_description
@@ -1163,6 +1246,13 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             last_ai_candidate: Optional[str] = candidate if candidate else None
 
             valid, fail_reason = validate_description(str(candidate), ai_context)
+            if valid:
+                # Also check SEO keywords (description should have at least 2)
+                kw_valid, kw_reason = _check_seo_keywords_in_text(
+                    str(candidate), _get_subject_keywords(ai_context), min_count=2
+                )
+                if not kw_valid:
+                    valid, fail_reason = False, kw_reason
             if valid:
                 rec_value = candidate
             else:
@@ -1182,6 +1272,12 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                     if candidate:
                         last_ai_candidate = candidate
                     valid, fail_reason = validate_description(str(candidate), ai_context)
+                    if valid:
+                        kw_valid, kw_reason = _check_seo_keywords_in_text(
+                            str(candidate), _get_subject_keywords(ai_context), min_count=2
+                        )
+                        if not kw_valid:
+                            valid, fail_reason = False, kw_reason
                     if valid:
                         rec_value = candidate
                         break
