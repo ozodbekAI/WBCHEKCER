@@ -45,7 +45,7 @@ async def get_dashboard(
         .where(
             Card.store_id.in_(store_ids),
             CardIssue.severity == IssueSeverity.CRITICAL,
-            CardIssue.status == IssueStatus.PENDING
+            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED])
         )
     )
     critical = critical_result.scalar() or 0
@@ -57,7 +57,7 @@ async def get_dashboard(
         .where(
             Card.store_id.in_(store_ids),
             CardIssue.severity == IssueSeverity.WARNING,
-            CardIssue.status == IssueStatus.PENDING
+            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED])
         )
     )
     warnings = warnings_result.scalar() or 0
@@ -69,7 +69,7 @@ async def get_dashboard(
         .where(
             Card.store_id.in_(store_ids),
             CardIssue.severity == IssueSeverity.IMPROVEMENT,
-            CardIssue.status == IssueStatus.PENDING
+            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED])
         )
     )
     improvements = improvements_result.scalar() or 0
@@ -128,7 +128,7 @@ async def get_store_dashboard(
         from fastapi import HTTPException, status
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
     
-    # Get issue counts
+    # Get issue counts (PENDING + SKIPPED)
     critical_result = await db.execute(
         select(
             func.count(CardIssue.id).label("issues"),
@@ -138,7 +138,7 @@ async def get_store_dashboard(
         .where(
             Card.store_id == store_id,
             CardIssue.severity == IssueSeverity.CRITICAL,
-            CardIssue.status == IssueStatus.PENDING
+            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED])
         )
     )
     critical_row = critical_result.one()
@@ -152,7 +152,7 @@ async def get_store_dashboard(
         .where(
             Card.store_id == store_id,
             CardIssue.severity == IssueSeverity.WARNING,
-            CardIssue.status == IssueStatus.PENDING
+            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED])
         )
     )
     warnings_row = warnings_result.one()
@@ -170,7 +170,7 @@ async def get_store_dashboard(
         .join(CardIssue)
         .where(
             Card.store_id == store_id,
-            CardIssue.status == IssueStatus.PENDING
+            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED])
         )
     )
     cards_count = cards_with_issues.scalar() or 0
