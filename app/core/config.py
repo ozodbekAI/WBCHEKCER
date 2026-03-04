@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -39,8 +40,9 @@ class Settings(BaseSettings):
     # Analysis Settings
     ANALYSIS_BATCH_SIZE: int = 100
     MIN_TITLE_LENGTH: int = 40
-    MAX_TITLE_LENGTH: int = 120
-    MIN_DESCRIPTION_LENGTH: int = 500
+    MAX_TITLE_LENGTH: int = 60
+    MIN_DESCRIPTION_LENGTH: int = 1000
+    MAX_DESCRIPTION_LENGTH: int = 1800
     MIN_PHOTOS_COUNT: int = 3
     RECOMMENDED_PHOTOS_COUNT: int = 6
     
@@ -49,7 +51,17 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = "gemini-2.5-flash"
     GEMINI_MAX_OUTPUT_TOKENS: int = 8192
     GEMINI_TEMPERATURE: float = 0.2
+    GEMINI_AUDIT_MAX_OUTPUT_TOKENS: int = 3072
+    GEMINI_FIX_MAX_OUTPUT_TOKENS: int = 2048
+    GEMINI_REFIX_MAX_OUTPUT_TOKENS: int = 1024
+    GEMINI_THINKING_BUDGET_AUDIT: int = 512
+    GEMINI_THINKING_BUDGET_FIX: int = 128
+    GEMINI_THINKING_BUDGET_REFIX: int = 64
     AI_ENABLED: bool = True
+
+    # OpenAI Settings (GPT-4o-mini for Product DNA vision)
+    OPENAI_API_KEY: str = ""
+    OPENAI_VISION_MODEL: str = "gpt-4o-mini"
     
     # KIE AI Service
     KIE_API_KEY: str = ""
@@ -79,6 +91,19 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         extra = "ignore"
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def _parse_debug(cls, v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            vv = v.strip().lower()
+            if vv in {"1", "true", "yes", "on", "debug", "dev"}:
+                return True
+            if vv in {"0", "false", "no", "off", "release", "prod", "production"}:
+                return False
+        return False
 
 
 @lru_cache()

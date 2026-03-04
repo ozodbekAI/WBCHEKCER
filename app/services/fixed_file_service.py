@@ -347,3 +347,83 @@ def compare_card_with_fixed(
             })
 
     return mismatches
+
+
+# ─── Vision fallback ──────────────────────────────────────────────────────────
+
+async def generate_characteristics_from_photo(
+    db: AsyncSession,
+    store_id: int,
+    nm_id: int,
+    card_raw_data: dict,
+    user_id: Optional[int] = None,
+) -> dict:
+    """
+    Mahsulot fotosini GPT-4o-mini ga yuborib Product DNA generatsiya qiladi,
+    keyin xarakteristikalarni FixedFileEntry ga saqlaydi.
+
+    Returns: {
+        "generated": int,  # saqlangan xarakteristikalar soni
+        "characteristics": {char_name: value},
+        "product_dna": dict,
+    }
+    """
+    from app.services.vision_service import vision_service
+
+    if not vision_service.is_enabled:
+        return {"generated": 0, "characteristics": {}, "product_dna": {}, "error": "OPENAI_API_KEY sozlanmagan"}
+
+    # Kartochkaning birinchi fotosini olish
+    photos = card_raw_data.get("photos", [])
+    photo_url: str | None = None
+    if isinstance(photos, list):
+        for p in photos:
+            if isinstance(p, dict):
+                url = p.get("big") or p.get("c516x688") or p.get("tm")
+                if url:
+                    photo_url = url
+                    break
+            elif isinstance(p, str):
+                photo_url = p
+                break
+
+    if not photo_url:
+        return {"generated": 0, "characteristics": {}, "product_dna": {}, "error": "Foto topilmadi"}
+
+    subject_name = card_raw_data.get("subjectName") or ""
+
+    # Vision API ga yuborish
+    dna = await vision_service.analyze_photo_dna(photo_url, subject_name)
+    if not dna:
+        return {"generated": 0, "characteristics": {}, "product_dna": {}, "error": "Vision API javob bermadi"}
+
+    # Product DNA dan WB xarakteristikalarini chiqarish
+    chars = vision_service.extract_wb_characteristics(dna)
+    if not chars:
+        return {"generated": 0, "characteristics": {}, "product_dna": dna}
+
+    # brand va subject_name ni raw_data dan olish
+    brand = card_raw_data.get("brand") or ""
+
+    # FixedFileEntry larni yaratish
+    entries = [
+        {
+            "nm_id": nm_id,
+            "brand": brand,
+            "subject_name": subject_name,
+            "char_name": char_name,
+            "fixed_value": str(value),
+        }
+        for char_name, value in chars.items()
+        if value and str(value).strip()
+    ]
+
+    if entries:
+        await upsert_entries(db, store_id, entries, user_id=user_id or 0)
+
+    return {
+        "generated": len(entries),
+        "characteristics": chars,
+        "product_dna": dna,
+    }
+

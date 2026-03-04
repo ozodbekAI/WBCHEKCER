@@ -210,7 +210,63 @@ async def delete_all_fixed_entries(
     await ffs.delete_all_entries(db, store.id)
 
 
-@router.post("/recheck/{nm_id}")
+
+class GenerateFromPhotoResult(BaseModel):
+    nm_id: int
+    generated: int
+    characteristics: dict
+    message: str
+    has_openai: bool
+
+
+@router.post("/generate-from-photo/{nm_id}", response_model=GenerateFromPhotoResult)
+async def generate_fixed_from_photo(
+    nm_id: int,
+    store: Store = Depends(_get_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Mahsulot fotosini GPT-4o-mini ga yuborib Product DNA generatsiya qiladi,
+    xarakteristikalarni FixedFileEntry ga saqlaydi.
+
+    Faqat OPENAI_API_KEY sozlangan bo'lsa ishlaydi.
+    Only owner / head_manager can run.
+    """
+    _require_manage(current_user)
+
+    from ..services.card_service import get_card_by_nm_id
+    from ..services.vision_service import vision_service
+
+    card = await get_card_by_nm_id(db, nm_id, store.id)
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    if not vision_service.is_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY sozlanmagan. .env faylida OPENAI_API_KEY ni kiriting.",
+        )
+
+    result = await ffs.generate_characteristics_from_photo(
+        db=db,
+        store_id=store.id,
+        nm_id=nm_id,
+        card_raw_data=card.raw_data or {},
+        user_id=current_user.id,
+    )
+
+    if result.get("error"):
+        raise HTTPException(status_code=422, detail=result["error"])
+
+    return GenerateFromPhotoResult(
+        nm_id=nm_id,
+        generated=result["generated"],
+        characteristics=result["characteristics"],
+        message=f"Foto tahlil qilindi. {result['generated']} ta xarakteristika saqlandi.",
+        has_openai=vision_service.is_enabled,
+    )
+
 async def recheck_card_fixed(
     nm_id: int,
     store: Store = Depends(_get_store),

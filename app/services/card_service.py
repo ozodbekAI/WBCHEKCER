@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import re
 from datetime import datetime
 from typing import List, Optional
@@ -9,23 +10,424 @@ from ..models import Card, CardIssue, IssueSeverity, IssueCategory, IssueStatus
 from ..services.analyzer import card_analyzer
 from ..services.wb_validator import validate_card_characteristics, get_catalog, find_best_match
 from ..services.gemini_service import get_gemini_service
+from ..services.title_policy import validate_title
+from ..services.text_policy import validate_description
+from ..services.super_validator import super_validator_service
 from ..services import fixed_file_service as ffs
 
 # Max retries for AI fix validation loop
 MAX_FIX_RETRIES = 2
 
-# ── Title quality validation ─────────────────────────────
-_FORBIDDEN_COLORS = {
-    "черный", "белый", "красный", "синий", "зеленый", "серый", "бежевый",
-    "розовый", "голубой", "желтый", "коричневый", "фиолетовый", "оранжевый",
-    "бордовый", "бирюзовый", "сиреневый", "малиновый", "салатовый",
-    "персиковый", "лавандовый", "мятный", "хаки", "молочный", "айвори",
-    "бордо", "индиго", "марсала", "пудровый", "графитовый", "шоколадный",
-    "песочный", "кремовый", "изумрудный", "васильковый", "терракотовый",
-    "мандариновый", "горчичный", "жемчужный", "пыльно-розовый",
-}
+_TITLE_CODES = {"title_too_short", "no_title", "title_too_long", "title_policy_violation"}
+_TITLE_FIELD_PATHS = {"title"}
+_DESCRIPTION_CODES = {"no_description", "description_too_short", "description_too_long", "description_policy_violation"}
+_DESCRIPTION_FIELD_PATHS = {"description"}
 
-_TITLE_CODES = {"title_too_short", "no_title", "title_too_long"}
+_DATE_CONTEXT_WORDS = {
+    "дата", "сертификат", "сертифика", "декларац", "регистрац",
+    "срок", "действия", "годен", "годности", "expiry", "certificate",
+    "declaration", "issue date", "valid until", "validity",
+}
+_DATE_FIELD_HINTS = {"date", "дата", "certificate", "сертификат", "декларац"}
+
+
+def _clip(value: object, max_len: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_len:
+        return text
+    return text[:max_len]
+
+
+def _is_color_field(field_name: Optional[str]) -> bool:
+    return "цвет" in (field_name or "").lower()
+
+
+def _norm_text(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
+def _extract_seed_colors(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    if "," in text:
+        return [x.strip() for x in text.split(",") if x.strip()]
+    return [text]
+
+
+def _allowed_values_for_ai(iss: CardIssue) -> List[str]:
+    """
+    For color fields send only parent color names to AI.
+    For other fields keep existing allowed_values.
+    """
+    if _is_color_field(iss.field_path) or _is_color_field(iss.title):
+        try:
+            return get_catalog().get_color_parent_names()
+        except Exception:
+            return iss.allowed_values or []
+    return iss.allowed_values or []
+
+
+def _normalize_issue_field_path(name: Optional[str]) -> Optional[str]:
+    """Normalize AI/compound field names to internal field_path format."""
+    if not name:
+        return None
+
+    raw = str(name).strip()
+    if not raw:
+        return None
+
+    lower = raw.lower()
+    if lower in {"title", "название", "наименование"}:
+        return "title"
+    if lower in {"description", "описание"}:
+        return "description"
+    if raw.startswith("characteristics."):
+        return raw
+
+    return f"characteristics.{raw}"
+
+
+def _is_title_issue_obj(issue: CardIssue) -> bool:
+    path = (issue.field_path or "").strip().lower()
+    return issue.code in _TITLE_CODES or path in _TITLE_FIELD_PATHS
+
+
+def _is_description_issue_obj(issue: CardIssue) -> bool:
+    path = (issue.field_path or "").strip().lower()
+    return issue.code in _DESCRIPTION_CODES or path in _DESCRIPTION_FIELD_PATHS
+
+
+def _issue_has_fix_action(issue: CardIssue, actions: set[str]) -> bool:
+    for detail in (issue.error_details or []):
+        if not isinstance(detail, dict):
+            continue
+        marker = str(detail.get("fix_action") or detail.get("type") or "").strip().lower()
+        if marker in actions:
+            return True
+    return False
+
+
+def _allow_destructive_fix(issue: CardIssue) -> bool:
+    """
+    Allow clear/swap only for explicitly non-applicable fields.
+    For plain allowed-values/limit violations we must suggest a concrete value.
+    """
+    code = str(issue.code or "").strip().lower()
+    if code == "wb_wrong_category":
+        return True
+    if _issue_has_fix_action(issue, {"swap", "clear", "compound"}):
+        return True
+    for detail in (issue.error_details or []):
+        if isinstance(detail, dict) and str(detail.get("type") or "").strip().lower() == "wrong_category":
+            return True
+    return False
+
+
+def _split_issue_values(raw_value: Optional[str]) -> List[str]:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return []
+    normalized = raw.strip().strip("[]")
+    if not normalized:
+        return []
+    parts = re.split(r"[;,]", normalized)
+    out: List[str] = []
+    for part in parts:
+        v = part.strip().strip("'\"")
+        if v:
+            out.append(v)
+    return out
+
+
+def _fallback_value_from_constraints(issue: CardIssue):
+    """
+    Best-effort fallback when AI returned empty/clear for non-clearable issues.
+    Always tries to return a usable value that passes code constraints.
+    """
+    allowed = list(issue.allowed_values or [])
+    if allowed:
+        current_parts = _split_issue_values(issue.current_value)
+        picked: List[str] = []
+        for cur in current_parts:
+            match = find_best_match(cur, allowed, threshold=0.68)
+            if match and match not in picked:
+                picked.append(match)
+        if not picked:
+            picked.append(allowed[0])
+
+        limits = _extract_limits(issue.error_details)
+        min_l = limits.get("min")
+        max_l = limits.get("max")
+        if isinstance(max_l, int) and max_l > 0 and len(picked) > max_l:
+            picked = picked[:max_l]
+        if isinstance(min_l, int) and min_l > 0 and len(picked) < min_l:
+            for av in allowed:
+                if len(picked) >= min_l:
+                    break
+                if av not in picked:
+                    picked.append(av)
+            while len(picked) < min_l:
+                picked.append(picked[-1])
+
+        candidate = picked if len(picked) > 1 else picked[0]
+        ok, _, corrected = _validate_fix_against_constraints(
+            candidate,
+            issue.allowed_values,
+            issue.error_details,
+            char_name=issue.field_path or issue.title,
+            current_value=issue.current_value,
+        )
+        if ok:
+            return corrected if corrected is not None else candidate
+        return None
+
+    limits = _extract_limits(issue.error_details)
+    if not limits:
+        return None
+
+    values = _split_issue_values(issue.current_value)
+    if not values:
+        return None
+
+    min_l = limits.get("min")
+    max_l = limits.get("max")
+    if isinstance(max_l, int) and max_l > 0 and len(values) > max_l:
+        values = values[:max_l]
+    if isinstance(min_l, int) and min_l > 0 and len(values) < min_l:
+        while len(values) < min_l:
+            values.append(values[-1])
+    return values if len(values) > 1 else values[0]
+
+
+def _as_text(value: object) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _normalize_compound_fix_value(
+    field_path: Optional[str],
+    value,
+    current_value: Optional[str],
+):
+    """
+    Normalize compound fix values before persisting into error_details.
+    For color fields, expand parent color into a palette of closest shades.
+    """
+    if not _is_color_field(field_path):
+        return value
+    ok, _, corrected = _validate_fix_against_constraints(
+        value=value,
+        allowed_values=[],
+        error_details=[],
+        char_name=field_path,
+        current_value=current_value,
+    )
+    if ok and corrected is not None:
+        return corrected
+    return value
+
+
+def _contains_date_context_text(text: Optional[str]) -> bool:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return False
+    if any(word in raw for word in _DATE_CONTEXT_WORDS):
+        return True
+    # Date format itself is not enough; require date-field hint nearby.
+    has_date_value = bool(re.search(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", raw))
+    has_hint = any(h in raw for h in _DATE_FIELD_HINTS)
+    return has_date_value and has_hint
+
+
+def _is_date_sensitive_ai_issue(ai_issue: dict) -> bool:
+    texts: List[str] = [
+        str(ai_issue.get("name") or ""),
+        str(ai_issue.get("message") or ""),
+        str(ai_issue.get("description") or ""),
+        str(ai_issue.get("value") or ""),
+        str(ai_issue.get("swap_to_name") or ""),
+        str(ai_issue.get("swap_to_value") or ""),
+    ]
+    for err in (ai_issue.get("errors") or []):
+        if isinstance(err, dict):
+            texts.append(str(err.get("type") or ""))
+            texts.append(str(err.get("message") or ""))
+    for fx in (ai_issue.get("compound_fixes") or []):
+        if isinstance(fx, dict):
+            texts.append(str(fx.get("name") or ""))
+            texts.append(str(fx.get("value") or ""))
+    return any(_contains_date_context_text(t) for t in texts if t)
+
+
+def _is_non_fixed_date_issue_obj(issue: CardIssue) -> bool:
+    if (issue.source or "").lower() == "fixed_file":
+        return False
+
+    texts: List[str] = [
+        str(issue.code or ""),
+        str(issue.title or ""),
+        str(issue.description or ""),
+        str(issue.field_path or ""),
+        str(issue.current_value or ""),
+        str(issue.suggested_value or ""),
+    ]
+    for err in (issue.error_details or []):
+        if isinstance(err, dict):
+            texts.append(str(err.get("type") or ""))
+            texts.append(str(err.get("message") or ""))
+            texts.append(str(err.get("name") or ""))
+            texts.append(str(err.get("field_path") or ""))
+            texts.append(str(err.get("value") or ""))
+            fixes = err.get("fixes")
+            if isinstance(fixes, list):
+                for fx in fixes:
+                    if isinstance(fx, dict):
+                        texts.append(str(fx.get("name") or ""))
+                        texts.append(str(fx.get("field_path") or ""))
+                        texts.append(str(fx.get("value") or ""))
+    return any(_contains_date_context_text(t) for t in texts if t)
+
+
+def _drop_non_fixed_date_issues(issues: List[CardIssue]) -> List[CardIssue]:
+    return [iss for iss in issues if not _is_non_fixed_date_issue_obj(iss)]
+
+
+def _set_characteristic_value_in_context(context: dict, field_path: Optional[str], value) -> None:
+    """
+    Update context characteristics in-place so title/description prompts
+    can use freshly fixed characteristic values.
+    """
+    if not isinstance(context, dict):
+        return
+    if not field_path:
+        return
+    path = str(field_path).strip()
+    if not path.lower().startswith("characteristics."):
+        return
+    name = path.split("characteristics.", 1)[1].strip()
+    if not name:
+        return
+
+    chars = context.get("characteristics")
+    if isinstance(chars, dict):
+        chars[name] = value
+        return
+    if isinstance(chars, list):
+        target = None
+        for ch in chars:
+            if not isinstance(ch, dict):
+                continue
+            if str(ch.get("name") or "").strip().lower() == name.lower():
+                target = ch
+                break
+        if target is None:
+            target = {"name": name}
+            chars.append(target)
+        if isinstance(value, list):
+            target["values"] = value
+            target["value"] = value
+        else:
+            target["value"] = value
+            if "values" in target:
+                target["values"] = value
+        return
+
+    # initialize empty dict structure when characteristics absent
+    context["characteristics"] = {name: value}
+
+
+def _extract_compound_fixes(error_details: list | None) -> List[dict]:
+    """Return compound fix list from issue.error_details."""
+    for item in (error_details or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "compound" or item.get("fix_action") == "compound":
+            fixes = item.get("fixes")
+            return fixes if isinstance(fixes, list) else []
+    return []
+
+
+def _collapse_compound_overlaps(issues: List[CardIssue]) -> List[CardIssue]:
+    """
+    Keep compound issue as the single actionable item for covered fields.
+    Example: "Тип низа + Модель юбки + Модель брюк" should stay as one issue.
+    """
+    if not issues:
+        return issues
+
+    compound_targets: List[tuple[int, set[str], set[int], set[str]]] = []
+    for idx, issue in enumerate(issues):
+        fixes = _extract_compound_fixes(issue.error_details)
+        if not fixes:
+            continue
+
+        target_paths: set[str] = set()
+        target_charc_ids: set[int] = set()
+        target_names: set[str] = set()
+
+        for fix in fixes:
+            if not isinstance(fix, dict):
+                continue
+
+            path = fix.get("field_path") or _normalize_issue_field_path(fix.get("name"))
+            if path:
+                target_paths.add(str(path).strip().lower())
+
+            cid = fix.get("charc_id", fix.get("charcId"))
+            if cid is not None:
+                try:
+                    target_charc_ids.add(int(cid))
+                except (TypeError, ValueError):
+                    pass
+
+            name = str(fix.get("name") or "").strip().lower()
+            if name:
+                target_names.add(name)
+
+        if target_paths or target_charc_ids or target_names:
+            compound_targets.append((idx, target_paths, target_charc_ids, target_names))
+
+    if not compound_targets:
+        return issues
+
+    collapsed: List[CardIssue] = []
+    for idx, issue in enumerate(issues):
+        remove = False
+        issue_path = (issue.field_path or "").strip().lower()
+        issue_charc_id = issue.charc_id
+        issue_name = ""
+        if issue_path.startswith("characteristics."):
+            issue_name = issue_path.split("characteristics.", 1)[1].strip().lower()
+
+        for compound_idx, paths, charc_ids, names in compound_targets:
+            if idx == compound_idx:
+                continue
+            # Collapse only data/characteristic style issues; keep photo/video/etc.
+            if issue.category not in {
+                IssueCategory.CHARACTERISTICS,
+                IssueCategory.CATEGORY,
+                IssueCategory.TITLE,
+                IssueCategory.DESCRIPTION,
+            }:
+                continue
+
+            if issue_charc_id is not None and issue_charc_id in charc_ids:
+                remove = True
+                break
+            if issue_path and issue_path in paths:
+                remove = True
+                break
+            if issue_name and issue_name in names:
+                remove = True
+                break
+
+        if not remove:
+            collapsed.append(issue)
+
+    return collapsed
 
 
 def _validate_title_fix(title: str, card: dict) -> tuple:
@@ -33,59 +435,7 @@ def _validate_title_fix(title: str, card: dict) -> tuple:
     Validate AI-generated title against WB quality rules.
     Returns (is_valid, fail_reason).
     """
-    if not title or not isinstance(title, str):
-        return False, "Пустое название"
-
-    title = title.strip()
-
-    # 1) Length
-    if len(title) < 40:
-        return False, f"Слишком короткое ({len(title)} символов, нужно 40-100)"
-    if len(title) > 100:
-        return False, f"Слишком длинное ({len(title)} символов, нужно 40-100)"
-
-    # 2) No brand in title
-    brand = (card.get("brand") or "").strip()
-    if brand and len(brand) > 2 and brand.lower() in title.lower():
-        return False, f"Содержит бренд '{brand}'. Бренд НЕ должен быть в названии."
-
-    # 3) No color names — check against known basic colors
-    title_lower = title.lower()
-    title_words = set(re.findall(r'[а-яёa-z-]+', title_lower))
-    found_colors = title_words & _FORBIDDEN_COLORS
-    if found_colors:
-        return False, (
-            f"Содержит цвет: {', '.join(found_colors)}. "
-            "Цвет указывается в характеристиках, НЕ в названии."
-        )
-
-    # Also check card's own color values
-    chars = card.get("characteristics") or []
-    for ch in (chars if isinstance(chars, list) else []):
-        if isinstance(ch, dict) and "цвет" in (ch.get("name") or "").lower():
-            color_vals = ch.get("value") or ch.get("values") or []
-            if isinstance(color_vals, str):
-                color_vals = [color_vals]
-            if isinstance(color_vals, list):
-                for cv in color_vals:
-                    cv_str = str(cv).strip().lower()
-                    # Only check single-word color names (avoid false positives)
-                    if cv_str and len(cv_str) > 2 and " " not in cv_str:
-                        if cv_str in title_words:
-                            return False, (
-                                f"Содержит цвет товара '{cv}'. "
-                                "Цвет указывается в характеристиках, НЕ в названии."
-                            )
-
-    # 4) No "для + noun" — use adjectives instead
-    m = re.search(r'\bдля\s+\w+', title_lower)
-    if m:
-        return False, (
-            f"Содержит '{m.group()}'. Используй прилагательные "
-            "(например 'офисный' вместо 'для офиса')."
-        )
-
-    return True, ""
+    return validate_title(title, card)
 
 
 async def sync_cards_from_wb(
@@ -197,6 +547,18 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
         total_tokens["thinking_tokens"] += t.get("thinking_tokens", 0)
         total_tokens["total_tokens"] += t.get("total_tokens", 0)
         total_tokens["api_calls"] += 1
+    # ── Save SKIPPED/POSTPONED issues before wiping ─────────
+    existing_skipped = await db.execute(
+        select(CardIssue).where(
+            CardIssue.card_id == card.id,
+            CardIssue.status.in_([IssueStatus.SKIPPED, IssueStatus.POSTPONED]),
+        )
+    )
+    skipped_map: dict[str, tuple] = {
+        i.code: (i.status, i.postpone_reason, i.postponed_until)
+        for i in existing_skipped.scalars().all()
+    }
+
     # Delete old issues
     await db.execute(
         delete(CardIssue).where(CardIssue.card_id == card.id)
@@ -204,6 +566,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     
     issues: List[CardIssue] = []
     raw_data = card.raw_data or {}
+    ai_context = copy.deepcopy(raw_data) if isinstance(raw_data, dict) else {}
     
     # ── STEP 1: Basic code analysis ──────────────────────
     code_issues = card_analyzer.analyze_card(card)
@@ -212,20 +575,19 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     for issue_data in code_issues:
         issue = CardIssue(
             card_id=card.id,
-            code=issue_data["code"],
+            code=_clip(issue_data["code"], 100),
             severity=issue_data["severity"],
             category=issue_data["category"],
-            title=issue_data["title"],
+            title=_clip(issue_data["title"], 500),
             description=issue_data["description"],
             current_value=str(issue_data.get("current_value")) if issue_data.get("current_value") else None,
             suggested_value=str(issue_data.get("suggested_value")) if issue_data.get("suggested_value") else None,
             alternatives=issue_data.get("alternatives", []),
-            field_path=issue_data.get("field_path"),
+            field_path=_clip(issue_data.get("field_path"), 255) if issue_data.get("field_path") else None,
             score_impact=issue_data["score_impact"],
             status=IssueStatus.PENDING,
-            source="code",
+            source=_clip("code", 50),
         )
-        db.add(issue)
         issues.append(issue)
     
     # ── STEP 2: WB catalog validation (characteristics) ──
@@ -245,26 +607,28 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             
             issue = CardIssue(
                 card_id=card.id,
-                code=f"wb_fixed_{wb_issue.get('category', 'char')}" if is_fixed else f"wb_{wb_issue.get('category', 'char')}",
+                code=_clip(
+                    f"wb_fixed_{wb_issue.get('category', 'char')}" if is_fixed else f"wb_{wb_issue.get('category', 'char')}",
+                    100,
+                ),
                 severity=severity,
                 category=IssueCategory.CHARACTERISTICS,
-                title=wb_issue.get("message", "Ошибка характеристики"),
+                title=_clip(wb_issue.get("message", "Ошибка характеристики"), 500),
                 description=_format_error_description(wb_issue),
                 current_value=str(wb_issue.get("value")) if wb_issue.get("value") else None,
                 # Fixed field don't get suggestions
                 suggested_value=None if is_fixed else (_format_suggested(sv) if sv else None),
-                field_path=f"characteristics.{wb_issue.get('name')}",
+                field_path=_clip(f"characteristics.{wb_issue.get('name')}", 255),
                 charc_id=wb_issue.get("charc_id"),
                 allowed_values=wb_issue.get("allowed_values", []),
                 error_details=wb_issue.get("errors", []),
                 score_impact=0 if is_fixed else _calculate_wb_score_impact(wb_issue),  # Fixed fields don't affect score
                 status=IssueStatus.PENDING,
-                source="code",
+                source=_clip("code", 50),
             )
             # Mark auto-fixed issues (but not if fixed field)
             if wb_issue.get("auto_fixed") and sv and not is_fixed:
                 issue.source = "auto_fix"
-            db.add(issue)
             issues.append(issue)
 
     # ── STEP 2.5: Fixed file check ────────────────────────
@@ -278,22 +642,21 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             for mm in mismatches:
                 ff_issue = CardIssue(
                     card_id=card.id,
-                    code="fixed_file_mismatch",
+                    code=_clip("fixed_file_mismatch", 100),
                     severity=IssueSeverity.WARNING,
                     category=IssueCategory.CHARACTERISTICS,
-                    title=f"Расхождение с эталонным файлом: {mm['char_name']}",
+                    title=_clip(f"Расхождение с эталонным файлом: {mm['char_name']}", 500),
                     description=(
                         f"В эталонном файле: «{mm['fixed_value']}». "
                         f"В карточке: «{mm['card_value'] or 'не заполнено'}»."
                     ),
                     current_value=mm["card_value"],
                     suggested_value=mm["fixed_value"],
-                    field_path=mm["field_path"],
+                    field_path=_clip(mm["field_path"], 255) if mm.get("field_path") else None,
                     score_impact=8,
                     status=IssueStatus.PENDING,
-                    source="fixed_file",
+                    source=_clip("fixed_file", 50),
                 )
-                db.add(ff_issue)
                 issues.append(ff_issue)
 
     # ── STEP 3: AI audit (if enabled) ────────────────────
@@ -312,6 +675,10 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
         _add_tokens(audit_tokens)
         
         for ai_issue in ai_issues:
+            # Date/certificate/declaration fields are out of AI scope.
+            # They are controlled only via fixed file mismatches.
+            if _is_date_sensitive_ai_issue(ai_issue):
+                continue
             # Build error_details with swap/compound info if present
             ai_error_details = ai_issue.get("errors", [])
             fix_action = ai_issue.get("fix_action", "replace")
@@ -331,20 +698,33 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                                 if isinstance(_v, list)
                                 else (str(_v) if _v is not None else None)
                             )
+                    normalized_fixes = []
+                    for f in compound_fixes:
+                        if not isinstance(f, dict):
+                            continue
+                        fix_name = f.get("name", "")
+                        field_path = f.get("field_path") or _normalize_issue_field_path(fix_name)
+                        current_val = _char_val_map.get((fix_name or "").lower())
+                        fix_action_item = f.get("action", "set")
+                        fix_value = f.get("value")
+                        if fix_action_item != "clear":
+                            fix_value = _normalize_compound_fix_value(
+                                field_path=field_path,
+                                value=fix_value,
+                                current_value=current_val,
+                            )
+                        normalized_fixes.append({
+                            "name": fix_name,
+                            "field_path": field_path,
+                            "charc_id": f.get("charcId"),
+                            "action": fix_action_item,
+                            "value": fix_value,
+                            "current_value": current_val,
+                        })
                     ai_error_details.append({
                         "type": "compound",
                         "fix_action": "compound",
-                        "fixes": [
-                            {
-                                "name": f.get("name", ""),
-                                "field_path": f"characteristics.{f.get('name', '')}",
-                                "charc_id": f.get("charcId"),
-                                "action": f.get("action", "set"),
-                                "value": f.get("value"),
-                                "current_value": _char_val_map.get((f.get("name") or "").lower()),
-                            }
-                            for f in compound_fixes
-                        ],
+                        "fixes": normalized_fixes,
                     })
             elif fix_action == "swap":
                 ai_error_details = ai_error_details or []
@@ -361,35 +741,39 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                     "fix_action": "clear",
                 })
 
+            normalized_issue_path = _normalize_issue_field_path(ai_issue.get("name"))
             issue = CardIssue(
                 card_id=card.id,
-                code=f"ai_{ai_issue.get('category', 'mixed')}",
+                code=_clip(f"ai_{ai_issue.get('category', 'mixed')}", 100),
                 severity=_map_severity(ai_issue.get("severity", "warning")),
                 category=_map_ai_category(ai_issue.get("category")),
-                title=ai_issue.get("message", "AI обнаружил проблему"),
+                title=_clip(ai_issue.get("message", "AI обнаружил проблему"), 500),
                 description=_format_ai_description(ai_issue),
                 current_value=str(ai_issue.get("value")) if ai_issue.get("value") else None,
-                field_path=f"characteristics.{ai_issue.get('name')}" if ai_issue.get("name") else None,
+                field_path=_clip(normalized_issue_path, 255) if normalized_issue_path else None,
                 charc_id=ai_issue.get("charcId"),
                 error_details=ai_error_details,
                 score_impact=_calculate_ai_score_impact(ai_issue),
                 status=IssueStatus.PENDING,
-                source="ai",
+                source=_clip("ai", 50),
             )
-            db.add(issue)
             issues.append(issue)
-        
+
         # ── STEP 4: AI generates fixes ──────────────────
         # Send ALL issues to AI for concrete fixes, except:
         #   - Photo/video issues (need manual upload)
         #   - Auto-fixed issues (already have correct values)
-        _SKIP_AI_CODES = {
-            "no_photos", "few_photos", "add_more_photos",
-            "no_video",
-        }
+        # Date-related fields are out of AI scope and handled only by fixed_file mismatch.
+        issues = _drop_non_fixed_date_issues(issues)
+
+        # User requirement:
+        # 1) characteristics first (batch AI),
+        # 2) title/description later via dedicated prompts.
+        _SKIP_AI_CODES = set()
         _AI_TEXT_CODES = {
             "title_too_short", "no_title", "title_too_long",
-            "no_description", "description_too_short",
+            "title_policy_violation",
+            "no_description", "description_too_short", "description_too_long", "description_policy_violation",
         }
         fixable_issues = []
         fixable_indices = []
@@ -398,17 +782,24 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             is_skip = iss.code in _SKIP_AI_CODES
             # wrong_category issues already have __CLEAR__ as suggested_value — no AI needed
             is_wrong_category = iss.code == "wb_wrong_category"
+            is_text_issue = _is_title_issue_obj(iss) or _is_description_issue_obj(iss)
+            normalized_path = (iss.field_path or "").strip().lower()
+            issue_error_type = iss.code
+            if normalized_path == "title":
+                issue_error_type = "title"
+            elif normalized_path == "description":
+                issue_error_type = "description"
             
-            # Send to AI: everything except photo/video, auto-fixed, and wrong_category
-            if not is_skip and not already_auto_fixed and not is_wrong_category:
+            # Batch AI is for non-text issues only (allowed values / limits / logic).
+            if not is_skip and not already_auto_fixed and not is_wrong_category and not is_text_issue:
                 fixable_issues.append({
                     "id": str(idx),
                     "name": iss.field_path or iss.title,
                     "current_value": iss.current_value,
-                    "error_type": iss.code,
+                    "error_type": issue_error_type,
                     "message": iss.title,
                     "description": iss.description,
-                    "allowed_values": iss.allowed_values,
+                    "allowed_values": _allowed_values_for_ai(iss),
                     "errors": iss.error_details,
                 })
                 fixable_indices.append(idx)
@@ -416,7 +807,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 iss.suggested_value = None
         
         if fixable_issues:
-            suggestions, fixes_tokens = await asyncio.to_thread(gemini.generate_fixes, raw_data, fixable_issues)
+            suggestions, fixes_tokens = await asyncio.to_thread(gemini.generate_fixes, ai_context, fixable_issues)
             _add_tokens(fixes_tokens)
             
             # ── STEP 5–6: Validate each fix, retry if needed ──
@@ -430,82 +821,159 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
 
                 rec_value = suggestion.get("recommended_value")
                 reason = suggestion.get("reason", "")
+                fix_action = str(suggestion.get("fix_action", "replace") or "replace").strip().lower()
+                if fix_action not in {"replace", "clear", "swap"}:
+                    fix_action = "replace"
 
-                is_title_issue = iss.code in _TITLE_CODES
-                is_text_issue = iss.code in _AI_TEXT_CODES
+                is_title_issue = _is_title_issue_obj(iss)
+                is_description_issue = _is_description_issue_obj(iss)
+                is_text_issue = (iss.code in _AI_TEXT_CODES) or is_title_issue or is_description_issue
+                title_fix_valid = True
+                description_fix_valid = True
 
                 # ── A) Title issues — validate against quality rules ──
-                if is_title_issue and rec_value:
-                    fix_valid, fail_reason = _validate_title_fix(
-                        str(rec_value), raw_data
-                    )
-                    if not fix_valid:
-                        for retry in range(MAX_FIX_RETRIES):
-                            refix, refix_t = await asyncio.to_thread(
-                                gemini.refix_title,
-                                card=raw_data,
-                                current_title=str(rec_value),
-                                failed_reason=fail_reason,
-                            )
-                            _add_tokens(refix_t)
-                            if not refix:
-                                break
-                            rec_value = refix.get("recommended_value", rec_value)
-                            reason = refix.get("reason", reason)
-                            fix_valid, fail_reason = _validate_title_fix(
-                                str(rec_value), raw_data
-                            )
-                            if fix_valid:
-                                break
+                if is_title_issue:
+                    title_fix_valid = False
+                    fail_reason = "AI не вернул предложенный title"
+                    if rec_value:
+                        title_fix_valid, fail_reason = _validate_title_fix(
+                            str(rec_value), ai_context
+                        )
+                        if not title_fix_valid:
+                            for _ in range(MAX_FIX_RETRIES):
+                                refix, refix_t = await asyncio.to_thread(
+                                    gemini.refix_title,
+                                    card=ai_context,
+                                    current_title=str(rec_value),
+                                    failed_reason=fail_reason,
+                                )
+                                _add_tokens(refix_t)
+                                if not refix:
+                                    break
+                                rec_value = refix.get("recommended_value", rec_value)
+                                reason = refix.get("reason", reason)
+                                title_fix_valid, fail_reason = _validate_title_fix(
+                                    str(rec_value), ai_context
+                                )
+                                if title_fix_valid:
+                                    break
+
+                    if not title_fix_valid:
+                        rec_value = None
+
+                # ── A2) Description issues — validate against SEO rules ──
+                elif is_description_issue:
+                    description_fix_valid = False
+                    fail_reason = "AI не вернул предложенное описание"
+                    if rec_value:
+                        description_fix_valid, fail_reason = validate_description(
+                            str(rec_value), ai_context
+                        )
+                        if not description_fix_valid:
+                            for _ in range(MAX_FIX_RETRIES):
+                                refix, refix_t = await asyncio.to_thread(
+                                    gemini.refix_description,
+                                    card=ai_context,
+                                    current_description=str(rec_value),
+                                    failed_reason=fail_reason,
+                                )
+                                _add_tokens(refix_t)
+                                if not refix:
+                                    break
+                                rec_value = refix.get("recommended_value", rec_value)
+                                reason = refix.get("reason", reason)
+                                description_fix_valid, fail_reason = validate_description(
+                                    str(rec_value), ai_context
+                                )
+                                if description_fix_valid:
+                                    break
+
+                    if not description_fix_valid:
+                        rec_value = None
 
                 # ── B) Characteristic issues — validate against allowed values ──
                 elif not is_text_issue and (iss.allowed_values or iss.error_details):
-                    fix_valid, fail_reason, corrected_value = _validate_fix_against_constraints(
-                        rec_value, iss.allowed_values, iss.error_details
-                    )
-                    
+                    destructive_allowed = _allow_destructive_fix(iss)
+                    fix_valid = True
+                    fail_reason = ""
+                    corrected_value = None
+
+                    if fix_action in {"clear", "swap"} and not destructive_allowed:
+                        fix_valid = False
+                        fail_reason = (
+                            "Для этой ошибки нельзя очищать/переносить поле. "
+                            "Нужно выбрать корректное допустимое значение."
+                        )
+                    else:
+                        fix_valid, fail_reason, corrected_value = _validate_fix_against_constraints(
+                            rec_value,
+                            iss.allowed_values,
+                            iss.error_details,
+                            char_name=iss.field_path or iss.title,
+                            current_value=iss.current_value,
+                        )
+
                     # If fuzzy match found a better value, use it immediately
                     if corrected_value is not None:
                         rec_value = corrected_value
                         reason = f"{reason} (автоматически скорректировано до ближайшего допустимого значения)"
+                        fix_action = "replace"
 
                     if not fix_valid:
+                        seed_value = rec_value if rec_value not in (None, "", []) else (iss.current_value or "")
                         # Retry loop
                         for retry in range(MAX_FIX_RETRIES):
                             refix, refix_t = await asyncio.to_thread(
                                 gemini.refix_value,
-                                card=raw_data,
+                                card=ai_context,
                                 char_name=iss.field_path or iss.title,
-                                current_value=rec_value,
+                                current_value=seed_value,
                                 failed_reason=fail_reason,
-                                allowed_values=iss.allowed_values or [],
+                                allowed_values=_allowed_values_for_ai(iss),
                                 limits=_extract_limits(iss.error_details),
                             )
                             _add_tokens(refix_t)
                             if not refix:
-                                break
-                            rec_value = refix.get("recommended_value", rec_value)
+                                continue
+                            seed_value = refix.get("recommended_value", seed_value)
+                            rec_value = seed_value
                             reason = refix.get("reason", reason)
+                            fix_action = "replace"
 
                             fix_valid, fail_reason, corrected_value = _validate_fix_against_constraints(
-                                rec_value, iss.allowed_values, iss.error_details
+                                rec_value,
+                                iss.allowed_values,
+                                iss.error_details,
+                                char_name=iss.field_path or iss.title,
+                                current_value=iss.current_value,
                             )
-                            
+
                             # Apply fuzzy match correction if found
                             if corrected_value is not None:
                                 rec_value = corrected_value
                                 reason = f"{reason} (автоматически скорректировано)"
-                            
+
                             if fix_valid:
                                 break
 
+                    if not fix_valid:
+                        fallback_value = _fallback_value_from_constraints(iss)
+                        if fallback_value not in (None, "", []):
+                            rec_value = fallback_value
+                            fix_action = "replace"
+                            reason = reason or "Автоматически подобрано по allowed_values и лимитам"
+
                 # Save the fix — skip empty AI results
                 # For swap actions: empty recommended_value is valid (means "clear this field")
-                fix_action = suggestion.get("fix_action", "replace")
-                is_swap = fix_action == "swap"
-                is_clear = fix_action == "clear"
+                destructive_allowed = _allow_destructive_fix(iss)
+                is_swap = fix_action == "swap" and destructive_allowed
+                is_clear = fix_action == "clear" and destructive_allowed
 
                 has_value = rec_value is not None and rec_value != "" and rec_value != []
+                if is_title_issue and has_value and not title_fix_valid:
+                    has_value = False
+                if is_description_issue and has_value and not description_fix_valid:
+                    has_value = False
                 
                 if is_swap or is_clear:
                     # For swap/clear: the recommended_value should be "" (clear)
@@ -532,6 +1000,12 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 # Always use AI concrete value as suggested_value
                 if has_value and not is_swap and not is_clear:
                     iss.suggested_value = _format_suggested(rec_value)
+                    if not is_title_issue and not is_description_issue:
+                        _set_characteristic_value_in_context(
+                            ai_context,
+                            iss.field_path,
+                            rec_value,
+                        )
 
             # ── STEP 5b: Retry missed issues (AI didn't return fix) ──
             if missed_issues:
@@ -548,26 +1022,218 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                     orig_idx = retry_map[ri]
                     iss = issues[orig_idx]
                     retry_result, retry_t = await asyncio.to_thread(
-                        gemini.generate_fixes, raw_data, [retry_issue]
+                        gemini.generate_fixes, ai_context, [retry_issue]
                     )
                     _add_tokens(retry_t)
                     suggestion = retry_result.get("0", {})
                     if suggestion:
                         rec_value = suggestion.get("recommended_value")
                         reason = suggestion.get("reason", "")
+                        fix_action = str(suggestion.get("fix_action", "replace") or "replace").strip().lower()
+                        if fix_action not in {"replace", "clear", "swap"}:
+                            fix_action = "replace"
+
+                        if _is_title_issue_obj(iss) and rec_value:
+                            valid, _ = _validate_title_fix(str(rec_value), ai_context)
+                            if not valid:
+                                rec_value = None
+                        elif _is_description_issue_obj(iss) and rec_value:
+                            valid, _ = validate_description(str(rec_value), ai_context)
+                            if not valid:
+                                rec_value = None
+                        else:
+                            destructive_allowed = _allow_destructive_fix(iss)
+                            if fix_action in {"clear", "swap"} and not destructive_allowed:
+                                fix_action = "replace"
+                                rec_value = _fallback_value_from_constraints(iss)
+                            if rec_value not in (None, "", []):
+                                valid, _, corrected = _validate_fix_against_constraints(
+                                    rec_value,
+                                    iss.allowed_values,
+                                    iss.error_details,
+                                    char_name=iss.field_path or iss.title,
+                                    current_value=iss.current_value,
+                                )
+                                if corrected is not None:
+                                    rec_value = corrected
+                                if not valid:
+                                    rec_value = _fallback_value_from_constraints(iss)
+
                         has_value = rec_value is not None and rec_value != "" and rec_value != []
                         if has_value:
                             iss.ai_suggested_value = _format_suggested(rec_value)
                             iss.ai_reason = reason
                             iss.ai_alternatives = []
                             iss.suggested_value = _format_suggested(rec_value)
+                            if not _is_title_issue_obj(iss) and not _is_description_issue_obj(iss):
+                                _set_characteristic_value_in_context(
+                                    ai_context,
+                                    iss.field_path,
+                                    rec_value,
+                                )
+
+        # ── STEP 5c: Title/Description — AI generates from scratch, then validates ──
+        for iss in issues:
+            already_auto_fixed = (iss.source == "auto_fix")
+            if already_auto_fixed:
+                continue
+            if not (_is_title_issue_obj(iss) or _is_description_issue_obj(iss)):
+                continue
+
+            fail_reason = f"{iss.title}. {iss.description or ''}".strip()
+            rec_value = None
+            reason = ""
+
+            if _is_title_issue_obj(iss):
+                current_title = str(
+                    ai_context.get("title")
+                    or raw_data.get("title")
+                    or iss.current_value
+                    or ""
+                )
+
+                # Step 1: Generate fresh title via AI (not refix)
+                gen_result, gen_t = await asyncio.to_thread(
+                    gemini.generate_title,
+                    card=ai_context,
+                )
+                _add_tokens(gen_t)
+                candidate = _as_text(gen_result.get("recommended_value")) or current_title
+                reason = gen_result.get("reason", "")
+                last_ai_candidate: Optional[str] = candidate if candidate else None
+
+                valid, fail_reason = _validate_title_fix(str(candidate), ai_context)
+                if valid:
+                    rec_value = candidate
+                else:
+                    # Step 2: Up to MAX_FIX_RETRIES correction cycles via refix_title
+                    for _ in range(MAX_FIX_RETRIES):
+                        refix, refix_t = await asyncio.to_thread(
+                            gemini.refix_title,
+                            card=ai_context,
+                            current_title=str(candidate),
+                            failed_reason=fail_reason,
+                        )
+                        _add_tokens(refix_t)
+                        if not refix:
+                            continue
+                        candidate = _as_text(refix.get("recommended_value")) or candidate
+                        reason = refix.get("reason", reason)
+                        if candidate:
+                            last_ai_candidate = candidate
+                        valid, fail_reason = _validate_title_fix(str(candidate), ai_context)
+                        if valid:
+                            rec_value = candidate
+                            break
+
+                # Use best draft even if validation failed
+                if rec_value is None and last_ai_candidate:
+                    if last_ai_candidate.strip().lower() != current_title.strip().lower():
+                        rec_value = last_ai_candidate
+                        reason = reason or "Черновой вариант от AI"
+
+                if rec_value:
+                    iss.ai_suggested_value = rec_value
+                    iss.ai_reason = reason
+                    iss.ai_alternatives = []
+                    iss.suggested_value = rec_value
+                    ai_context["title"] = rec_value
+                else:
+                    iss.ai_suggested_value = None
+                    iss.ai_reason = fail_reason
+                    iss.ai_alternatives = []
+                continue
+
+            # description issue
+            current_description = str(
+                ai_context.get("description")
+                or raw_data.get("description")
+                or iss.current_value
+                or ""
+            )
+
+            # Step 1: Generate fresh description via AI (not refix)
+            gen_result, gen_t = await asyncio.to_thread(
+                gemini.generate_description,
+                card=ai_context,
+            )
+            _add_tokens(gen_t)
+            candidate = _as_text(gen_result.get("recommended_value")) or current_description
+            reason = gen_result.get("reason", "")
+            last_ai_candidate: Optional[str] = candidate if candidate else None
+
+            valid, fail_reason = validate_description(str(candidate), ai_context)
+            if valid:
+                rec_value = candidate
+            else:
+                # Step 2: Up to MAX_FIX_RETRIES correction cycles via refix_description
+                for _ in range(MAX_FIX_RETRIES):
+                    refix, refix_t = await asyncio.to_thread(
+                        gemini.refix_description,
+                        card=ai_context,
+                        current_description=str(candidate),
+                        failed_reason=fail_reason,
+                    )
+                    _add_tokens(refix_t)
+                    if not refix:
+                        continue
+                    candidate = _as_text(refix.get("recommended_value")) or candidate
+                    reason = refix.get("reason", reason)
+                    if candidate:
+                        last_ai_candidate = candidate
+                    valid, fail_reason = validate_description(str(candidate), ai_context)
+                    if valid:
+                        rec_value = candidate
+                        break
+
+            # Use best draft even if validation failed (min 500 chars to be useful)
+            if rec_value is None and last_ai_candidate:
+                if last_ai_candidate.strip().lower() != current_description.strip().lower():
+                    if len(last_ai_candidate) >= 500:
+                        rec_value = last_ai_candidate
+                        reason = reason or "Черновой вариант от AI"
+
+            if rec_value:
+                iss.ai_suggested_value = rec_value
+                iss.ai_reason = reason
+                iss.ai_alternatives = []
+                iss.suggested_value = rec_value
+                ai_context["description"] = rec_value
+            else:
+                iss.ai_suggested_value = None
+                iss.ai_reason = fail_reason
+                iss.ai_alternatives = []
     
+    # Date-related fields must not be auto-validated by AI/code logic.
+    # Keep only fixed-file mismatches for such fields.
+    issues = _drop_non_fixed_date_issues(issues)
+
+    # ── STEP 6.5: Collapse overlapping issues covered by compound swaps ─
+    issues = _collapse_compound_overlaps(issues)
+
     # ── STEP 7: Ensure every issue has a suggested_value ─
     _ensure_all_suggested_values(issues)
+    issues = _drop_noop_issues(issues)
+
+    # Persist final issue set (after collapse)
+    for issue in issues:
+        # Restore SKIPPED/POSTPONED status if this issue was previously skipped
+        if issue.code in skipped_map:
+            prev_status, prev_reason, prev_until = skipped_map[issue.code]
+            issue.status = prev_status
+            issue.postpone_reason = prev_reason
+            issue.postponed_until = prev_until
+        db.add(issue)
     
-    # ── STEP 8: Update card score and counts ─────────────
-    card.score = score_breakdown["total_score"]
-    card.score_breakdown = score_breakdown
+    # ── STEP 8: Super-Validator (without media analyzer) ─
+    sv_breakdown = super_validator_service.evaluate(
+        card=card,
+        raw_data=raw_data,
+        issues=issues,
+        base_breakdown=score_breakdown,
+    )
+    card.score = int(sv_breakdown.get("final_score", sv_breakdown.get("total_score", 0)))
+    card.score_breakdown = sv_breakdown
     card.critical_issues_count = sum(1 for i in issues if i.severity == IssueSeverity.CRITICAL)
     card.warnings_count = sum(1 for i in issues if i.severity == IssueSeverity.WARNING)
     card.improvements_count = sum(1 for i in issues if i.severity == IssueSeverity.IMPROVEMENT)
@@ -626,10 +1292,34 @@ def _ensure_all_suggested_values(issues: List[CardIssue]) -> None:
         iss.suggested_value = None
 
 
+def _norm_issue_value(val: Optional[str]) -> str:
+    if val is None:
+        return ""
+    return " ".join(str(val).strip().lower().split())
+
+
+def _drop_noop_issues(issues: List[CardIssue]) -> List[CardIssue]:
+    """
+    Remove issues where suggested value equals current value and therefore gives no action.
+    Currently applied to composition_mismatch only to avoid false UX noise.
+    """
+    out: List[CardIssue] = []
+    for iss in issues:
+        if iss.code == "composition_mismatch":
+            cur = _norm_issue_value(iss.current_value)
+            sug = _norm_issue_value(iss.suggested_value)
+            if cur and sug and cur == sug:
+                continue
+        out.append(iss)
+    return out
+
+
 def _validate_fix_against_constraints(
     value,
     allowed_values: list,
     error_details: list,
+    char_name: Optional[str] = None,
+    current_value: Optional[str] = None,
 ) -> tuple:
     """
     Check if AI-suggested value passes allowed_values and limit constraints.
@@ -638,11 +1328,69 @@ def _validate_fix_against_constraints(
     If value doesn't match allowed_values exactly, tries to find best match.
     """
     corrected = None
-    
+    is_color = _is_color_field(char_name)
+    catalog = None
+    if is_color:
+        try:
+            catalog = get_catalog()
+        except Exception:
+            catalog = None
+
+    # Color-special flow:
+    # AI chooses parent color, then we pick main + closest 3-5 shades inside that parent.
+    if is_color and catalog is not None:
+        # Parse AI selection
+        picked_raw = value
+        if isinstance(picked_raw, list):
+            picked_raw = picked_raw[0] if picked_raw else ""
+        picked_str = str(picked_raw or "").strip()
+        if not picked_str:
+            return False, "Не удалось определить основной цвет", None
+
+        limits = _extract_limits(error_details)
+        min_l = limits.get("min")
+        max_l = limits.get("max")
+        # Prefer richer palette by default: parent + closest shades.
+        desired = 5
+        if isinstance(max_l, int) and max_l > 0:
+            desired = min(desired, max_l)
+        if isinstance(min_l, int) and min_l > desired:
+            desired = min(min_l, max_l or min_l)
+        desired = max(3, min(desired, 5))
+
+        seeds = _extract_seed_colors(current_value)
+        palette = catalog.suggest_related_colors(
+            selected_parent_or_color=picked_str,
+            seed_colors=seeds,
+            total_count=desired,
+        )
+        if not palette:
+            return False, f"Не удалось подобрать палитру для цвета '{picked_str}'", None
+
+        full_allowed = catalog.get_allowed_values("цвет") or []
+        full_allowed_norm = {_norm_text(x) for x in full_allowed}
+        # Normalize to allowed list values
+        normalized_palette: List[str] = []
+        for c in palette:
+            if _norm_text(c) in full_allowed_norm:
+                # keep original allowed spelling where possible
+                exact = next((av for av in full_allowed if _norm_text(av) == _norm_text(c)), c)
+                if exact not in normalized_palette:
+                    normalized_palette.append(exact)
+            else:
+                bm = find_best_match(c, full_allowed, threshold=0.72)
+                if bm and bm not in normalized_palette:
+                    normalized_palette.append(bm)
+
+        if not normalized_palette:
+            return False, f"Цветовая палитра для '{picked_str}' не проходит справочник", None
+
+        return True, "", normalized_palette
+
     if not allowed_values and not error_details:
         return True, "", None
-    
-    # Check allowed_values
+
+    # Generic allowed_values flow (non-color)
     if allowed_values:
         if isinstance(value, list):
             corrected_list = []
@@ -676,7 +1424,7 @@ def _validate_fix_against_constraints(
                 else:
                     return False, f"Значение '{v_str}' отсутствует в допустимых: {allowed_values[:10]}", None
     
-    # Check limits
+    # Check limits (non-color generic)
     limits = _extract_limits(error_details)
     if limits:
         min_l = limits.get("min")

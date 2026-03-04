@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -7,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from .core.config import settings
+from .services.card_scheduler import card_scheduler
 from .routers import (
     auth_router,
     stores_router,
@@ -23,12 +25,22 @@ from .routers import (
     fixed_files_router,
 )
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start background schedulers on startup, stop on shutdown."""
+    card_scheduler.start_background()
+    yield
+    card_scheduler.stop()
+
+
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     description="Wildberries Card Optimization API",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # CORS
