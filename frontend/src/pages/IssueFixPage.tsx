@@ -589,8 +589,9 @@ export default function IssueFixPage() {
                       const isClear = fix.action === 'clear';
                       const isSet = fix.action === 'set';
                       const isReplace = fix.action === 'replace';
-                      // Use stored current_value for each sub-field; fallback to main issue value only for idx=0
-                      const currentVal = fix.current_value ?? (idx === 0 ? currentIssue.current_value : null);
+                      // Use stored current_value for each sub-field only; do NOT fallback to main issue value
+                      // (main issue current_value may be a characteristic value, not the sub-field's value)
+                      const currentVal = fix.current_value ?? null;
                       return (
                         <div key={idx} className="fix-swap-step">
                           <div className={`fix-swap-step-badge ${isClear ? 'fix-swap-step-badge--remove' : isReplace ? 'fix-swap-step-badge--change' : 'fix-swap-step-badge--add'}`}>

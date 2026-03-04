@@ -771,7 +771,14 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                             continue
                         fix_name = f.get("name", "")
                         field_path = f.get("field_path") or _normalize_issue_field_path(fix_name)
-                        current_val = _char_val_map.get((fix_name or "").lower())
+                        # For top-level fields (title, description) get value directly from raw_data
+                        fix_name_lower = (fix_name or "").lower()
+                        if fix_name_lower == "title":
+                            current_val = str(raw_data.get("title") or "")
+                        elif fix_name_lower == "description":
+                            current_val = str(raw_data.get("description") or "")
+                        else:
+                            current_val = _char_val_map.get(fix_name_lower)
                         fix_action_item = f.get("action", "set")
                         fix_value = f.get("value")
                         if fix_action_item != "clear":
