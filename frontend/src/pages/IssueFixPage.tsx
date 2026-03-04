@@ -47,6 +47,23 @@ function getCompoundFixes(issue: IssueWithCard): CompoundFix[] {
   return [];
 }
 
+function isMediaIssue(issue: IssueWithCard): boolean {
+  const code = String(issue.code || '').toLowerCase();
+  return (
+    code === 'no_photos' ||
+    code === 'few_photos' ||
+    code === 'add_more_photos' ||
+    isVideoMediaIssue(issue)
+  );
+}
+
+function isVideoMediaIssue(issue: IssueWithCard): boolean {
+  const code = String(issue.code || '').toLowerCase();
+  const category = String(issue.category || '').toLowerCase();
+  const fieldPath = String(issue.field_path || '').toLowerCase();
+  return code === 'no_video' || category === 'video' || fieldPath.startsWith('videos');
+}
+
 export default function IssueFixPage() {
   const { severity } = useParams<{ severity: string }>();
   const navigate = useNavigate();
@@ -260,6 +277,19 @@ export default function IssueFixPage() {
     }
   };
 
+  const openPhotoStudioForIssue = () => {
+    if (!currentIssue) return;
+    const params = new URLSearchParams({
+      cardId: String(currentIssue.card_id),
+      nmId: String(currentIssue.card_nm_id),
+      mode: 'generator',
+    });
+    if (isVideoMediaIssue(currentIssue)) {
+      params.set('genTab', 'video');
+    }
+    navigate(`/photo-studio?${params.toString()}`);
+  };
+
   const severityLabel = {
     critical: 'Выход из аварийного режима',
     warning: 'Исправление предупреждений',
@@ -395,6 +425,8 @@ export default function IssueFixPage() {
 
   // ==================== FIX FLOW ====================
   const alternatives = getAlternatives(currentIssue);
+  const mediaIssue = currentIssue ? isMediaIssue(currentIssue) : false;
+  const videoMediaIssue = currentIssue ? isVideoMediaIssue(currentIssue) : false;
   const progressPercent = issues.length > 0 ? ((currentIdx) / issues.length) * 100 : 0;
 
   return (
@@ -488,7 +520,14 @@ export default function IssueFixPage() {
           <div className={`issue-header ${currentIssue.severity}`}>
             <div>
               <div className="issue-label">Текущая проблема карточки</div>
-              <div className="issue-title">{currentIssue.title}</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div className="issue-title">{currentIssue.title}</div>
+                {currentIssue.status === 'skipped' && (
+                  <span style={{ fontSize: 11, background: '#e5e7eb', color: '#6b7280', borderRadius: 4, padding: '2px 7px', fontWeight: 500, whiteSpace: 'nowrap' }}>
+                    пропущено
+                  </span>
+                )}
+              </div>
               {currentIssue.description && (
                 <div className="issue-desc">{currentIssue.description}</div>
               )}
@@ -658,6 +697,26 @@ export default function IssueFixPage() {
               }
 
               // Default REPLACE UI
+              if (mediaIssue) {
+                return (
+                  <div className="fix-recommendation">
+                    <h4>Рекомендуемое исправление</h4>
+                    <p style={{ marginBottom: 12, color: 'var(--text-secondary)' }}>
+                      {videoMediaIssue
+                        ? 'Для этой проблемы нужно добавить или сгенерировать видео через Photo Studio.'
+                        : 'Для этой проблемы нужно добавить медиа в карточку через Photo Studio.'}
+                    </p>
+                    <button
+                      className="btn btn-primary btn-sm"
+                      onClick={openPhotoStudioForIssue}
+                      type="button"
+                    >
+                      Открыть Photo Studio
+                    </button>
+                  </div>
+                );
+              }
+
               return (
                 <div className="fix-recommendation">
                   <h4>Рекомендуемое исправление</h4>
@@ -684,7 +743,7 @@ export default function IssueFixPage() {
             })()}
 
             {/* Variants */}
-            {alternatives.length > 0 && (
+            {!mediaIssue && alternatives.length > 0 && (
               <div className="fix-variants">
                 <h4>Варианты решения</h4>
                 <div className="variant-chips">
@@ -705,6 +764,7 @@ export default function IssueFixPage() {
             )}
 
             {/* Custom value */}
+            {!mediaIssue && (
             <div className="custom-value">
               <div
                 className="custom-value-toggle"
@@ -725,9 +785,10 @@ export default function IssueFixPage() {
                 </div>
               )}
             </div>
+            )}
 
             {/* Allowed values (for characteristics) */}
-            {currentIssue.allowed_values && currentIssue.allowed_values.length > 0 && (
+            {!mediaIssue && currentIssue.allowed_values && currentIssue.allowed_values.length > 0 && (
               <div style={{ marginBottom: 24 }}>
                 <h4 style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8 }}>
                   Допустимые значения
@@ -798,10 +859,10 @@ export default function IssueFixPage() {
             </div>
             <button
               className="btn btn-primary"
-              onClick={handleFix}
-              disabled={actionLoading || (!selectedValue && !customValue.trim() && !getSwapInfo(currentIssue).isSwap && !getSwapInfo(currentIssue).isClear)}
+              onClick={mediaIssue ? openPhotoStudioForIssue : handleFix}
+              disabled={actionLoading || (!mediaIssue && !selectedValue && !customValue.trim() && !getSwapInfo(currentIssue).isSwap && !getSwapInfo(currentIssue).isClear)}
             >
-              {actionLoading ? 'Применяется...' : finishButtonLabel}
+              {actionLoading ? 'Применяется...' : (mediaIssue ? 'Открыть Photo Studio' : finishButtonLabel)}
             </button>
           </div>
         </div>
@@ -833,11 +894,17 @@ export default function IssueFixPage() {
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                     <div className="si-title">{issue.title}</div>
-                    <span className={`si-severity ${issue.severity}`}>
-                      {issue.severity === 'critical' ? 'Критичные' :
-                       issue.severity === 'warning' ? 'Предупреждения' :
-                       'Улучшения'}
-                    </span>
+                    {issue.status === 'skipped' ? (
+                      <span style={{ fontSize: 10, background: '#e5e7eb', color: '#6b7280', borderRadius: 4, padding: '2px 6px', fontWeight: 500, whiteSpace: 'nowrap', flexShrink: 0, marginLeft: 4 }}>
+                        пропущено
+                      </span>
+                    ) : (
+                      <span className={`si-severity ${issue.severity}`}>
+                        {issue.severity === 'critical' ? 'Критичные' :
+                         issue.severity === 'warning' ? 'Предупреждения' :
+                         'Улучшения'}
+                      </span>
+                    )}
                   </div>
                   <div className="si-card">
                     {issue.card_title || `Карточка ${issue.card_nm_id}`}

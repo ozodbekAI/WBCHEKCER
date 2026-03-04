@@ -120,7 +120,6 @@ async def _run_sync(task_id: str, store_id: int, api_key: str, nm_ids_filter: Op
 
             # ── Step 4: AI analysis of changed cards ───────────────────────
             issues_found = 0
-            ai_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0, "api_calls": 0}
 
             if nm_ids_filter:
                 # Manual mode — analyze ONLY the requested cards
@@ -148,13 +147,8 @@ async def _run_sync(task_id: str, store_id: int, api_key: str, nm_ids_filter: Op
                         f"{(card.title or '')[:40] or str(card.nm_id)}..."
                     )
                     try:
-                        issues, card_tokens = await analyze_card(db, card, use_ai=True)
+                        issues, _ = await analyze_card(db, card, use_ai=True)
                         issues_found += len(issues)
-                        ai_tokens["prompt_tokens"] += card_tokens.get("prompt_tokens", 0)
-                        ai_tokens["completion_tokens"] += card_tokens.get("completion_tokens", 0)
-                        ai_tokens["thinking_tokens"] += card_tokens.get("thinking_tokens", 0)
-                        ai_tokens["total_tokens"] += card_tokens.get("total_tokens", 0)
-                        ai_tokens["api_calls"] += card_tokens.get("api_calls", 0)
                     except Exception:
                         pass
             else:
@@ -176,7 +170,6 @@ async def _run_sync(task_id: str, store_id: int, api_key: str, nm_ids_filter: Op
             "analyzed": len(nm_ids_to_analyze) if nm_ids_to_analyze else 0,
             "issues_found": issues_found,
             "mode": "manual" if nm_ids_filter else "incremental",
-            "ai_tokens": ai_tokens,
         }
         task["completed_at"] = datetime.utcnow().isoformat()
 
@@ -367,7 +360,6 @@ async def _run_analyze_all(task_id: str, store_id: int):
             task["progress"] = 10
 
             issues_found = 0
-            ai_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0, "api_calls": 0}
 
             for i, card in enumerate(cards):
                 pct = 10 + int((i + 1) / max(total, 1) * 80)
@@ -377,10 +369,8 @@ async def _run_analyze_all(task_id: str, store_id: int):
                     f"{(card.title or '')[:40] or str(card.nm_id)}..."
                 )
                 try:
-                    issues, card_tokens = await analyze_card(db, card, use_ai=True)
+                    issues, _ = await analyze_card(db, card, use_ai=True)
                     issues_found += len(issues)
-                    for k in ai_tokens:
-                        ai_tokens[k] += card_tokens.get(k, 0)
                 except Exception:
                     pass
 
@@ -393,7 +383,6 @@ async def _run_analyze_all(task_id: str, store_id: int):
         task["result"] = {
             "total_analyzed": total,
             "issues_found": issues_found,
-            "ai_tokens": ai_tokens,
         }
     except Exception as e:
         task["status"] = "failed"

@@ -25,7 +25,16 @@ async def _apply_compound_fixes(
     """Auto-create or auto-fix linked CardIssue records for compound fixes."""
     now = datetime.utcnow()
     for fix in fixes:
-        field_path = fix.get("field_path") or f"characteristics.{fix.get('name', '')}"
+        field_path = fix.get("field_path")
+        if not field_path:
+            name = str(fix.get("name") or "").strip()
+            lower = name.lower()
+            if lower in {"title", "название", "наименование"}:
+                field_path = "title"
+            elif lower in {"description", "описание"}:
+                field_path = "description"
+            else:
+                field_path = f"characteristics.{name}"
         action = fix.get("action", "set")
         raw_value = fix.get("value") if action != "clear" else "__CLEAR__"
         # Serialize lists as JSON so they can be round-tripped properly
@@ -60,7 +69,7 @@ async def _apply_compound_fixes(
                 title=f"Автоисправление: {fix.get('name', field_path)}",
                 description="Автоматически исправлено как часть составного исправления",
                 field_path=field_path,
-                charc_id=fix.get("charc_id"),
+                charc_id=fix.get("charc_id", fix.get("charcId")),
                 fixed_value=value,
                 status=IssueStatus.FIXED,
                 fixed_at=now,
@@ -155,7 +164,7 @@ async def get_store_issues(
 
 
 async def get_issues_grouped(db: AsyncSession, store_id: int) -> dict:
-    """Get issues grouped by severity"""
+    """Get issues grouped by severity — includes PENDING and SKIPPED issues."""
     result = {
         "critical": [],
         "warnings": [],
@@ -166,23 +175,30 @@ async def get_issues_grouped(db: AsyncSession, store_id: int) -> dict:
         "improvements_count": 0,
         "postponed_count": 0,
     }
-    
-    # Get pending issues grouped by severity
+
+    # PENDING + SKIPPED issues grouped by severity
     for severity, key in [
         (IssueSeverity.CRITICAL, "critical"),
         (IssueSeverity.WARNING, "warnings"),
         (IssueSeverity.IMPROVEMENT, "improvements"),
     ]:
-        issues, count = await get_store_issues(
+        # Pending first, then skipped (so skipped appear at the end of each group)
+        pending, p_count = await get_store_issues(
             db, store_id,
             status=IssueStatus.PENDING,
             severity=severity,
             limit=100
         )
-        result[key] = issues
-        result[f"{key}_count"] = count
-    
-    # Get postponed issues
+        skipped, s_count = await get_store_issues(
+            db, store_id,
+            status=IssueStatus.SKIPPED,
+            severity=severity,
+            limit=100
+        )
+        result[key] = list(pending) + list(skipped)
+        result[f"{key}_count"] = p_count + s_count
+
+    # Postponed issues
     postponed, postponed_count = await get_store_issues(
         db, store_id,
         status=IssueStatus.POSTPONED,
@@ -190,7 +206,7 @@ async def get_issues_grouped(db: AsyncSession, store_id: int) -> dict:
     )
     result["postponed"] = postponed
     result["postponed_count"] = postponed_count
-    
+
     return result
 
 
