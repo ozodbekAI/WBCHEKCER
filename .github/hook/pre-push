@@ -1,11 +1,21 @@
 #!/bin/bash
+# pre-push hook: [deploy] bo'lsa deploy, bo'lmasa oddiy push haqida xabar beradi
+# 
+# O'rnatish: cp .github/hook/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
 
-TARGET=$1
+LAST_COMMIT_MSG=$(git log -1 --pretty=%B)
 
-if [ "$TARGET" == 'deploy' ]; then
-  echo "Triggering deploy workflow..."
-  git push origin main -o workflow-target=deploy
+if echo "$LAST_COMMIT_MSG" | grep -q "\[deploy\]"; then
+  echo ""
+  echo "🚀 [deploy] topildi!"
+  echo "   GitHub Actions ishga tushadi va server yangilanadi."
+  echo "   Kuzatish: https://github.com/ozodbekAI/WBCHEKCER/actions"
+  echo ""
 else
-  echo "Usage: $0 deploy"
-  exit 1
+  echo ""
+  echo "ℹ️  [deploy] yo'q - faqat kod push qilinadi, server yangilanmaydi."
+  echo "   Deploy uchun: git commit -m 'your message [deploy]'"
+  echo ""
 fi
+
+exit 0
