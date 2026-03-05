@@ -462,6 +462,80 @@ def _check_seo_keywords_in_text(text: str, keywords: list, min_count: int = 2) -
     return False, f"Отсутствуют ключевые слова категории: {', '.join(missing)}"
 
 
+def _resolve_current_value(
+    raw_data: dict, field_path: str | None, code: str | None = None, fallback: str | None = None,
+) -> str | None:
+    """
+    Derive current_value from *raw_data* — the single source of truth.
+    Prevents wrong values when AI/validator reports a different field's data.
+    """
+    if not raw_data or not isinstance(raw_data, dict):
+        return fallback
+    fp = (field_path or "").strip()
+    c = (code or "").strip().lower()
+
+    # Title issues
+    if fp == "title" or c in {"title_too_short", "no_title", "title_too_long", "title_policy_violation"}:
+        v = raw_data.get("title")
+        return str(v) if v is not None else fallback
+
+    # Description issues
+    if fp == "description" or c in {"no_description", "description_too_short", "description_too_long", "description_policy_violation"}:
+        v = raw_data.get("description")
+        return str(v) if v is not None else fallback
+
+    # Characteristic issues  (field_path = "characteristics.Цвет")
+    if fp.startswith("characteristics."):
+        char_name = fp.split("characteristics.", 1)[1].strip()
+        chars = raw_data.get("characteristics", [])
+        # WB API stores as list of {"name":...,"value":...}
+        if isinstance(chars, list):
+            for ch in chars:
+                if not isinstance(ch, dict):
+                    continue
+                if (ch.get("name") or "").strip().lower() == char_name.lower():
+                    v = ch.get("value", ch.get("values"))
+                    if isinstance(v, list):
+                        return ", ".join(str(x) for x in v)
+                    return str(v) if v is not None else fallback
+        # Parsed dict format
+        elif isinstance(chars, dict):
+            for k, v in chars.items():
+                if k.strip().lower() == char_name.lower():
+                    if isinstance(v, list):
+                        return ", ".join(str(x) for x in v)
+                    return str(v) if v is not None else fallback
+
+    return fallback
+
+
+_RE_REMOVED_TAG = re.compile(
+    r"[Уу]дал[её]н[а-яё]*\s+неподтвержд[её]нн[а-яё]*\s+признак[а-яё]*\s+['\'\u2018\u2019\u201c\u201d\"]?([а-яёА-ЯЁa-zA-Z0-9-]+)['\'\u2018\u2019\u201c\u201d\"]?",
+    re.IGNORECASE,
+)
+
+
+def _clean_title_ai_reason(reason: str, current_title: str, suggested_title: str) -> str:
+    """
+    Sanitise ai_reason for title issues.
+
+    The AI refix cycle may report \"Удалён неподтверждённый признак 'X'\"
+    where X only existed in an *intermediate* AI draft, never in the
+    original title.  This confuses users who see current_value without X.
+    """
+    if not reason:
+        return reason
+    m = _RE_REMOVED_TAG.search(reason)
+    if m:
+        removed_word = m.group(1).lower().strip("'\"")
+        title_lower = (current_title or "").lower()
+        if removed_word not in title_lower:
+            if suggested_title and current_title:
+                return "Название приведено к формуле WB"
+            return ""
+    return reason
+
+
 def _validate_title_fix(title: str, card: dict) -> tuple:
     """
     Validate AI-generated title against WB quality rules + SEO keywords.
@@ -637,7 +711,11 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 category=IssueCategory.CHARACTERISTICS,
                 title=_clip(wb_issue.get("message", "Ошибка характеристики"), 500),
                 description=_format_error_description(wb_issue),
-                current_value=str(wb_issue.get("value")) if wb_issue.get("value") else None,
+                current_value=_resolve_current_value(
+                    raw_data,
+                    f"characteristics.{wb_issue.get('name')}",
+                    fallback=str(wb_issue.get("value")) if wb_issue.get("value") else None,
+                ),
                 # Fixed field don't get suggestions
                 suggested_value=None if is_fixed else (_format_suggested(sv) if sv else None),
                 field_path=_clip(f"characteristics.{wb_issue.get('name')}", 255),
@@ -837,7 +915,12 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 category=_map_ai_category(ai_issue.get("category")),
                 title=_clip(ai_issue.get("message", "AI обнаружил проблему"), 500),
                 description=_format_ai_description(ai_issue),
-                current_value=str(ai_issue.get("value")) if ai_issue.get("value") else None,
+                current_value=_resolve_current_value(
+                    raw_data,
+                    normalized_issue_path,
+                    code=f"ai_{ai_issue.get('category', 'mixed')}",
+                    fallback=str(ai_issue.get("value")) if ai_issue.get("value") else None,
+                ),
                 field_path=_clip(normalized_issue_path, 255) if normalized_issue_path else None,
                 charc_id=ai_issue.get("charcId"),
                 allowed_values=ai_allowed_values,
@@ -1244,7 +1327,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
 
                 if rec_value:
                     iss.ai_suggested_value = rec_value
-                    iss.ai_reason = reason
+                    iss.ai_reason = _clean_title_ai_reason(reason, current_title, rec_value)
                     iss.ai_alternatives = []
                     iss.suggested_value = rec_value
                     ai_context["title"] = rec_value

@@ -104,6 +104,50 @@ def _norm_val(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
 
+def _live_current_value(issue: CardIssue) -> str | None:
+    """
+    Return the *live* value from the card's raw_data so the UI always shows
+    what the card currently has on WB.
+    """
+    card = issue.card
+    if card is None or not card.raw_data:
+        return issue.current_value
+
+    raw = card.raw_data
+    fp = (issue.field_path or "").strip()
+    c = (issue.code or "").strip().lower()
+
+    # Title issues
+    if fp == "title" or c.startswith("title_") or c in {"no_title", "title_policy_violation"}:
+        live = raw.get("title") or card.title
+        return str(live) if live is not None else issue.current_value
+
+    # Description issues
+    if fp == "description" or c.startswith("description_") or c in {"no_description", "description_policy_violation"}:
+        live = raw.get("description") or card.description
+        return str(live) if live is not None else issue.current_value
+
+    # Characteristic issues  (field_path = "characteristics.Цвет")
+    if fp.startswith("characteristics."):
+        char_name = fp.split("characteristics.", 1)[1].strip()
+        chars = raw.get("characteristics", [])
+        if isinstance(chars, list):
+            for ch in chars:
+                if isinstance(ch, dict) and (ch.get("name") or "").strip().lower() == char_name.lower():
+                    v = ch.get("value", ch.get("values"))
+                    if isinstance(v, list):
+                        return ", ".join(str(x) for x in v)
+                    return str(v) if v is not None else issue.current_value
+        elif isinstance(chars, dict):
+            for k, v in chars.items():
+                if k.strip().lower() == char_name.lower():
+                    if isinstance(v, list):
+                        return ", ".join(str(x) for x in v)
+                    return str(v) if v is not None else issue.current_value
+
+    return issue.current_value
+
+
 async def _auto_resolve_if_now_valid(
     issue: CardIssue, fresh_allowed: list, db: AsyncSession
 ) -> bool:
@@ -198,7 +242,7 @@ async def get_grouped_issues(
             category=issue.category.value,
             title=issue.title,
             description=issue.description,
-            current_value=issue.current_value,
+            current_value=_live_current_value(issue),
             suggested_value=issue.suggested_value,
             alternatives=issue.alternatives or [],
             charc_id=issue.charc_id,
@@ -455,7 +499,7 @@ async def get_next_queue_issue(
         category=issue.category.value,
         title=issue.title,
         description=issue.description,
-        current_value=issue.current_value,
+        current_value=_live_current_value(issue),
         suggested_value=issue.suggested_value,
         alternatives=issue.alternatives or [],
         charc_id=issue.charc_id,
