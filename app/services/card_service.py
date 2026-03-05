@@ -929,6 +929,11 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 status=IssueStatus.PENDING,
                 source=_clip("ai", 50),
             )
+            # Title/description issues from AI are always CRITICAL —
+            # they directly affect search visibility and conversion.
+            _np = (normalized_issue_path or "").strip().lower()
+            if _np in ("title", "description"):
+                issue.severity = IssueSeverity.CRITICAL
             issues.append(issue)
 
         # ── STEP 4: AI generates fixes ──────────────────
@@ -1756,7 +1761,7 @@ def _map_severity(severity: str) -> IssueSeverity:
     """Map string severity to enum"""
     mapping = {
         "critical": IssueSeverity.CRITICAL,
-        "error": IssueSeverity.WARNING,
+        "error": IssueSeverity.CRITICAL,
         "warning": IssueSeverity.WARNING,
         "info": IssueSeverity.INFO,
     }
