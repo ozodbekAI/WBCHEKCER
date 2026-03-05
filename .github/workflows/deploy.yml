@@ -12,8 +12,8 @@ jobs:
 
     env:
       USER: root
-      SERVER_IP: 5.129.219.79
-      SERVER_DIR: /root/wb-optimizer
+      SERVER_IP: 195.133.66.192
+      SERVER_DIR: /var/www/WBCHEKCER
 
     steps:
       - name: Checkout repository
@@ -47,7 +47,7 @@ jobs:
         run: |
           ssh ${{ env.USER }}@${{ env.SERVER_IP }} 'bash -s' << 'SSHEOF'
             set -e
-            cd /root/wb-optimizer
+            cd /var/www/WBCHEKCER
 
             echo ">>> [1/4] Venv tekshirilmoqda..."
             if [ ! -d "venv" ]; then
@@ -71,7 +71,7 @@ jobs:
         run: |
           ssh ${{ env.USER }}@${{ env.SERVER_IP }} 'bash -s' << 'SSHEOF'
             set -e
-            cd /root/wb-optimizer/frontend
+            cd /var/www/WBCHEKCER/frontend
 
             if [ ! -f "package.json" ]; then
               echo "Frontend yo'q, o'tkazib yuborildi"

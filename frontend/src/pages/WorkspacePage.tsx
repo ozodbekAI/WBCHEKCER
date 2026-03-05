@@ -27,7 +27,6 @@ import {
   Sparkles,
   X,
   Check,
-  Loader2,
   Users,
   ClipboardCheck,
   Shield,
@@ -51,12 +50,6 @@ export default function WorkspacePage() {
   const [showStoreMenu, setShowStoreMenu] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const profileRef = useRef<HTMLDivElement>(null);
-  const [reanalyzing, setReanalyzing] = useState(false);
-  const [reanalyzeTaskId, setReanalyzeTaskId] = useState<string | null>(null);
-  const [reanalyzeProgress, setReanalyzeProgress] = useState(0);
-  const [reanalyzeStep, setReanalyzeStep] = useState('');
-  const [reanalyzeResult, setReanalyzeResult] = useState<{ total_analyzed?: number; issues_found?: number } | null>(null);
-  const [reanalyzeError, setReanalyzeError] = useState<string | null>(null);
   const [modeModalOpen, setModeModalOpen] = useState(false);
   const [workMode, setWorkMode] = useState<'guided' | 'advanced'>('guided');
   const [startTarget, setStartTarget] = useState<'critical' | 'incoming' | 'cards' | null>(null);
@@ -154,57 +147,6 @@ export default function WorkspacePage() {
   };
 
   const canConnectStore = isRole('owner');
-
-  // ── Re-analyze handler ──
-  const handleReanalyze = async () => {
-    if (!activeStore || reanalyzing) return;
-    setReanalyzing(true);
-    setReanalyzeProgress(0);
-    setReanalyzeStep('Запуск...');
-    setReanalyzeResult(null);
-    setReanalyzeError(null);
-    try {
-      const res = await api.startResetAndAnalyze(activeStore.id);
-      const taskId = res.task_id;
-      setReanalyzeTaskId(taskId);
-
-      // Poll every 1.5s
-      const poll = setInterval(async () => {
-        try {
-          const st = await api.getSyncStatus(activeStore.id, taskId);
-          setReanalyzeProgress(st.progress || 0);
-          setReanalyzeStep(st.step || '');
-          if (st.status === 'completed') {
-            clearInterval(poll);
-            setReanalyzeResult(st.result || {});
-            setReanalyzeProgress(100);
-            loadDashboard();
-          } else if (st.status === 'failed') {
-            clearInterval(poll);
-            setReanalyzeError(st.error || st.step || 'Ошибка');
-            setReanalyzing(false);
-          } else if (st.status === 'cancelled') {
-            clearInterval(poll);
-            setReanalyzing(false);
-          }
-        } catch {
-          clearInterval(poll);
-          setReanalyzeError('Потеряна связь с сервером');
-          setReanalyzing(false);
-        }
-      }, 1500);
-    } catch (err: any) {
-      setReanalyzeError(err.message || 'Не удалось запустить анализ');
-      setReanalyzing(false);
-    }
-  };
-
-  const closeReanalyzeModal = () => {
-    setReanalyzing(false);
-    setReanalyzeTaskId(null);
-    setReanalyzeResult(null);
-    setReanalyzeError(null);
-  };
 
   if (!activeStore && !loading && stores.length === 0) {
     return (
@@ -596,28 +538,6 @@ export default function WorkspacePage() {
             <ChevronRight size={18} className="ws-tool-arrow" />
           </div>
 
-          {/* Re-analyze all */}
-          <div
-            className="ws-tool"
-            onClick={reanalyzing ? undefined : handleReanalyze}
-            style={reanalyzing ? { opacity: 0.6, cursor: 'not-allowed' } : {}}
-          >
-            <div className="ws-tool-icon" style={{ background: 'rgba(239,68,68,.12)' }}>
-              {reanalyzing ? <Loader2 size={20} className="ws-spin" style={{ color: '#ef4444' }} /> : <Sparkles size={20} style={{ color: '#ef4444' }} />}
-            </div>
-            <div className="ws-tool-body">
-              <span className="ws-tool-name">
-                {reanalyzing ? 'Анализ идёт...' : 'Переанализировать все'}
-              </span>
-              <span className="ws-tool-desc">
-                {reanalyzing
-                  ? `${reanalyzeStep} — ${reanalyzeProgress}%`
-                  : 'Удалить все проблемы и заново проанализировать карточки с AI'}
-              </span>
-            </div>
-            <ChevronRight size={18} className="ws-tool-arrow" />
-          </div>
-
           <div className="ws-tool" onClick={() => navigate('/workspace/approvals')}>
             <div className="ws-tool-icon">
               <ClipboardCheck size={20} />
@@ -784,70 +704,6 @@ export default function WorkspacePage() {
           </div>
         </div>
       </main>
-
-      {/* ═══════════ Re-analyze progress modal ═══════════ */}
-      {(reanalyzing || reanalyzeResult || reanalyzeError) && (
-        <div className="ws-mode-overlay" onClick={reanalyzeResult || reanalyzeError ? closeReanalyzeModal : undefined}>
-          <div className="ws-mode-modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
-            <div className="ws-mode-head">
-              <div>
-                <h3>{reanalyzeResult ? '✅ Анализ завершён' : reanalyzeError ? '❌ Ошибка' : '🔄 Переанализ карточек'}</h3>
-                <p style={{ color: '#6b7280', fontSize: 13 }}>
-                  {reanalyzeResult
-                    ? `Проанализировано ${reanalyzeResult.total_analyzed} карточек, найдено ${reanalyzeResult.issues_found} проблем`
-                    : reanalyzeError
-                      ? reanalyzeError
-                      : reanalyzeStep || 'Ожидание...'}
-                </p>
-              </div>
-              {(reanalyzeResult || reanalyzeError) && (
-                <button type="button" className="ws-mode-close" onClick={closeReanalyzeModal}>
-                  <X size={16} />
-                </button>
-              )}
-            </div>
-
-            {/* Progress bar */}
-            {!reanalyzeError && (
-              <div style={{ padding: '0 20px 20px' }}>
-                <div style={{
-                  width: '100%',
-                  height: 8,
-                  borderRadius: 4,
-                  background: '#f3f4f6',
-                  overflow: 'hidden',
-                }}>
-                  <div style={{
-                    width: `${reanalyzeProgress}%`,
-                    height: '100%',
-                    borderRadius: 4,
-                    background: reanalyzeResult ? '#22c55e' : 'linear-gradient(90deg, #6366f1, #8b5cf6)',
-                    transition: 'width 0.5s ease',
-                  }} />
-                </div>
-                <div style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  marginTop: 8,
-                  fontSize: 13,
-                  color: '#6b7280',
-                }}>
-                  <span>{reanalyzeStep}</span>
-                  <span style={{ fontWeight: 600, color: '#111' }}>{reanalyzeProgress}%</span>
-                </div>
-              </div>
-            )}
-
-            {(reanalyzeResult || reanalyzeError) && (
-              <div style={{ padding: '0 20px 20px', display: 'flex', justifyContent: 'flex-end' }}>
-                <button className="btn btn-primary" onClick={closeReanalyzeModal}>
-                  Закрыть
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
 
       {modeModalOpen ? (
         <div className="ws-mode-overlay" onClick={() => setModeModalOpen(false)}>
