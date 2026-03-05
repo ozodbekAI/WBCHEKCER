@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 from typing import List, Optional
-from sqlalchemy import select, update, func, and_
+from sqlalchemy import select, update, func, and_, or_, not_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -121,15 +121,23 @@ async def get_store_issues(
     limit: int = 50,
 ) -> tuple[List[CardIssue], int]:
     """Get all issues for a store with filters"""
+    # Exclude characteristics issues where AI couldn't generate any suggestion
+    _has_suggestion = or_(
+        not_(CardIssue.field_path.like('characteristics.%')),
+        CardIssue.field_path.is_(None),
+        CardIssue.suggested_value.isnot(None),
+        CardIssue.ai_suggested_value.isnot(None),
+    )
+
     base_filter = (
         select(CardIssue)
         .join(Card)
-        .where(Card.store_id == store_id)
+        .where(Card.store_id == store_id, _has_suggestion)
     )
     count_filter = (
         select(func.count(CardIssue.id))
         .join(Card)
-        .where(Card.store_id == store_id)
+        .where(Card.store_id == store_id, _has_suggestion)
     )
     
     if status:
@@ -255,6 +263,23 @@ async def skip_issue(
     return issue
 
 
+async def unskip_issue(
+    db: AsyncSession,
+    issue: CardIssue,
+) -> CardIssue:
+    """Reset a skipped issue back to pending so it can be fixed."""
+    issue.status = IssueStatus.PENDING
+    issue.postpone_reason = None
+    issue.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(issue)
+
+    await _update_card_issue_counts(db, issue.card_id)
+
+    return issue
+
+
 async def postpone_issue(
     db: AsyncSession,
     issue: CardIssue,
@@ -368,33 +393,71 @@ async def get_next_issue(
     db: AsyncSession,
     store_id: int,
     after_issue_id: Optional[int] = None,
+    card_id: Optional[int] = None,
+    severity: Optional[str] = None,
 ) -> Optional[CardIssue]:
     """
     Get next pending issue in the queue for sequential fixing.
-    Order: critical → warning → improvement, then by score_impact desc.
-    If after_issue_id is provided, skip all issues up to and including that ID.
+    If card_id is provided, returns only issues for that specific card.
+    If severity provided, filters by that severity only.
+    Otherwise orders by card priority (cards with critical issues first),
+    then by severity/score_impact within the card.
     """
+    # Exclude characteristics issues where AI couldn't generate a suggestion
+    _has_suggestion = or_(
+        not_(CardIssue.field_path.like('characteristics.%')),
+        CardIssue.field_path.is_(None),
+        CardIssue.suggested_value.isnot(None),
+        CardIssue.ai_suggested_value.isnot(None),
+    )
+
+    conditions = [
+        Card.store_id == store_id,
+        CardIssue.status == IssueStatus.PENDING,
+        _has_suggestion,
+    ]
+
+    if card_id is not None:
+        conditions.append(CardIssue.card_id == card_id)
+
+    if after_issue_id is not None:
+        conditions.append(CardIssue.id > after_issue_id)
+
+    if severity:
+        try:
+            conditions.append(CardIssue.severity == IssueSeverity(severity))
+        except ValueError:
+            pass
+
     query = (
         select(CardIssue)
         .join(Card)
         .options(selectinload(CardIssue.card))
-        .where(
-            Card.store_id == store_id,
-            CardIssue.status == IssueStatus.PENDING,
-        )
+        .where(*conditions)
         .order_by(
             CardIssue.severity.asc(),  # CRITICAL=0 first
             CardIssue.score_impact.desc(),
             CardIssue.id.asc(),
         )
+        .limit(1)
     )
-    
-    if after_issue_id is not None:
-        query = query.where(CardIssue.id > after_issue_id)
-    
-    query = query.limit(1)
+
     result = await db.execute(query)
     return result.scalar_one_or_none()
+
+
+async def get_card_pending_count(
+    db: AsyncSession,
+    card_id: int,
+) -> int:
+    """Count pending issues for a specific card."""
+    result = await db.execute(
+        select(func.count(CardIssue.id)).where(
+            CardIssue.card_id == card_id,
+            CardIssue.status == IssueStatus.PENDING,
+        )
+    )
+    return result.scalar() or 0
 
 
 async def get_fixed_issues_for_store(
@@ -415,8 +478,22 @@ async def get_fixed_issues_for_store(
     return list(result.scalars().all())
 
 
-async def get_queue_progress(db: AsyncSession, store_id: int) -> dict:
-    """Get progress of issue fixing queue"""
+async def get_queue_progress(db: AsyncSession, store_id: int, severity: Optional[str] = None) -> dict:
+    """Get progress of issue fixing queue, optionally filtered by severity."""
+    severity_filter = []
+    if severity:
+        try:
+            severity_filter = [CardIssue.severity == IssueSeverity(severity)]
+        except ValueError:
+            pass
+
+    _has_suggestion = or_(
+        not_(CardIssue.field_path.like('characteristics.%')),
+        CardIssue.field_path.is_(None),
+        CardIssue.suggested_value.isnot(None),
+        CardIssue.ai_suggested_value.isnot(None),
+    )
+
     # Total pending
     pending_result = await db.execute(
         select(func.count(CardIssue.id))
@@ -424,6 +501,8 @@ async def get_queue_progress(db: AsyncSession, store_id: int) -> dict:
         .where(
             Card.store_id == store_id,
             CardIssue.status == IssueStatus.PENDING,
+            _has_suggestion,
+            *severity_filter,
         )
     )
     pending = pending_result.scalar() or 0
@@ -435,6 +514,8 @@ async def get_queue_progress(db: AsyncSession, store_id: int) -> dict:
         .where(
             Card.store_id == store_id,
             CardIssue.status == IssueStatus.FIXED,
+            _has_suggestion,
+            *severity_filter,
         )
     )
     fixed = fixed_result.scalar() or 0
@@ -446,6 +527,8 @@ async def get_queue_progress(db: AsyncSession, store_id: int) -> dict:
         .where(
             Card.store_id == store_id,
             CardIssue.status == IssueStatus.SKIPPED,
+            _has_suggestion,
+            *severity_filter,
         )
     )
     skipped = skipped_result.scalar() or 0
@@ -457,6 +540,8 @@ async def get_queue_progress(db: AsyncSession, store_id: int) -> dict:
         .where(
             Card.store_id == store_id,
             CardIssue.status == IssueStatus.POSTPONED,
+            _has_suggestion,
+            *severity_filter,
         )
     )
     postponed = postponed_result.scalar() or 0

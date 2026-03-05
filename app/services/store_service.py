@@ -9,6 +9,12 @@ from ..schemas import StoreCreate, StoreUpdate
 
 
 async def create_store(db: AsyncSession, owner_id: int, store_data: StoreCreate) -> Store:
+    await ensure_store_not_exists(
+        db,
+        owner_id=owner_id,
+        api_key=store_data.api_key,
+    )
+
     store = Store(
         owner_id=owner_id,
         name=store_data.name,
@@ -19,6 +25,44 @@ async def create_store(db: AsyncSession, owner_id: int, store_data: StoreCreate)
     await db.commit()
     await db.refresh(store)
     return store
+
+
+async def ensure_account_can_create_store(db: AsyncSession, user: User) -> None:
+    """
+    Business rule:
+    - Only owner can connect a store.
+    """
+    role_val = user.role.value if hasattr(user.role, "value") else str(user.role)
+    if role_val != "owner":
+        raise ValueError("Only owner can connect a new store")
+
+
+async def ensure_store_not_exists(
+    db: AsyncSession,
+    owner_id: int,
+    api_key: Optional[str] = None,
+    wb_supplier_id: Optional[str] = None,
+) -> None:
+    """Prevent connecting the same store twice for one owner."""
+    if api_key:
+        by_key = await db.execute(
+            select(Store).where(
+                Store.owner_id == owner_id,
+                Store.api_key == api_key,
+            )
+        )
+        if by_key.scalar_one_or_none():
+            raise ValueError("Store with this API key is already connected")
+
+    if wb_supplier_id:
+        by_supplier = await db.execute(
+            select(Store).where(
+                Store.owner_id == owner_id,
+                Store.wb_supplier_id == str(wb_supplier_id),
+            )
+        )
+        if by_supplier.scalar_one_or_none():
+            raise ValueError("This WB supplier is already connected")
 
 
 async def get_store_by_id(db: AsyncSession, store_id: int) -> Optional[Store]:

@@ -58,11 +58,19 @@ class Card(Base):
     
     # Raw WB data
     raw_data = Column(JSON, default=dict)
+
+    # Product DNA — detailed technical description generated from photo ONCE,
+    # reused in all subsequent AI calls (audit, title, description generation).
+    product_dna = Column(Text, nullable=True)
     
     # Timestamps
     last_analysis_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # After applying our own fix to WB, skip the next scheduler re-analysis
+    # (WB updates updatedAt after our fix, which would otherwise trigger re-analysis)
+    skip_next_reanalyze = Column(Boolean, default=False, nullable=False, server_default="false")
     
     # Relationships
     store = relationship("Store", back_populates="cards")

@@ -18,6 +18,11 @@ export default function LoginPage() {
       await login(email, password);
       navigate('/workspace');
     } catch (err: any) {
+      if (err?.code === 'ACCOUNT_NOT_VERIFIED' || /не активирован/i.test(String(err?.message || ''))) {
+        localStorage.setItem('pending_verify_email', err?.email || email);
+        navigate(`/verify-email?email=${encodeURIComponent(err?.email || email)}`);
+        return;
+      }
       setError(err.message || 'Ошибка входа');
     } finally {
       setLoading(false);

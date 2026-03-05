@@ -6,11 +6,12 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from ..core.database import get_db, AsyncSessionLocal
 from ..core.security import get_current_user
 from ..models import User, Card
+from ..models.issue import CardIssue
 from ..services import (
     get_store_by_id, WildberriesAPI,
     sync_cards_from_wb, update_store_stats,
@@ -351,24 +352,29 @@ async def _run_analyze_all(task_id: str, store_id: int):
         task["progress"] = 5
 
         async with AsyncSessionLocal() as db:
-            card_res = await db.execute(
-                select(Card).where(Card.store_id == store_id)
+            # Load only IDs to avoid expired-object issues after each commit
+            id_res = await db.execute(
+                select(Card.id).where(Card.store_id == store_id)
             )
-            cards = card_res.scalars().all()
-            total = len(cards)
+            card_ids = [row[0] for row in id_res.all()]
+            total = len(card_ids)
             task["step"] = f"Найдено {total} карточек для анализа"
             task["progress"] = 10
 
             issues_found = 0
 
-            for i, card in enumerate(cards):
+            for i, cid in enumerate(card_ids):
                 pct = 10 + int((i + 1) / max(total, 1) * 80)
                 task["progress"] = pct
-                task["step"] = (
-                    f"[{i + 1}/{total}] Анализ: "
-                    f"{(card.title or '')[:40] or str(card.nm_id)}..."
-                )
                 try:
+                    card_row = await db.execute(select(Card).where(Card.id == cid))
+                    card = card_row.scalar_one_or_none()
+                    if not card:
+                        continue
+                    task["step"] = (
+                        f"[{i + 1}/{total}] Анализ: "
+                        f"{(card.title or '')[:40] or str(card.nm_id)}..."
+                    )
                     issues, _ = await analyze_card(db, card, use_ai=True)
                     issues_found += len(issues)
                 except Exception:
@@ -429,3 +435,119 @@ async def start_analyze_all(
     asyncio.create_task(_run_analyze_all(task_id, store_id))
     return {"task_id": task_id, "status": "started", "mode": "analyze_all"}
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reset ALL analyses + re-analyze
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _run_reset_and_analyze(task_id: str, store_id: int):
+    """Background task: delete all issues/scores for store, then re-analyze all cards."""
+    task = SYNC_TASKS[task_id]
+    try:
+        task["status"] = "running"
+        task["step"] = "Очистка старых анализов..."
+        task["progress"] = 2
+
+        async with AsyncSessionLocal() as db:
+            # Get all card ids for this store
+            card_res = await db.execute(select(Card.id).where(Card.store_id == store_id))
+            card_ids = [row[0] for row in card_res.all()]
+
+            if card_ids:
+                # Delete all issues
+                await db.execute(delete(CardIssue).where(CardIssue.card_id.in_(card_ids)))
+                # Reset scores
+                from sqlalchemy import update as sa_update
+                await db.execute(
+                    sa_update(Card)
+                    .where(Card.id.in_(card_ids))
+                    .values(score=0, score_breakdown={})
+                )
+                await db.commit()
+
+            task["step"] = f"Анализ {len(card_ids)} карточек..."
+            task["progress"] = 5
+            total = len(card_ids)
+            issues_found = 0
+
+            for i, cid in enumerate(card_ids):
+                pct = 5 + int((i + 1) / max(total, 1) * 88)
+                task["progress"] = pct
+                try:
+                    # Re-fetch card fresh each time to avoid expired state after commit
+                    card_row = await db.execute(select(Card).where(Card.id == cid))
+                    card = card_row.scalar_one_or_none()
+                    if not card:
+                        continue
+                    task["step"] = (
+                        f"[{i + 1}/{total}] "
+                        f"{(card.title or '')[:40] or str(card.nm_id)}..."
+                    )
+                    issues, _ = await analyze_card(db, card, use_ai=True)
+                    issues_found += len(issues)
+                except Exception:
+                    pass
+
+            from ..services import update_store_stats
+            await update_store_stats(db, store_id)
+
+        task["status"] = "completed"
+        task["progress"] = 100
+        task["step"] = f"Готово! Найдено {issues_found} проблем"
+        task["result"] = {"total_analyzed": total, "issues_found": issues_found}
+    except Exception as e:
+        task["status"] = "failed"
+        task["error"] = str(e)
+        task["step"] = f"Ошибка: {e}"
+
+
+@router.post("/{store_id}/sync/reset-and-analyze")
+async def start_reset_and_analyze(
+    store_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete all existing analyses for this store, then re-analyze all cards."""
+    if not current_user.has_permission("cards.sync"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Только старший менеджер или владелец может запустить анализ",
+        )
+    store = await get_store_by_id(db, store_id)
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+    _check_sync_access(store, current_user, store_id)
+
+    # Cancel any running task for this store
+    for task in SYNC_TASKS.values():
+        if task.get("store_id") == store_id and task.get("status") == "running":
+            task["status"] = "cancelled"
+
+    task_id = str(uuid.uuid4())
+    SYNC_TASKS[task_id] = {
+        "task_id": task_id,
+        "store_id": store_id,
+        "status": "pending",
+        "step": "Запуск...",
+        "progress": 0,
+        "mode": "reset_and_analyze",
+        "result": None,
+        "error": None,
+        "created_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
+    }
+
+    asyncio.create_task(_run_reset_and_analyze(task_id, store_id))
+    return {"task_id": task_id, "status": "started", "mode": "reset_and_analyze"}
+
+
+# ── Scheduler status ─────────────────────────────────────────────────────────
+
+@router.get("/scheduler/status", tags=["Scheduler"])
+async def get_scheduler_status(
+    current_user: User = Depends(get_current_user),
+):
+    """Get auto-analysis scheduler status: last/next tick times."""
+    from ..services.card_scheduler import card_scheduler
+    return card_scheduler.get_status()

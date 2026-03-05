@@ -54,6 +54,8 @@ class IssueWithCard(IssueOut):
     card_title: Optional[str] = None
     card_vendor_code: Optional[str] = None
     card_photos: List[str] = []
+    card_pending_count: int = 0  # Remaining pending issues for this card (including this one)
+    requires_fixed_file: bool = False  # True if characteristic is is_fixed in WB catalog
 
 
 class IssueListOut(BaseModel):

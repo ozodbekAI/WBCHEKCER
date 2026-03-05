@@ -125,6 +125,7 @@ class User(Base):
     first_name = Column(String(100), nullable=True)
     last_name = Column(String(100), nullable=True)
     phone = Column(String(20), nullable=True)
+    avatar_url = Column(String(500), nullable=True)
     role = Column(
         Enum(UserRole, values_callable=lambda x: [e.value for e in x]),
         default=UserRole.USER,

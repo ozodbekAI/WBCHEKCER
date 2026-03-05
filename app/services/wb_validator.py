@@ -161,16 +161,15 @@ class DataCatalog:
             self.keywords_by_subject = {}
 
     def _load_sprav(self) -> None:
-        """Load allowed values from справочники"""
+        """Load allowed values ONLY from Ключевые_слова.json.
+        Colors are handled separately via color_names.json."""
         merged: Dict[str, List[str]] = {}
-        
-        for p in ("data/Справочник генерация.json", "data/fill_dict.json"):
-            try:
-                d = self._read_json(p)
-            except KeyError:
-                continue
-            if not isinstance(d, dict):
-                continue
+
+        try:
+            d = self._read_json("data/Ключевые_слова.json")
+        except KeyError:
+            d = None
+        if isinstance(d, dict):
             for name, arr in d.items():
                 if name not in merged:
                     merged[name] = []
@@ -531,6 +530,7 @@ class ErrorReason:
     min: Optional[int] = None
     max: Optional[int] = None
     actual: Optional[int] = None
+    over_limit: Optional[bool] = None  # True=exceeded max, False=below min
     # For allowed_values errors:
     invalidValues: Optional[List[str]] = None
     exampleValues: Optional[List[str]] = None
@@ -587,10 +587,49 @@ class CardValidator:
 
         # Build set of valid characteristic names for this subject (for wrong_category check)
         valid_char_names: Optional[Set[str]] = None
+        subject_chars_list: List[CharMetadata] = []
         if sid:
             subject_chars = self.catalog.get_subject_chars(sid)
             if subject_chars:
                 valid_char_names = {_norm(cm.name) for cm in subject_chars}
+                subject_chars_list = subject_chars
+
+        # ── Check REQUIRED characteristics that are EMPTY ──────────────────
+        if subject_chars_list:
+            filled_names = set()
+            for ch in chars:
+                raw_value = ch.get("value")
+                values = _as_list(raw_value)
+                if values and not all(str(v).strip() == "" for v in values):
+                    filled_names.add(_norm(str(ch.get("name") or "").strip()))
+            for cm in subject_chars_list:
+                if cm.required and _norm(cm.name) not in filled_names:
+                    # Limit allowed values for response (same as _validate_one_characteristic)
+                    _raw_av = self.catalog.get_allowed_values(cm.name)
+                    if _raw_av:
+                        if _norm(cm.name) == "цвет":
+                            _av = self.catalog.get_color_parent_names()
+                        else:
+                            _av = _raw_av
+                    else:
+                        _av = None
+
+                    out.append(ValidationIssue(
+                        charcId=cm.charc_id,
+                        name=cm.name,
+                        value=None,
+                        message=f"Обязательная характеристика «{cm.name}» не заполнена. Без неё товар не попадёт в фильтры WB.",
+                        severity="critical",
+                        category="qualification",
+                        errors=[ErrorReason(
+                            type="missing_required",
+                            message=f"Характеристика '{cm.name}' является обязательной для категории товара.",
+                        )],
+                        allowed_values=_av,
+                        suggested_value=None,
+                        auto_fixed=False,
+                        is_fixed_field=False,
+                    ))
 
         for ch in chars:
             char_name = str(ch.get("name") or "").strip()
@@ -678,22 +717,26 @@ class CardValidator:
             max_v = lim.get("max", 999)
             actual = len(values)
             if actual < min_v or actual > max_v:
+                over = actual > max_v
                 reasons.append(ErrorReason(
                     type="limit",
-                    message=f"Количество значений ({actual}) вне допустимого диапазона ({min_v}-{max_v})",
+                    message=f"Количество значений ({actual}) {'превышает максимум' if over else 'меньше минимума'} ({min_v}-{max_v})",
                     min=min_v,
                     max=max_v,
                     actual=actual,
+                    over_limit=over,
                 ))
-                # Try auto-fix limit
-                fixed_list = self.catalog.auto_fix_limit_violation(
-                    char_name,
-                    [str(v) for v in values],
-                    min_v, max_v,
-                )
-                if fixed_list is not None:
-                    suggested_value = fixed_list if len(fixed_list) > 1 else fixed_list[0]
-                    auto_fixed = True
+                # Try auto-fix limit (skip for color fields — AI handles palette)
+                is_color_char = "цвет" in char_name.lower()
+                if not is_color_char:
+                    fixed_list = self.catalog.auto_fix_limit_violation(
+                        char_name,
+                        [str(v) for v in values],
+                        min_v, max_v,
+                    )
+                    if fixed_list is not None:
+                        suggested_value = fixed_list if len(fixed_list) > 1 else fixed_list[0]
+                        auto_fixed = True
 
         # 2) Check allowed values
         allowed = self.catalog.get_allowed_values(char_name)
@@ -702,7 +745,7 @@ class CardValidator:
                 # For AI/UI keep compact parent-color list, not hundreds of shades.
                 allowed_values = self.catalog.get_color_parent_names()
             else:
-                allowed_values = allowed[:50]  # Limit for response
+                allowed_values = allowed
             allowed_norm = {_norm(x) for x in allowed}
             invalid = [v for v in values if _norm(str(v)) not in allowed_norm]
             if invalid:
@@ -746,8 +789,13 @@ class CardValidator:
         
         # Build message
         parts = []
-        if any(r.type == "limit" for r in reasons):
-            parts.append("превышен лимит")
+        limit_reasons = [r for r in reasons if r.type == "limit"]
+        if limit_reasons:
+            lr = limit_reasons[0]
+            if getattr(lr, 'over_limit', True):
+                parts.append("превышен лимит")
+            else:
+                parts.append("недостаточно значений")
         if any(r.type == "allowed_values" for r in reasons):
             parts.append("недопустимые значения")
         msg = f"Характеристика '{char_name}': {' + '.join(parts)}"
@@ -827,3 +875,64 @@ def validate_card_characteristics(card: Dict[str, Any]) -> List[Dict[str, Any]]:
             "is_fixed_field": issue.is_fixed_field,
         })
     return result
+
+
+def calculate_card_fcs(card: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Feature Completeness Score (FCS) — spec 1.3.13.
+    Returns dict with fcs (0-100), required_filled, required_total,
+    popular_filled, popular_total, interpretation.
+    """
+    catalog = get_catalog()
+    subject_id = card.get("subjectID") or card.get("subject_id")
+    if isinstance(subject_id, str) and str(subject_id).isdigit():
+        subject_id = int(subject_id)
+
+    if not subject_id:
+        return {"fcs": 0, "required_filled": 0, "required_total": 0,
+                "popular_filled": 0, "popular_total": 0, "interpretation": "Категория не определена"}
+
+    subject_chars = catalog.get_subject_chars(subject_id)
+    if not subject_chars:
+        return {"fcs": 0, "required_filled": 0, "required_total": 0,
+                "popular_filled": 0, "popular_total": 0, "interpretation": "Нет данных по категории"}
+
+    # Build set of filled characteristic names
+    filled_names: set = set()
+    chars = card.get("characteristics") or []
+    for ch in (chars if isinstance(chars, list) else []):
+        raw_value = ch.get("value")
+        values = _as_list(raw_value)
+        if values and not all(str(v).strip() == "" for v in values):
+            filled_names.add(_norm(str(ch.get("name") or "").strip()))
+
+    req_chars = [c for c in subject_chars if c.required and not c.is_fixed]
+    pop_chars = [c for c in subject_chars if c.popular and not c.required and not c.is_fixed]
+
+    req_total = len(req_chars)
+    req_filled = sum(1 for c in req_chars if _norm(c.name) in filled_names)
+    pop_total = len(pop_chars)
+    pop_filled = sum(1 for c in pop_chars if _norm(c.name) in filled_names)
+
+    # FCS = 70% required + 30% popular
+    req_score = (req_filled / req_total * 70.0) if req_total > 0 else 70.0
+    pop_score = (pop_filled / pop_total * 30.0) if pop_total > 0 else 30.0
+    fcs = round(req_score + pop_score)
+
+    if fcs < 60:
+        interpretation = "Критически плохо — карточка не попадёт в фильтры"
+    elif fcs < 80:
+        interpretation = "Средне — заполните обязательные поля"
+    elif fcs < 90:
+        interpretation = "Хорошо"
+    else:
+        interpretation = "Отлично"
+
+    return {
+        "fcs": fcs,
+        "required_filled": req_filled,
+        "required_total": req_total,
+        "popular_filled": pop_filled,
+        "popular_total": pop_total,
+        "interpretation": interpretation,
+    }

@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Card, CardIssue, IssueSeverity, IssueCategory, IssueStatus
 from ..services.analyzer import card_analyzer
-from ..services.wb_validator import validate_card_characteristics, get_catalog, find_best_match
+from ..services.wb_validator import validate_card_characteristics, get_catalog, find_best_match, calculate_card_fcs
 from ..services.gemini_service import get_gemini_service, get_ai_service
 from ..services.vision_service import vision_service
 from ..services.title_policy import validate_title
@@ -605,34 +605,14 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     await db.execute(
         delete(CardIssue).where(CardIssue.card_id == card.id)
     )
+    await db.flush()  # Ensure delete is applied before adding new issues
     
     issues: List[CardIssue] = []
     raw_data = card.raw_data or {}
     ai_context = copy.deepcopy(raw_data) if isinstance(raw_data, dict) else {}
-    
-    # ── STEP 1: Basic code analysis ──────────────────────
-    code_issues = card_analyzer.analyze_card(card)
-    score_breakdown = card_analyzer.calculate_score(card, code_issues)
-    
-    for issue_data in code_issues:
-        issue = CardIssue(
-            card_id=card.id,
-            code=_clip(issue_data["code"], 100),
-            severity=issue_data["severity"],
-            category=issue_data["category"],
-            title=_clip(issue_data["title"], 500),
-            description=issue_data["description"],
-            current_value=str(issue_data.get("current_value")) if issue_data.get("current_value") else None,
-            suggested_value=str(issue_data.get("suggested_value")) if issue_data.get("suggested_value") else None,
-            alternatives=issue_data.get("alternatives", []),
-            field_path=_clip(issue_data.get("field_path"), 255) if issue_data.get("field_path") else None,
-            score_impact=issue_data["score_impact"],
-            status=IssueStatus.PENDING,
-            source=_clip("code", 50),
-        )
-        issues.append(issue)
-    
-    # ── STEP 2: WB catalog validation (characteristics) ──
+    score_breakdown = {}  # No basic code analysis — AI handles everything
+
+    # ── STEP 1: WB catalog validation (allowed values + limits only) ──
     # Now includes auto-fix suggestions from catalog data
     wb_issues_data: List[dict] = []
     if raw_data:
@@ -673,13 +653,20 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 issue.source = "auto_fix"
             issues.append(issue)
 
-    # ── STEP 2.5: Fixed file check ────────────────────────
+    # ── STEP 1.5: Fixed file check ────────────────────────
     # Compare card characteristics against store's uploaded fixed values.
     # Fixed file values always take priority — mismatch is a WARNING.
+    # Also collect fixed char names to exclude from AI audit.
+    fixed_char_names: set[str] = set()
     nm_id = raw_data.get("nmID") or raw_data.get("nm_id") or getattr(card, "nm_id", None)
     if nm_id and raw_data:
         fixed_entries = await ffs.get_entries_for_card(db, card.store_id, nm_id)
         if fixed_entries:
+            # Record all characteristic names that have fixed values
+            for fe in fixed_entries:
+                char_name = getattr(fe, 'char_name', None) or (fe.get('char_name') if isinstance(fe, dict) else None)
+                if char_name:
+                    fixed_char_names.add(char_name.lower())
             mismatches = ffs.compare_card_with_fixed(raw_data, fixed_entries)
             for mm in mismatches:
                 ff_issue = CardIssue(
@@ -703,28 +690,36 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
 
     # ── STEP 2.5: Generate / load Product DNA ────────────────
     # Photo analyzed ONCE and cached in card.product_dna.
-    # All subsequent Gemini calls use this text → no re-sending photo.
-    if use_ai and vision_service.is_enabled and raw_data:
-        if not card.product_dna:
-            photo_urls: list = []
-            media = raw_data.get("photos") or raw_data.get("mediaFiles") or []
-            if isinstance(media, list) and media:
-                first = media[0]
-                url = (first.get("big") or first.get("c516x688") or first.get("square")
-                       or first.get("url") or "") if isinstance(first, dict) else str(first)
-                if url:
-                    photo_urls.append(url)
-            if photo_urls:
-                subject_name = raw_data.get("subjectName") or raw_data.get("subject_name") or ""
-                dna_text = await vision_service.generate_product_dna_text(
-                    photo_urls[0], subject_name
+    # All subsequent AI calls use this text → no re-sending photo.
+    # Provider selection: GPT uses VisionService (GPT-4o-mini), Gemini uses GeminiService.
+    if use_ai and raw_data and not card.product_dna:
+        photo_url_dna: str = ""
+        media = raw_data.get("photos") or raw_data.get("mediaFiles") or []
+        if isinstance(media, list) and media:
+            first = media[0]
+            photo_url_dna = (first.get("big") or first.get("c516x688") or first.get("square")
+                   or first.get("url") or "") if isinstance(first, dict) else str(first)
+
+        if photo_url_dna:
+            subject_name_dna = raw_data.get("subjectName") or raw_data.get("subject_name") or ""
+            ai_svc = get_ai_service()
+            # Use Gemini's built-in vision if provider=gemini, else use VisionService (GPT-4o-mini)
+            if ai_svc.is_enabled() and hasattr(ai_svc, "generate_product_dna_text"):
+                dna_text = await asyncio.to_thread(
+                    ai_svc.generate_product_dna_text, photo_url_dna, subject_name_dna
                 )
-                if dna_text:
-                    card.product_dna = dna_text
-                    db.add(card)
+            elif vision_service.is_enabled:
+                dna_text = await vision_service.generate_product_dna_text(
+                    photo_url_dna, subject_name_dna
+                )
+            else:
+                dna_text = ""
+            if dna_text:
+                card.product_dna = dna_text
+                db.add(card)
     product_dna: str = card.product_dna or ""
 
-    # ── STEP 3: AI audit (if enabled) ────────────────────
+    # ── STEP 2: AI audit (if enabled) ────────────────────
     gemini = get_ai_service()
     if use_ai and gemini.is_enabled() and raw_data:
         # Enrich raw_data with valid characteristic names for this category
@@ -736,6 +731,14 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             subject_chars = catalog.get_subject_chars(int(subject_id))
             if subject_chars:
                 audit_data["_valid_char_names"] = [cm.name for cm in subject_chars]
+            # Also pass SEO keywords for this category into audit
+            subject_name = raw_data.get("subjectName") or raw_data.get("subject_name") or ""
+            seo_kws = catalog.get_keywords_for_subject(subject_name)
+            if seo_kws:
+                audit_data["_seo_keywords"] = seo_kws
+        # Tell AI which characteristics are controlled by fixed file (don't audit them)
+        if fixed_char_names:
+            audit_data["_fixed_file_chars"] = list(fixed_char_names)
         ai_issues, audit_tokens = await asyncio.to_thread(
             gemini.audit_card, audit_data, product_dna
         )
@@ -816,6 +819,17 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 })
 
             normalized_issue_path = _normalize_issue_field_path(ai_issue.get("name"))
+
+            # ── Populate allowed_values from catalog for AI-generated issues ──
+            ai_allowed_values: List[str] = []
+            if normalized_issue_path and normalized_issue_path.startswith("characteristics."):
+                char_name = normalized_issue_path.split("characteristics.", 1)[1].strip()
+                if char_name:
+                    try:
+                        ai_allowed_values = get_catalog().get_allowed_values(char_name) or []
+                    except Exception:
+                        ai_allowed_values = []
+
             issue = CardIssue(
                 card_id=card.id,
                 code=_clip(f"ai_{ai_issue.get('category', 'mixed')}", 100),
@@ -826,6 +840,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 current_value=str(ai_issue.get("value")) if ai_issue.get("value") else None,
                 field_path=_clip(normalized_issue_path, 255) if normalized_issue_path else None,
                 charc_id=ai_issue.get("charcId"),
+                allowed_values=ai_allowed_values,
                 error_details=ai_error_details,
                 score_impact=_calculate_ai_score_impact(ai_issue),
                 status=IssueStatus.PENDING,
@@ -854,6 +869,8 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
         for idx, iss in enumerate(issues):
             already_auto_fixed = (iss.source == "auto_fix")
             is_skip = iss.code in _SKIP_AI_CODES
+            # fixed_file issues already have the correct value from uploaded file — no AI needed
+            is_fixed_file = (iss.source == "fixed_file")
             # wrong_category issues already have __CLEAR__ as suggested_value — no AI needed
             is_wrong_category = iss.code == "wb_wrong_category"
             is_text_issue = _is_title_issue_obj(iss) or _is_description_issue_obj(iss)
@@ -865,7 +882,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 issue_error_type = "description"
             
             # Batch AI is for non-text issues only (allowed values / limits / logic).
-            if not is_skip and not already_auto_fixed and not is_wrong_category and not is_text_issue:
+            if not is_skip and not already_auto_fixed and not is_fixed_file and not is_wrong_category and not is_text_issue:
                 fixable_issues.append({
                     "id": str(idx),
                     "name": iss.field_path or iss.title,
@@ -999,6 +1016,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                             iss.error_details,
                             char_name=iss.field_path or iss.title,
                             current_value=iss.current_value,
+                            product_dna=product_dna,
                         )
 
                     # If fuzzy match found a better value, use it immediately
@@ -1034,6 +1052,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                                 iss.error_details,
                                 char_name=iss.field_path or iss.title,
                                 current_value=iss.current_value,
+                                product_dna=product_dna,
                             )
 
                             # Apply fuzzy match correction if found
@@ -1141,6 +1160,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                                     iss.error_details,
                                     char_name=iss.field_path or iss.title,
                                     current_value=iss.current_value,
+                                    product_dna=product_dna,
                                 )
                                 if corrected is not None:
                                     rec_value = corrected
@@ -1185,6 +1205,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                     gemini.generate_title,
                     card=ai_context,
                     product_dna=product_dna,
+                    seo_keywords=_get_subject_keywords(ai_context),
                 )
                 _add_tokens(gen_t)
                 candidate = _as_text(gen_result.get("recommended_value")) or current_title
@@ -1246,6 +1267,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 gemini.generate_description,
                 card=ai_context,
                 product_dna=product_dna,
+                seo_keywords=_get_subject_keywords(ai_context),
             )
             _add_tokens(gen_t)
             candidate = _as_text(gen_result.get("recommended_value")) or current_description
@@ -1311,12 +1333,32 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     # Keep only fixed-file mismatches for such fields.
     issues = _drop_non_fixed_date_issues(issues)
 
-    # ── STEP 6.5: Collapse overlapping issues covered by compound swaps ─
+    # ── Drop AI issues for characteristics that are in the fixed file ──
+    if fixed_char_names:
+        kept: List[CardIssue] = []
+        for iss in issues:
+            if iss.source == "ai" and iss.field_path:
+                char_name = iss.field_path.split("characteristics.", 1)[-1].strip().lower() if "characteristics." in iss.field_path else ""
+                if char_name and char_name in fixed_char_names:
+                    continue  # Skip — controlled by fixed file
+            kept.append(iss)
+        issues = kept
+
+    # ── Collapse overlapping issues covered by compound swaps ─
     issues = _collapse_compound_overlaps(issues)
 
-    # ── STEP 7: Ensure every issue has a suggested_value ─
+    # ── Ensure every issue has a suggested_value ─
     _ensure_all_suggested_values(issues)
     issues = _drop_noop_issues(issues)
+
+    # ── Drop issues where AI returned null suggested_value ──
+    # If AI couldn't determine a fix, the issue is not actionable.
+    issues = [
+        iss for iss in issues
+        if iss.suggested_value is not None
+        or iss.source == "fixed_file"  # Fixed file issues always shown
+        or iss.source == "auto_fix"    # Auto-fixed issues always shown
+    ]
 
     # Persist final issue set (after collapse)
     for issue in issues:
@@ -1329,11 +1371,13 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
         db.add(issue)
     
     # ── STEP 8: Super-Validator (without media analyzer) ─
+    fcs_data = calculate_card_fcs(raw_data)
     sv_breakdown = super_validator_service.evaluate(
         card=card,
         raw_data=raw_data,
         issues=issues,
         base_breakdown=score_breakdown,
+        fcs=fcs_data,
     )
     card.score = int(sv_breakdown.get("final_score", sv_breakdown.get("total_score", 0)))
     card.score_breakdown = sv_breakdown
@@ -1341,6 +1385,23 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     card.warnings_count = sum(1 for i in issues if i.severity == IssueSeverity.WARNING)
     card.improvements_count = sum(1 for i in issues if i.severity == IssueSeverity.IMPROVEMENT)
     card.last_analysis_at = datetime.utcnow()
+
+    # ── Normalize score_impact so all pending issues sum to (100 - card.score) ──
+    # This ensures: fixing all issues brings the card exactly to 100.
+    pending_issues = [i for i in issues if i.status == IssueStatus.PENDING]
+    raw_sum = sum(max(1, i.score_impact or 1) for i in pending_issues)
+    potential = max(0, 100 - card.score)
+    if pending_issues and raw_sum > 0 and potential > 0:
+        distributed = 0
+        for idx, iss in enumerate(pending_issues):
+            raw = max(1, iss.score_impact or 1)
+            if idx < len(pending_issues) - 1:
+                normalized = max(1, round(raw / raw_sum * potential))
+                iss.score_impact = normalized
+                distributed += normalized
+            else:
+                # Last issue gets the remainder to ensure exact sum
+                iss.score_impact = max(1, potential - distributed)
     
     await db.commit()
     return issues, total_tokens
@@ -1403,16 +1464,32 @@ def _norm_issue_value(val: Optional[str]) -> str:
 
 def _drop_noop_issues(issues: List[CardIssue]) -> List[CardIssue]:
     """
-    Remove issues where suggested value equals current value and therefore gives no action.
-    Currently applied to composition_mismatch only to avoid false UX noise.
+    Remove issues that provide no actionable fix to the user:
+    1. composition_mismatch where suggested == current (no-op)
+    2. Any issue where allowed_values is non-empty in principle but AI couldn't produce
+       a suggested_value — meaning the field has constraints and there's nothing valid to set.
+       (If allowed_values is empty, free-text is accepted and we keep the issue so user can type.)
     """
     out: List[CardIssue] = []
     for iss in issues:
+        # Rule 1: no-op composition mismatch
         if iss.code == "composition_mismatch":
             cur = _norm_issue_value(iss.current_value)
             sug = _norm_issue_value(iss.suggested_value)
             if cur and sug and cur == sug:
                 continue
+
+        # Rule 2: allowed_values is empty (no catalog constraints) AND no suggestion generated
+        # → AI couldn't determine what to change to → unfixable, skip silently
+        has_allowed = bool(iss.allowed_values)
+        has_suggestion = bool(
+            (iss.ai_suggested_value or "").strip()
+            or (iss.suggested_value or "").strip()
+        )
+        is_free_text_field = (iss.field_path or "").lower() in ("title", "description")
+        if not has_allowed and not has_suggestion and not is_free_text_field:
+            continue
+
         out.append(iss)
     return out
 
@@ -1423,12 +1500,15 @@ def _validate_fix_against_constraints(
     error_details: list,
     char_name: Optional[str] = None,
     current_value: Optional[str] = None,
+    product_dna: str = "",
 ) -> tuple:
     """
     Check if AI-suggested value passes allowed_values and limit constraints.
     Returns (is_valid: bool, fail_reason: str, corrected_value: any)
     
     If value doesn't match allowed_values exactly, tries to find best match.
+    For color fields: AI picks ONE parent, then a separate AI call selects
+    the closest shades from that parent's children.
     """
     corrected = None
     is_color = _is_color_field(char_name)
@@ -1440,7 +1520,10 @@ def _validate_fix_against_constraints(
             catalog = None
 
     # Color-special flow:
-    # AI chooses parent color, then we pick main + closest 3-5 shades inside that parent.
+    # 1) AI picks ONE parent color (e.g. "черный")
+    # 2) Get children list from color_names.json
+    # 3) Separate AI call picks the closest 4 shades for this product
+    # 4) Final palette = [parent] + [AI-selected children] = 5 colors
     if is_color and catalog is not None:
         # Parse AI selection
         picked_raw = value
@@ -1450,10 +1533,12 @@ def _validate_fix_against_constraints(
         if not picked_str:
             return False, "Не удалось определить основной цвет", None
 
+        # Resolve to parent
+        parent = catalog.get_color_parent(picked_str) or picked_str
+
         limits = _extract_limits(error_details)
         min_l = limits.get("min")
         max_l = limits.get("max")
-        # Prefer richer palette by default: parent + closest shades.
         desired = 5
         if isinstance(max_l, int) and max_l > 0:
             desired = min(desired, max_l)
@@ -1461,32 +1546,59 @@ def _validate_fix_against_constraints(
             desired = min(min_l, max_l or min_l)
         desired = max(3, min(desired, 5))
 
-        seeds = _extract_seed_colors(current_value)
-        palette = catalog.suggest_related_colors(
-            selected_parent_or_color=picked_str,
-            seed_colors=seeds,
-            total_count=desired,
-        )
-        if not palette:
-            return False, f"Не удалось подобрать палитру для цвета '{picked_str}'", None
+        # Get all children of this parent
+        children = list(catalog.color_parent_to_children.get(parent, []))
 
         full_allowed = catalog.get_allowed_values("цвет") or []
         full_allowed_norm = {_norm_text(x) for x in full_allowed}
-        # Normalize to allowed list values
+
+        # Start palette with the parent itself (if it's in allowed list)
         normalized_palette: List[str] = []
-        for c in palette:
-            if _norm_text(c) in full_allowed_norm:
-                # keep original allowed spelling where possible
-                exact = next((av for av in full_allowed if _norm_text(av) == _norm_text(c)), c)
-                if exact not in normalized_palette:
-                    normalized_palette.append(exact)
-            else:
-                bm = find_best_match(c, full_allowed, threshold=0.72)
-                if bm and bm not in normalized_palette:
-                    normalized_palette.append(bm)
+        if _norm_text(parent) in full_allowed_norm:
+            exact_parent = next((av for av in full_allowed if _norm_text(av) == _norm_text(parent)), parent)
+            normalized_palette.append(exact_parent)
+
+        # How many children do we need from AI?
+        children_needed = desired - len(normalized_palette)
+
+        if children and children_needed > 0:
+            # Ask AI to pick closest shades from children list
+            ai_svc = get_ai_service()
+            if ai_svc.is_enabled():
+                ai_shades, _shade_tokens = ai_svc.pick_color_shades(
+                    parent_color=parent,
+                    children=children,
+                    product_dna=product_dna,
+                    count=children_needed,
+                )
+                for shade in ai_shades:
+                    if _norm_text(shade) in full_allowed_norm:
+                        exact = next((av for av in full_allowed if _norm_text(av) == _norm_text(shade)), shade)
+                        if exact not in normalized_palette:
+                            normalized_palette.append(exact)
+                    else:
+                        bm = find_best_match(shade, full_allowed, threshold=0.72)
+                        if bm and bm not in normalized_palette:
+                            normalized_palette.append(bm)
+
+        # Fallback: if AI didn't return enough, fill from similarity-based method
+        if len(normalized_palette) < desired and children:
+            seeds = _extract_seed_colors(current_value)
+            fallback_palette = catalog.suggest_related_colors(
+                selected_parent_or_color=picked_str,
+                seed_colors=seeds,
+                total_count=desired,
+            )
+            for c in fallback_palette:
+                if len(normalized_palette) >= desired:
+                    break
+                if _norm_text(c) in full_allowed_norm:
+                    exact = next((av for av in full_allowed if _norm_text(av) == _norm_text(c)), c)
+                    if exact not in normalized_palette:
+                        normalized_palette.append(exact)
 
         if not normalized_palette:
-            return False, f"Цветовая палитра для '{picked_str}' не проходит справочник", None
+            return False, f"Не удалось подобрать палитру для цвета '{picked_str}'", None
 
         return True, "", normalized_palette
 

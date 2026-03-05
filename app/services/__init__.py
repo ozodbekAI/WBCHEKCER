@@ -10,6 +10,8 @@ from .user_service import (
 )
 from .store_service import (
     create_store,
+    ensure_account_can_create_store,
+    ensure_store_not_exists,
     get_store_by_id,
     get_user_stores,
     update_store,
@@ -20,6 +22,7 @@ from .store_service import (
 )
 from .wb_api import WildberriesAPI
 from .analyzer import card_analyzer, CardAnalyzer
+from .super_validator import super_validator_service, SuperValidatorService
 from .card_service import (
     sync_cards_from_wb,
     analyze_card,
@@ -39,6 +42,7 @@ from .issue_service import (
     postpone_issue,
     get_issue_stats,
     get_next_issue,
+    get_card_pending_count,
     get_fixed_issues_for_store,
     get_queue_progress,
     mark_applied_to_wb,
@@ -64,6 +68,8 @@ __all__ = [
     "get_all_users",
     # Store
     "create_store",
+    "ensure_account_can_create_store",
+    "ensure_store_not_exists",
     "get_store_by_id",
     "get_user_stores",
     "update_store",
@@ -76,6 +82,8 @@ __all__ = [
     # Analyzer
     "card_analyzer",
     "CardAnalyzer",
+    "super_validator_service",
+    "SuperValidatorService",
     # Card
     "sync_cards_from_wb",
     "analyze_card",
@@ -92,6 +100,7 @@ __all__ = [
     "postpone_issue",
     "get_issue_stats",
     "get_next_issue",
+    "get_card_pending_count",
     "get_fixed_issues_for_store",
     "get_queue_progress",
     "mark_applied_to_wb",

@@ -8,7 +8,7 @@ export default function LandingPage() {
 
   const handleConnect = () => {
     if (isAuthenticated) {
-      navigate('/onboard');
+      navigate('/workspace');
     } else {
       navigate('/login');
     }

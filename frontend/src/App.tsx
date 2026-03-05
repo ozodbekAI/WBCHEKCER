@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useCallback, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { StoreProvider, useStore } from './contexts/StoreContext';
@@ -8,12 +8,14 @@ import SyncProgressBanner from './components/SyncProgressBanner';
 import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
+import VerifyEmailPage from './pages/VerifyEmailPage';
 import OnboardingPage from './pages/OnboardingPage';
 import WorkspacePage from './pages/WorkspacePage';
 import IncomingPage from './pages/IncomingPage';
 import IssueFixPage from './pages/IssueFixPage';
 import CardListPage from './pages/CardListPage';
 import CardDetailPage from './pages/CardDetailPage';
+import CardQueuePage from './pages/CardQueuePage';
 import PhotoStudioPage from './pages/PhotoStudioPage';
 import ABTestsPage from './pages/ABTestsPage';
 import TeamPage from './pages/TeamPage';
@@ -21,15 +23,16 @@ import ApprovalsPage from './pages/ApprovalsPage';
 import StaffPage from './pages/StaffPage';
 import AcceptInvitePage from './pages/AcceptInvitePage';
 import FixedFilePage from './pages/FixedFilePage';
+import ProfilePage from './pages/ProfilePage';
 
 function GlobalSyncBanner() {
   const { activeStore, loadStores } = useStore();
   if (!activeStore) return null;
-  const handleComplete = () => {
+  const handleComplete = useCallback(() => {
     loadStores();
     // Emit event so WorkspacePage can reload its dashboard
     window.dispatchEvent(new CustomEvent('syncCompleted', { detail: { storeId: activeStore.id } }));
-  };
+  }, [loadStores, activeStore.id]);
   return <SyncProgressBanner storeId={activeStore.id} onComplete={handleComplete} />;
 }
 
@@ -79,6 +82,7 @@ function AppRoutes() {
         <Route path="/" element={<LandingPage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
+        <Route path="/verify-email" element={<VerifyEmailPage />} />
       <Route path="/accept-invite" element={<AcceptInvitePage />} />
 
       {/* Protected routes */}
@@ -115,10 +119,26 @@ function AppRoutes() {
         }
       />
       <Route
+        path="/workspace/fix/card/:cardId"
+        element={
+          <ProtectedRoute>
+            <IssueFixPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
         path="/workspace/cards"
         element={
           <ProtectedRoute>
             <CardListPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/workspace/cards/queue"
+        element={
+          <ProtectedRoute>
+            <CardQueuePage />
           </ProtectedRoute>
         }
       />
@@ -167,6 +187,14 @@ function AppRoutes() {
         element={
           <ProtectedRoute permission="team.view">
             <StaffPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/workspace/profile"
+        element={
+          <ProtectedRoute>
+            <ProfilePage />
           </ProtectedRoute>
         }
       />

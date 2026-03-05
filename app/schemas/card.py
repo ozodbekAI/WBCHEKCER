@@ -34,10 +34,10 @@ class CardOut(CardBase):
     score: Optional[int] = None
     score_breakdown: Optional[Dict[str, Any]] = None
     
-    critical_issues_count: int = 0
-    warnings_count: int = 0
-    improvements_count: int = 0
-    growth_points_count: int = 0
+    critical_issues_count: Optional[int] = 0
+    warnings_count: Optional[int] = 0
+    improvements_count: Optional[int] = 0
+    growth_points_count: Optional[int] = 0
     
     last_analysis_at: Optional[datetime] = None
     created_at: datetime

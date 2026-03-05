@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStore } from '../contexts/StoreContext';
-import api from '../api/client';
+import api, { API_ORIGIN } from '../api/client';
 import {
   AlertCircle,
   AlertTriangle,
@@ -71,7 +71,7 @@ interface WbCardOption {
   photos: string[];
 }
 
-const API_BASE = 'http://localhost:8003';
+const API_BASE = API_ORIGIN;
 const MIN_SLOTS = 5;
 
 const WIZARD_STEPS = [

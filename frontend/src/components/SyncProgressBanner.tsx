@@ -54,6 +54,12 @@ export default function SyncProgressBanner({ storeId, onComplete }: SyncProgress
   const [task, setTask] = useState<SyncTask | null>(null);
   const [dismissed, setDismissed] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const onCompleteRef = useRef<(() => void) | undefined>(onComplete);
+  const completeNotifiedRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
@@ -68,8 +74,12 @@ export default function SyncProgressBanner({ storeId, onComplete }: SyncProgress
       setTask(data);
       if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
         stopPolling();
+        clearSyncTask(sid);
         if (data.status === 'completed') {
-          onComplete?.();
+          if (completeNotifiedRef.current !== tid) {
+            completeNotifiedRef.current = tid;
+            onCompleteRef.current?.();
+          }
         }
       }
     } catch {
@@ -78,7 +88,7 @@ export default function SyncProgressBanner({ storeId, onComplete }: SyncProgress
       clearSyncTask(sid);
       setTask(null);
     }
-  }, [stopPolling, onComplete]);
+  }, [stopPolling]);
 
   const startPolling = useCallback((sid: number, tid: string) => {
     stopPolling();

@@ -18,6 +18,7 @@ from .generator import (
 from .promt import PromptTemplate, PromptVersion
 from .invite import UserInvite
 from .fixed_file import FixedFileEntry
+from .registration_access import RegistrationAccessRequest
 
 __all__ = [
     "User",
@@ -63,4 +64,5 @@ __all__ = [
     "PromptTemplate",
     "PromptVersion",
     "UserInvite",
+    "RegistrationAccessRequest",
 ]

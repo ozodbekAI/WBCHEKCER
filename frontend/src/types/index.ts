@@ -5,6 +5,7 @@ export interface User {
   first_name: string | null;
   last_name: string | null;
   phone: string | null;
+  avatar_url?: string | null;
   role: string;
   is_active: boolean;
   is_verified: boolean;
@@ -167,10 +168,10 @@ export interface Card {
   discount: number | null;
   score: number | null;
   score_breakdown: Record<string, any> | null;
-  critical_issues_count: number;
-  warnings_count: number;
-  improvements_count: number;
-  growth_points_count: number;
+  critical_issues_count: number | null;
+  warnings_count: number | null;
+  improvements_count: number | null;
+  growth_points_count: number | null;
   last_analysis_at: string | null;
   created_at: string;
   updated_at: string;
@@ -226,6 +227,8 @@ export interface IssueWithCard extends Issue {
   card_title: string | null;
   card_vendor_code: string | null;
   card_photos: string[];
+  card_pending_count: number;
+  requires_fixed_file: boolean;
 }
 
 export interface IssuesGrouped {

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStore } from '../contexts/StoreContext';
+import { useAuth } from '../contexts/AuthContext';
 import api from '../api/client';
 import { AlertTriangle } from 'lucide-react';
 
@@ -8,7 +9,8 @@ type Step = 1 | 2 | 3;
 
 export default function OnboardingPage() {
   const navigate = useNavigate();
-  const { loadStores, setActiveStore } = useStore();
+  const { loadStores } = useStore();
+  const { isRole } = useAuth();
   const [step, setStep] = useState<Step>(1);
   const [apiKey, setApiKey] = useState('');
   const [error, setError] = useState('');
@@ -72,6 +74,22 @@ export default function OnboardingPage() {
       navigate('/workspace');
     }
   };
+
+  if (!isRole('owner')) {
+    return (
+      <div className="onboarding">
+        <div className="onboard-card">
+          <h2>Доступ ограничен</h2>
+          <p className="subtitle">
+            Подключать новый магазин может только пользователь с ролью Owner.
+          </p>
+          <button className="btn btn-primary btn-block btn-lg" onClick={() => navigate('/workspace')}>
+            В рабочее пространство
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="onboarding">

@@ -304,6 +304,46 @@ class WildberriesAPI:
                 "error": str(e),
             }
 
+    async def get_directory_values(self, charc_name: str, locale: str = "ru") -> Dict[str, Any]:
+        """Get allowed dictionary values for a characteristic from WB directory.
+        
+        Uses: GET /content/v2/directory/{charc_name}
+        Docs: https://dev.wildberries.ru/openapi/content#tag/Spravochniki
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(
+                    f"{settings.WB_CONTENT_API_URL}/content/v2/directory/{charc_name}",
+                    headers=self.headers,
+                    params={"locale": locale},
+                )
+
+                if response.status_code == 200:
+                    data = response.json().get("data", [])
+                    # Extract just the value strings
+                    values = []
+                    for item in data:
+                        if isinstance(item, dict):
+                            val = item.get("value") or item.get("name") or ""
+                            if val:
+                                values.append(str(val))
+                        elif isinstance(item, str):
+                            values.append(item)
+                    return {
+                        "success": True,
+                        "values": values,
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"API error: {response.status_code}",
+                    }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
     async def get_card_photo_urls(self, nm_id: int) -> List[str]:
         result = await self.get_cards(limit=1, nm_ids=[int(nm_id)], with_photo=-1)
         if not result.get("success"):

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..core.config import settings
 from ..core.database import get_db
 from ..core.security import get_current_user
-from ..models import User, Store, Card, StoreStatus
+from ..models import User, Store, Card, StoreStatus, IssueStatus
 from ..schemas import CardOut, CardDetail, CardListOut
 from ..services import get_store_by_id, get_card_by_id, get_store_cards, analyze_card
 from ..services.wb_api import WildberriesAPI
@@ -319,6 +319,77 @@ async def replace_wb_card_photo(
     }
 
 
+# Route ordering: specific paths BEFORE parameterized paths
+@router.get("/critical", response_model=List[CardOut])
+async def get_critical_cards(
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Get cards with critical issues"""
+    cards, _ = await get_store_cards(
+        db, store.id,
+        limit=limit,
+        has_critical=True,
+    )
+    return [CardOut.model_validate(c) for c in cards]
+
+
+@router.get("/queue", response_model=List[Dict[str, Any]])
+async def get_cards_queue(
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Get cards queue sorted by priority for step-by-step processing"""
+    from sqlalchemy import select, func, case
+    from ..models import CardIssue, IssueSeverity
+    
+    # Prioritize cards by: critical_issues DESC, warnings DESC, total_score ASC
+    query = (
+        select(Card)
+        .where(Card.store_id == store.id)
+        .order_by(
+            Card.critical_issues_count.desc(),
+            Card.warnings_count.desc(),
+            Card.score.asc()
+        )
+        .limit(limit)
+    )
+    
+    result = await db.execute(query)
+    cards = result.scalars().all()
+    
+    output = []
+    for card in cards:
+        # Count pending issues for this card
+        issue_query = select(func.count(CardIssue.id)).where(
+            CardIssue.card_id == card.id,
+            CardIssue.status == IssueStatus.PENDING
+        )
+        issue_count_result = await db.execute(issue_query)
+        pending_issues = issue_count_result.scalar() or 0
+        
+        # Get main photo URL from photos array
+        main_photo = None
+        if card.photos and isinstance(card.photos, list) and len(card.photos) > 0:
+            main_photo = card.photos[0]
+        
+        output.append({
+            "id": card.id,
+            "nm_id": card.nm_id,
+            "vendor_code": card.vendor_code,
+            "title": card.title,
+            "main_photo_url": main_photo,
+            "score": card.score,
+            "critical_issues_count": card.critical_issues_count,
+            "warnings_count": card.warnings_count,
+            "pending_issues_count": pending_issues,
+        })
+    
+    return output
+
+
 @router.get("/{card_id}", response_model=CardDetail)
 async def get_card(
     card_id: int,
@@ -359,18 +430,3 @@ async def analyze_single_card(
         "score": card.score,
         "issues_count": len(issues),
     }
-
-
-@router.get("/critical", response_model=List[CardOut])
-async def get_critical_cards(
-    store: Store = Depends(get_user_store),
-    db: AsyncSession = Depends(get_db),
-    limit: int = Query(20, ge=1, le=100),
-):
-    """Get cards with critical issues"""
-    cards, _ = await get_store_cards(
-        db, store.id,
-        limit=limit,
-        has_critical=True,
-    )
-    return [CardOut.model_validate(c) for c in cards]

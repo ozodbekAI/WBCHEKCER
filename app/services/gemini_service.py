@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from ..core.config import settings
+from .wb_logic_prompt import build_wb_logic_block
 
 
 def _strip_code_fences(text: str) -> str:
@@ -61,6 +62,34 @@ def _extract_json(text: str) -> Dict[str, Any]:
             return _ensure_dict(json.loads(text[start:end + 1]))
         except Exception:
             pass
+
+    # Heuristic fallback for partially valid JSON fragments with recommended_value.
+    rec_match = re.search(
+        r'"recommended_value"\s*:\s*("(?:(?:\\.)|[^"\\])*"|null|\[[\s\S]*?\])',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if rec_match:
+        rec_raw = rec_match.group(1)
+        rec_value: Any = None
+        try:
+            rec_value = json.loads(rec_raw)
+        except Exception:
+            rec_value = rec_raw.strip().strip('"')
+
+        reason = ""
+        reason_match = re.search(
+            r'"reason"\s*:\s*("(?:(?:\\.)|[^"\\])*")',
+            text,
+            flags=re.IGNORECASE,
+        )
+        if reason_match:
+            try:
+                reason = str(json.loads(reason_match.group(1)))
+            except Exception:
+                reason = reason_match.group(1).strip().strip('"')
+
+        return {"recommended_value": rec_value, "reason": reason}
 
     return {}
 
@@ -135,17 +164,21 @@ class GeminiService:
         self, 
         prompt: str, 
         image_url: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
         retry_count: int = 0,
-        max_retries: int = 3
-    ) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        max_retries: int = 3,
+        raw_text: bool = False,
+    ) -> Tuple[Any, Dict[str, int]]:
         """Call Gemini API with JSON response and retry logic.
         Returns (result_dict, token_usage) where token_usage =
-        {prompt_tokens, completion_tokens, total_tokens}
+        {prompt_tokens, completion_tokens, total_tokens}.
+        If raw_text=True, returns (str, token_usage) without JSON parsing.
         """
         _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
 
         if not self.api_key:
-            return {}, _empty_tokens
+            return ("" if raw_text else {}), _empty_tokens
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         params = {"key": self.api_key}
@@ -160,16 +193,18 @@ class GeminiService:
                     "inline_data": {"mime_type": mime, "data": img_b64}
                 })
         
+        generation_config: Dict[str, Any] = {
+            "temperature": self.temperature,
+            "maxOutputTokens": max_output_tokens or self.max_output_tokens,
+        }
+        if not raw_text:
+            generation_config["responseMimeType"] = "application/json"
+        if thinking_budget is not None and int(thinking_budget) > 0:
+            generation_config["thinkingConfig"] = {"thinkingBudget": int(thinking_budget)}
+
         payload = {
             "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {
-                "temperature": self.temperature,
-                "maxOutputTokens": self.max_output_tokens,
-                "responseMimeType": "application/json",
-                "thinkingConfig": {
-                    "thinkingBudget": 2048,
-                },
-            },
+            "generationConfig": generation_config,
         }
         
         try:
@@ -185,16 +220,24 @@ class GeminiService:
                     wait_time = 2 ** retry_count
                     print(f"Gemini API 503 error. Retry {retry_count + 1}/{max_retries} after {wait_time}s...")
                     time.sleep(wait_time)
-                    return self._call_api(prompt, image_url, retry_count + 1, max_retries)
+                    return self._call_api(
+                        prompt,
+                        image_url,
+                        thinking_budget=thinking_budget,
+                        max_output_tokens=max_output_tokens,
+                        retry_count=retry_count + 1,
+                        max_retries=max_retries,
+                        raw_text=raw_text,
+                    )
                 else:
                     print(f"Gemini API 503 error after {max_retries} retries. Skipping AI...")
-                    return {}, _empty_tokens
+                    return ("" if raw_text else {}), _empty_tokens
             else:
                 print(f"Gemini API HTTP error {e.response.status_code}: {e}")
-                return {}, _empty_tokens
+                return ("" if raw_text else {}), _empty_tokens
         except Exception as e:
             print(f"Gemini API error: {e}")
-            return {}, _empty_tokens
+            return ("" if raw_text else {}), _empty_tokens
         
         # Extract token usage from response
         usage_meta = data.get("usageMetadata") or {}
@@ -214,14 +257,22 @@ class GeminiService:
                     text = part["text"]
                     break
         except (KeyError, IndexError):
-            return {}, tokens
-        
+            return ("" if raw_text else {}), tokens
+
+        if raw_text:
+            return (text or "").strip(), tokens
+
         result = _extract_json(text) if text else {}
         return result, tokens
     
-    def audit_card(self, card: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    def audit_card(
+        self,
+        card: Dict[str, Any],
+        product_dna: str = "",
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """
         AI audit of card - finds issues by analyzing photo + card data.
+        If product_dna is provided (cached text description), it is used instead of photo.
         Returns (issues_list, token_usage).
         """
         _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
@@ -256,6 +307,15 @@ class GeminiService:
             char_list = [{"name": k, "value": v} for k, v in chars_raw.items()]
         else:
             char_list = []
+        # Exclude characteristics controlled by fixed file — they're locked.
+        fixed_chars_set = set(
+            n.lower() for n in (card.get("_fixed_file_chars") or [])
+        )
+        if fixed_chars_set:
+            char_list = [
+                ch for ch in char_list
+                if (ch.get("name") or "").lower() not in fixed_chars_set
+            ]
         compact["characteristics"] = char_list
 
         # Include valid characteristic names for this category
@@ -267,15 +327,28 @@ class GeminiService:
 {json.dumps(valid_char_names, ensure_ascii=False)}
 Если в карточке есть характеристики НЕ из этого списка и они заполнены — это ошибка.
 """
+        # Include SEO keywords for this category
+        seo_keywords_list = card.get("_seo_keywords") or []
+        seo_keywords_section = ""
+        if seo_keywords_list:
+            seo_keywords_section = f"""
+SEO-КЛЮЧЕВЫЕ СЛОВА ДЛЯ КАТЕГОРИИ "{subject_name}":
+{', '.join(seo_keywords_list[:20])}
+Проверь: есть ли хотя бы 1 ключевое слово в названии, минимум 2 в описании.
+Если ни одного нет — это проблема SEO (severity="warning", category="text").
+"""
+        logic_block = build_wb_logic_block(include_output=False)
 
         prompt = f"""
 РОЛЬ: Ты — старший модератор-аудитор маркетплейса Wildberries.
+
+{logic_block}
 
 ЗАДАЧА: Проанализируй фото товара и JSON-карточку. Найди РЕАЛЬНЫЕ ошибки
 и несоответствия. Не выдумывай — если не уверен, ставь severity="warning".
 
 КАТЕГОРИЯ ТОВАРА: "{subject_name}" (subjectID={subject_id})
-{valid_chars_section}
+{valid_chars_section}{seo_keywords_section}
 ЧТО ПРОВЕРЯТЬ:
 1. ФОТО ↔ ХАРАКТЕРИСТИКИ
    - Цвет на фото совпадает с характеристикой «Цвет»?
@@ -299,8 +372,29 @@ class GeminiService:
 5. АРТИКУЛ / VENDORCODE
    - Если в артикуле указан цвет — совпадает с «Цвет»?
 
+6. ДАТЫ/СЕРТИФИКАТЫ/ДЕКЛАРАЦИИ
+   - НЕ анализируй поля дат, регистрации сертификатов/деклараций, сроки действия.
+   - НЕ предлагай исправления дат.
+   - Эти поля обрабатываются только по эталонному fixed-файлу на backend.
+
+7. SEO — КЛЮЧЕВЫЕ СЛОВА
+   - Если список SEO-ключевых слов приведён выше:
+     • Есть ли хотя бы 1 ключевое слово в названии?
+     • Есть ли минимум 2 ключевых слова в описании?
+   - Если нет — сообщи как "warning" с name="title" или name="description", category="text".
+   - Пример: name="description", message="Описание не содержит SEO-ключевых слов категории..."
+
+8. НАЗВАНИЕ — ФОРМУЛА
+   - Название должно начинаться с категории товара ("{subject_name}") или её синонима.
+   - Должен быть ключевой признак модели (фасон, силуэт, конструктив).
+   - Запрещены: маркетинг, пол, эмоции, CAPS, эмодзи, запятые.
+   - Длина: 35–60 символов.
+   - Если нарушено — ошибка с name="title", severity="error", category="text".
+
 CARD JSON:
 {json.dumps(compact, ensure_ascii=False)[:4000]}
+
+{"" if not product_dna else "ТЕХНИЧЕСКОЕ ОПИСАНИЕ ТОВАРА ПО ФОТО (извлечено один раз, использовать как источник истины о товаре):" + chr(10) + product_dna[:2000]}
 
 ФОРМАТ ОТВЕТА — строго JSON, без markdown:
 {{
@@ -359,8 +453,13 @@ CARD JSON:
 Если ошибок нет — верни: {{"errors": []}}
 """.strip()
 
-        image_url = _get_card_photo(card)
-        result, tokens = self._call_api(prompt, image_url)
+        image_url = None if product_dna else _get_card_photo(card)
+        result, tokens = self._call_api(
+            prompt,
+            image_url,
+            thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_AUDIT", 512),
+            max_output_tokens=getattr(settings, "GEMINI_AUDIT_MAX_OUTPUT_TOKENS", self.max_output_tokens),
+        )
 
         if isinstance(result, list):
             return result, tokens
@@ -374,6 +473,7 @@ CARD JSON:
         self,
         card: Dict[str, Any],
         issues: List[Dict[str, Any]],
+        product_dna: str = "",
     ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
         """
         Generate fix suggestions for a batch of issues.
@@ -422,9 +522,12 @@ CARD JSON:
                 {"name": ch.get("name"), "value": ch.get("value", ch.get("values"))}
                 for ch in chars_raw[:30]
             ]
+        logic_block = build_wb_logic_block(include_output=True)
 
         prompt = f"""
 РОЛЬ: Ты — SEO-эксперт и копирайтер Wildberries с 5-летним опытом.
+
+{logic_block}
 
 ЗАДАЧА: Для каждой проблемы из списка создай ГОТОВОЕ ИСПРАВЛЕНИЕ.
 У каждой проблемы ОБЯЗАТЕЛЬНО должен быть recommended_value с КОНКРЕТНЫМ готовым значением.
@@ -432,6 +535,7 @@ CARD JSON:
 КАРТОЧКА ТОВАРА:
 {json.dumps(compact_card, ensure_ascii=False)[:3500]}
 
+{"" if not product_dna else "ТЕХНИЧЕСКОЕ ОПИСАНИЕ ТОВАРА ПО ФОТО:" + chr(10) + product_dna[:2000] + chr(10)}
 СПИСОК ПРОБЛЕМ:
 {json.dumps(issues_data, ensure_ascii=False)[:5000]}
 
@@ -440,6 +544,10 @@ CARD JSON:
   КОПИРУЙ значения ТОЧНО как написано (с тем же регистром, пробелами).
   НЕ придумывай свои значения. Это справочник Wildberries.
 • Если есть min_limit/max_limit → верни массив ТОЧНОЙ длины (между min и max).
+• Для цветовых характеристик (например: "Цвет", "Основной цвет", "Дополнительный цвет"):
+  - если есть allowed_values: это СПИСОК РОДИТЕЛЬСКИХ ЦВЕТОВ (parent color)
+  - выбери ОДИН самый подходящий parent color и верни ТОЛЬКО его в recommended_value (строкой)
+  - НЕ возвращай массив оттенков для color-полей: оттенки подберет backend автоматически
 • Если allowed_values нет → предложи конкретное логичное значение для категории "{subject}".
 • Выбирай самые релевантные значения для КОНКРЕТНОГО товара.
 • ВСЕГДА возвращай готовое значение, которое можно сразу использовать.
@@ -482,42 +590,51 @@ CARD JSON:
 • В reason — объясни ПОЧЕМУ выбрано именно это значение (что видно на фото / в тексте).
 
 ═══ ПРАВИЛА ДЛЯ НАЗВАНИЯ (error_type содержит "title") ═══
-• В recommended_value верни ПОЛНОЕ НОВОЕ ГОТОВОЕ НАЗВАНИЕ (40-100 символов).
+• В recommended_value верни ПОЛНОЕ НОВОЕ ГОТОВОЕ НАЗВАНИЕ (40-60 символов).
 • НЕ пиши советы типа «Улучшите название» — дай КОНКРЕТНОЕ название целиком.
-• Структура: [Тип товара] [женский/мужской/детский] [ключевая особенность]
-  [фасон/модель] [назначение-прилагательное]
+• Структура: [Категория] [ключевой признак] [конструктив] [назначение] [цвет при необходимости]
+• Каждый признак должен быть подтверждён данными карточки (характеристики/описание/фото-контекст).
 • СТРОГО ЗАПРЕЩЕНО включать:
   ❌ Бренд (он подставляется отдельно)
-  ❌ Цвет (черный, белый, зеленый и т.д.) — только в характеристиках
+  ❌ Пол (женский/мужской/детский)
+  ❌ Маркетинг/эмоции: «стильный», «хит», «топ», «лучший», «идеальный», «премиум», «красивый»
   ❌ «для + существительное» → используй прилагательные:
      НЕЛЬЗЯ: «для офиса» → НУЖНО: «офисный»
      НЕЛЬЗЯ: «для праздника» → НУЖНО: «праздничный»
      НЕЛЬЗЯ: «для прогулки» → НУЖНО: «повседневный»
-• Используй высокочастотные SEO-запросы Wildberries.
+  ❌ CAPS, спецсимволы, эмодзи, запятые
+• Цвет можно добавлять ТОЛЬКО если он:
+  1) подтверждён характеристиками/визуальным контекстом,
+  2) один и не конфликтует с карточкой,
+  3) является смысловой частью модели.
+• Используй только нейтральный фактический язык.
 • Примеры ПРАВИЛЬНЫХ ответов:
-  ✓ recommended_value: "Костюм женский деловой брючный с удлинённым жакетом офисный классический"
-  ✓ recommended_value: "Платье вечернее длинное с разрезом нарядное коктейльное"
-  ✓ recommended_value: "Куртка мужская зимняя с капюшоном пуховик тёплая спортивная"
+  ✓ recommended_value: "Костюм двубортный с жакетом и юбкой макси офисный"
+  ✓ recommended_value: "Платье миди приталенное вечернее"
+  ✓ recommended_value: "Жакет однобортный удлиненный деловой"
 • НЕ давай альтернативы — ОДИН лучший готовый вариант.
 
 ═══ ПРАВИЛА ДЛЯ ОПИСАНИЯ (error_type содержит "description") ═══
-• В recommended_value верни ПОЛНОЕ НОВОЕ ГОТОВОЕ описание (800-1200 символов).
+• В recommended_value верни ПОЛНОЕ НОВОЕ ГОТОВОЕ описание (1000-1800 символов).
 • СТРОГО ЗАПРЕЩЕНО писать советы: ❌ «Расширьте описание», ❌ «Добавьте детали».
 • ОБЯЗАТЕЛЬНО дай ЦЕЛЫЙ готовый текст, который можно сразу копировать в карточку.
+• Формат: 3-6 абзацев, без списков.
+• Каждый абзац: 2-4 предложения.
 • Структура абзацами (обязательные части):
-  1) Вступление (2-3 предложения) — что за товар, главное преимущество
-  2) Детали (3-4 предложения) — крой, посадка, силуэт, особенности, конструкция
-  3) Материал (2-3 предложения) — состав, свойства ткани, тактильные ощущения, комфорт
-  4) Использование (2-3 предложения) — офис/прогулка/праздник, с чем сочетать, образы
-  5) Уход (1-2 предложения) — стирка, глажка, хранение
-• Пиши живым продающим языком, не шаблонно. Без восклицательных знаков.
+  1) Вступление (1-2 предложения) — что за товар
+  2) Конструкция и посадка — ключевой блок
+  3) Материал — только если подтверждено данными карточки
+  4) Назначение/сценарии использования
+  5) Особенности/уход — опционально
+• Пиши нейтрально и фактически, без маркетинга и эмоций.
+• Запрещено: «лучший», «премиум», «идеальный», обещания эффекта, CAPS, эмодзи.
 • ЕСТЕСТВЕННО вплети ВСЕ ключевые слова из названия товара в текст.
 • Если текущее описание есть — используй его как основу, дополни и улучши.
 • Если описания нет — создай полностью новое на основе характеристик и фото.
 
 ═══ ПРАВИЛА ДЛЯ SEO (error_type = "seo_keywords_missing") ═══
 • Ключевые слова из названия отсутствуют в описании.
-• В recommended_value верни ПОЛНОЕ НОВОЕ переписанное описание (800-1200 символов),
+• В recommended_value верни ПОЛНОЕ НОВОЕ переписанное описание (1000-1800 символов),
   в которое естественно вплетены ВСЕ ключевые слова из названия товара.
 • ОБЯЗАТЕЛЬНО используй текущее описание как основу и ДОБАВЬ в него недостающие SEO-слова.
 • НЕ пиши "Добавьте слова: ..." — дай ГОТОВЫЙ ПОЛНЫЙ текст описания.
@@ -596,8 +713,65 @@ CARD JSON:
 }}
 """.strip()
 
-        image_url = _get_card_photo(card)
-        result, tokens = self._call_api(prompt, image_url)
+        has_text_issue = any(
+            str((it or {}).get("error_type") or "").strip().lower() in {
+                "title", "description", "seo_keywords_missing",
+                "title_too_short", "title_too_long", "no_title", "title_policy_violation",
+                "no_description", "description_too_short", "description_too_long", "description_policy_violation",
+            }
+            for it in issues_data
+        )
+        if not has_text_issue:
+            prompt = f"""
+РОЛЬ: Ты — эксперт по характеристикам Wildberries.
+
+{logic_block}
+
+ЗАДАЧА: Сгенерируй точные исправления ТОЛЬКО для характеристик.
+Не пиши длинные объяснения, только рабочие значения.
+
+КАРТОЧКА ТОВАРА:
+{json.dumps(compact_card, ensure_ascii=False)[:2500]}
+
+{"" if not product_dna else "ТЕХНИЧЕСКОЕ ОПИСАНИЕ ТОВАРА ПО ФОТО:" + chr(10) + product_dna[:1500] + chr(10)}
+СПИСОК ПРОБЛЕМ:
+{json.dumps(issues_data, ensure_ascii=False)[:3500]}
+
+ПРАВИЛА:
+• Если есть allowed_values — выбирай строго из списка (точное совпадение).
+• Если есть min_limit/max_limit — соблюдай длину массива.
+• Для color-полей верни ОДИН parent color строкой.
+• Верни ГОТОВОЕ значение для применения.
+• Не анализируй поля дат/сертификатов/деклараций.
+
+ФОРМАТ ОТВЕТА — строго JSON:
+{{
+  "fixes": {{
+    "<id проблемы>": {{
+      "recommended_value": "<string или array>",
+      "reason": "<кратко>",
+      "fix_action": "replace|clear|swap",
+      "swap_to_name": "<только если swap>",
+      "swap_to_value": "<только если swap>"
+    }}
+  }}
+}}
+""".strip()
+
+        # When product_dna is cached: use text context instead of photo (saves tokens).
+        # Otherwise: re-attach image for ai_* issues (visual accuracy).
+        needs_vision_context = not product_dna and any(
+            str((it or {}).get("error_type") or "").startswith("ai_")
+            for it in issues_data
+        )
+        image_url = _get_card_photo(card) if needs_vision_context else None
+
+        result, tokens = self._call_api(
+            prompt,
+            image_url=image_url,
+            thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_FIX", 128),
+            max_output_tokens=getattr(settings, "GEMINI_FIX_MAX_OUTPUT_TOKENS", self.max_output_tokens),
+        )
 
         if isinstance(result, dict):
             return result.get("fixes", {}), tokens
@@ -627,9 +801,18 @@ CARD JSON:
             mx = limits.get("max")
             if mn is not None or mx is not None:
                 limit_hint = f"\nЛимит: от {mn} до {mx} значений. Верни массив правильной длины."
+        color_hint = ""
+        if "цвет" in (char_name or "").lower():
+            color_hint = (
+                "\nЭто цветовая характеристика: верни ОДИН parent color "
+                "(не массив оттенков). Backend сам развернет его в близкие оттенки."
+            )
+        logic_block = build_wb_logic_block(include_output=False)
 
         prompt = f"""
 ЗАДАЧА: Подобрать правильное значение для характеристики товара на Wildberries.
+
+{logic_block}
 
 Товар: "{card.get('title')}" (категория: {subject})
 Характеристика: "{char_name}"
@@ -639,6 +822,7 @@ CARD JSON:
 ДОПУСТИМЫЕ ЗНАЧЕНИЯ (выбирай ТОЛЬКО из этого списка!):
 {json.dumps(allowed_values[:80], ensure_ascii=False)}
 {limit_hint}
+{color_hint}
 
 ВАЖНО:
 • Значение ДОЛЖНО быть ТОЧНО из списка допустимых — без изменений регистра,
@@ -653,9 +837,323 @@ CARD JSON:
 }}
 """.strip()
         
-        result, tokens = self._call_api(prompt)
+        result, tokens = self._call_api(
+            prompt,
+            thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_REFIX", 64),
+            max_output_tokens=getattr(settings, "GEMINI_REFIX_MAX_OUTPUT_TOKENS", self.max_output_tokens),
+        )
         return (result if isinstance(result, dict) else {}), tokens
-    
+
+    def pick_color_shades(
+        self,
+        parent_color: str,
+        children: List[str],
+        product_dna: str = "",
+        count: int = 4,
+    ) -> Tuple[List[str], Dict[str, int]]:
+        """
+        AI picks the closest color shades from parent's children list
+        for the given product. Returns (selected_shades, tokens).
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+        if not self.is_enabled() or not children:
+            return [], _empty_tokens
+
+        dna_block = ""
+        if product_dna:
+            dna_block = f"\nТЕХНИЧЕСКОЕ ОПИСАНИЕ ТОВАРА ПО ФОТО:\n{product_dna[:1500]}\n"
+
+        prompt = f"""
+ЗАДАЧА: Подобрать {count} ближайших оттенков для товара.
+
+Основной цвет товара: "{parent_color}"
+{dna_block}
+СПИСОК ДОСТУПНЫХ ОТТЕНКОВ (выбирай ТОЛЬКО из этого списка!):
+{json.dumps(children, ensure_ascii=False)}
+
+ПРАВИЛА:
+• Выбери ровно {count} оттенков из списка, которые БЛИЖЕ ВСЕГО к основному цвету товара.
+• Учитывай описание товара — оттенки должны подходить именно этому изделию.
+• Верни ТОЧНЫЕ значения из списка (без изменений).
+• Порядок: от самого подходящего к менее подходящему.
+
+Ответ строго JSON:
+{{
+  "shades": ["оттенок1", "оттенок2", ...]
+}}
+""".strip()
+
+        result, tokens = self._call_api(
+            prompt,
+            thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_REFIX", 64),
+            max_output_tokens=300,
+        )
+        if isinstance(result, dict):
+            shades = result.get("shades", [])
+            if isinstance(shades, list):
+                children_norm = {c.lower().strip(): c for c in children}
+                valid = []
+                for s in shades:
+                    s_str = str(s).strip()
+                    matched = children_norm.get(s_str.lower())
+                    if matched and matched not in valid:
+                        valid.append(matched)
+                return valid[:count], tokens
+        return [], _empty_tokens
+
+    def generate_product_dna_text(
+        self,
+        image_url: str,
+        subject_name: str = "",
+    ) -> str:
+        """
+        Mahsulot fotosini bir marta tahlil qilib texnik tavsif (Product DNA) yaratadi.
+        Gemini vision orqali ishlaydi. VisionService (GPT) bilan bir xil prompt.
+        Returns: 300-500 so'zli texnik tavsif yoki ""
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+        if not self.is_enabled():
+            return ""
+
+        prompt = f"""Ты — эксперт по анализу fashion-товаров для маркетплейса Wildberries.
+Твоя задача — по фотографии товара создать максимально подробное и объективное описание изделия,
+которое будет использоваться как базовое описание товара для дальнейшей обработки системой.
+
+ВАЖНО: Это техническое описание товара — не финальный текст для карточки. Используй его для:
+- проверки характеристик
+- поиска ошибок
+- генерации названия и SEO-описания
+- сравнения с данными карточки
+
+Описание должно быть: точным, детализированным, без маркетинга, без выдуманных характеристик.
+Если характеристика не определяется по фото — укажи "не определено".
+
+Проанализируй изображение товара и сформируй техническое описание по блокам:
+
+1. ТИП ТОВАРА
+Определи тип изделия: категория одежды, комплект или одиночное, элементы комплекта.
+
+2. КОНСТРУКЦИЯ ИЗДЕЛИЯ
+Верх: тип, длина, посадка, рукава, воротник, карманы, застёжка, декоративные элементы.
+Низ: тип, длина, посадка, разрезы, карманы, застёжка, декоративные элементы.
+
+3. СИЛУЭТ И ПОСАДКА
+Силуэт, степень прилегания, посадка по фигуре, линия талии, длина относительно тела.
+
+4. ЦВЕТ И ВНЕШНИЙ ВИД
+Основной цвет, оттенок, принт, фактура ткани (если видна), визуальная плотность.
+
+5. МАТЕРИАЛ
+Если не определён — "не определено". Если есть визуальные признаки — укажи как предположение.
+
+6. ДЕКОРАТИВНЫЕ ЭЛЕМЕНТЫ
+Кнопки, пуговицы, молнии, строчки, накладные элементы, разрезы, декоративные карманы.
+
+7. СТИЛЬ
+casual / городской / офисный / минимализм / базовый.
+
+8. СЕЗОННОСТЬ
+лето / демисезон / всесезон / не определено.
+
+9. ОСОБЕННОСТИ МОДЕЛИ
+Крой, визуальные акценты, уникальные элементы.
+
+10. КРАТКОЕ ОБОБЩЕНИЕ
+2–3 предложения. Без маркетинга. Только факты.
+
+Категория товара: {subject_name or 'не указана'}
+
+ТРЕБОВАНИЯ: 300–500 слов, структурирован по блокам, без рекламных формулировок, без SEO.
+Верни ТОЛЬКО структурированный текст. Без JSON, без вводных фраз."""
+
+        try:
+            result, _ = self._call_api(
+                prompt,
+                image_url=image_url,
+                thinking_budget=0,
+                max_output_tokens=1500,
+                raw_text=True,
+            )
+            if isinstance(result, str) and len(result) > 50:
+                return result
+            # If _call_api returned dict (JSON parse attempt), extract text
+            if isinstance(result, dict):
+                for key in ("text", "description", "content", "result"):
+                    if isinstance(result.get(key), str) and len(result[key]) > 50:
+                        return result[key]
+            return ""
+        except Exception:
+            return ""
+
+    def generate_title(
+        self,
+        card: Dict[str, Any],
+        product_dna: str = "",
+        seo_keywords: list = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """
+        Generate a fresh title for a WB card from scratch using AI.
+        Uses card characteristics and category as source of truth.
+        Returns (result_dict, token_usage).
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+        if not self.is_enabled():
+            return {}, _empty_tokens
+
+        subject = card.get("subjectName") or card.get("subject_name") or ""
+        brand = card.get("brand") or ""
+
+        chars_raw = card.get("characteristics") or []
+        char_hints = []
+        if isinstance(chars_raw, list):
+            for ch in chars_raw[:20]:
+                nm = ch.get("name", "")
+                vl = ch.get("value", ch.get("values"))
+                if nm and vl:
+                    char_hints.append(f"{nm}: {vl}")
+        elif isinstance(chars_raw, dict):
+            for k, v in list(chars_raw.items())[:20]:
+                if v:
+                    char_hints.append(f"{k}: {v}")
+        chars_text = "\n".join(char_hints) if char_hints else "нет данных"
+
+        tech_desc = card.get("tech_description") or card.get("description") or ""
+        logic_block = build_wb_logic_block(include_output=False)
+
+        kw_block = ""
+        if seo_keywords:
+            kw_sample = seo_keywords[:15]
+            kw_block = f"""
+SEO-КЛЮЧЕВЫЕ СЛОВА КАТЕГОРИИ "{subject}" (используй хотя бы 1-2 из этих слов естественно):
+{', '.join(kw_sample)}
+"""
+
+        prompt = f"""
+ЗАДАЧА: Создай название товара для Wildberries на основе характеристик карточки.
+
+{logic_block}
+
+Категория: "{subject}"
+Бренд (НЕ включать в название!): "{brand}"
+
+Характеристики товара:
+{chars_text}
+
+{'Техническое описание:' + chr(10) + tech_desc[:800] if tech_desc else ''}
+
+{"" if not product_dna else "ВИЗУАЛЬНОЕ ОПИСАНИЕ ТОВАРА (из фото):" + chr(10) + product_dna[:1500]}
+{kw_block}
+СТРОГИЕ ПРАВИЛА:
+• Формула: [Категория] [ключевой признак] [конструктив] [назначение] [цвет при необходимости]
+• Длина: 40–60 символов (идеально 40–50)
+• Используй ТОЛЬКО факты из характеристик выше
+• ЗАПРЕЩЕНО включать бренд "{brand}" — он подставляется автоматически
+• ЗАПРЕЩЕНО: пол (женский/мужской/детский), маркетинг (стильный, топ, хит, лучший, идеальный, премиум, красивый)
+• ЗАПРЕЩЕНО: CAPS, спецсимволы, эмодзи, запятые, повтор слов
+• ЗАПРЕЩЕНО: «для + существительное» → пиши прилагательными: «офисный», «праздничный», «повседневный»
+• Цвет — только если он подтверждён характеристиками и является ключевой особенностью
+• Верни ОДИН лучший вариант
+
+Ответ строго JSON:
+{{
+  "recommended_value": "<созданное название>",
+  "reason": "<какие признаки использованы>"
+}}
+""".strip()
+
+        result, tokens = self._call_api(
+            prompt,
+            image_url=None if product_dna else _get_card_photo(card),
+            thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_REFIX", 64),
+            max_output_tokens=getattr(settings, "GEMINI_REFIX_MAX_OUTPUT_TOKENS", self.max_output_tokens),
+        )
+        return (result if isinstance(result, dict) else {}), tokens
+
+    def generate_description(
+        self,
+        card: Dict[str, Any],
+        product_dna: str = "",
+        seo_keywords: list = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """
+        Generate a fresh description for a WB card from scratch using AI.
+        Uses card characteristics and tech description as source of truth.
+        Returns (result_dict, token_usage).
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+        if not self.is_enabled():
+            return {}, _empty_tokens
+
+        subject = card.get("subjectName") or card.get("subject_name") or ""
+        title = card.get("title") or ""
+        chars_raw = card.get("characteristics") or []
+        char_hints = []
+        if isinstance(chars_raw, list):
+            for ch in chars_raw[:25]:
+                name = ch.get("name")
+                val = ch.get("value", ch.get("values"))
+                if name and val:
+                    char_hints.append({"name": name, "value": val})
+        elif isinstance(chars_raw, dict):
+            for k, v in list(chars_raw.items())[:25]:
+                if v:
+                    char_hints.append({"name": k, "value": v})
+
+        tech_desc = card.get("tech_description") or ""
+        logic_block = build_wb_logic_block(include_output=False)
+
+        kw_block = ""
+        if seo_keywords:
+            kw_sample = seo_keywords[:20]
+            kw_block = f"""
+SEO-КЛЮЧЕВЫЕ СЛОВА КАТЕГОРИИ "{subject}" (обязательно включи минимум 2-3 из этих слов естественно в текст):
+{', '.join(kw_sample)}
+"""
+
+        prompt = f"""
+ЗАДАЧА: Создай описание товара для Wildberries на основе характеристик карточки.
+
+{logic_block}
+
+Категория: "{subject}"
+Название: "{title}"
+
+Характеристики товара:
+{json.dumps(char_hints, ensure_ascii=False)}
+
+{'Техническое описание (источник истины):' + chr(10) + tech_desc[:1000] if tech_desc else ''}
+
+{"" if not product_dna else "ВИЗУАЛЬНОЕ ОПИСАНИЕ ТОВАРА (из фото):" + chr(10) + product_dna[:1500]}
+{kw_block}
+СТРОГИЕ ПРАВИЛА:
+• Длина: 1000–1800 символов
+• Формат: 3–6 абзацев, без списков, маркеров, нумерации
+• Каждый абзац: 2–4 предложения
+• Структура: вступление → конструкция/посадка → материал (если подтверждён) → назначение → особенности/уход
+• Пиши ТОЛЬКО факты из характеристик выше — не придумывай
+• ЗАПРЕЩЕНО: маркетинг, эмоции (стильный, роскошный, идеальный и т.п.), обещания эффекта (делает стройнее и т.п.)
+• ЗАПРЕЩЕНО: ссылки, телефоны, CAPS, эмодзи
+• Описание должно быть согласовано с названием и характеристиками
+• Верни готовый текст описания
+
+Ответ строго JSON:
+{{
+  "recommended_value": "<готовое описание 1000–1800 символов>",
+  "reason": "<структура и источники>"
+}}
+""".strip()
+
+        result, tokens = self._call_api(
+            prompt,
+            image_url=None if product_dna else _get_card_photo(card),
+            thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_REFIX", 64),
+            max_output_tokens=max(
+                getattr(settings, "GEMINI_REFIX_MAX_OUTPUT_TOKENS", self.max_output_tokens),
+                2048,
+            ),
+        )
+        return (result if isinstance(result, dict) else {}), tokens
+
     def refix_title(
         self,
         card: Dict[str, Any],
@@ -683,9 +1181,12 @@ CARD JSON:
                 if nm and vl:
                     char_hints.append(f"{nm}: {vl}")
         chars_text = "\n".join(char_hints) if char_hints else "нет данных"
+        logic_block = build_wb_logic_block(include_output=False)
 
         prompt = f"""
 ЗАДАЧА: Исправь название товара для Wildberries.
+
+{logic_block}
 
 Категория: "{subject}"
 Бренд (НЕ включать!): "{brand}"
@@ -696,15 +1197,18 @@ CARD JSON:
 {chars_text}
 
 СТРОГИЕ ПРАВИЛА:
-• Длина: 40–100 символов
+• Длина: 40–60 символов
 • ЗАПРЕЩЕНО включать бренд "{brand}" — он подставляется автоматически
-• ЗАПРЕЩЕНО включать цвет (черный, белый, зеленый и т.д.) —
-  цвет указывается отдельно в характеристиках, НЕ в названии
+• ЗАПРЕЩЕНО включать пол: "женский", "мужской", "детский"
+• ЗАПРЕЩЕНО включать маркетинг/эмоции: "стильный", "топ", "хит", "лучший", "идеальный", "премиум", "красивый"
+• ЗАПРЕЩЕНО использовать CAPS, спецсимволы, эмодзи, запятые
 • ЗАПРЕЩЕНО использовать «для + существительное» — пиши прилагательными:
   НЕЛЬЗЯ: «для офиса» → НУЖНО: «офисный»
   НЕЛЬЗЯ: «для праздника» → НУЖНО: «праздничный»
   НЕЛЬЗЯ: «для прогулки» → НУЖНО: «повседневный»
-• Структура: [Тип товара] [пол] [фасон/модель] [особенность] [назначение]
+• Структура: [Категория] [ключевой признак] [конструктив] [назначение] [цвет при необходимости]
+• Каждый признак должен быть подтверждён данными товара.
+• Цвет допускается только когда он подтверждён и является смысловой частью модели.
 • Верни ОДИН лучший вариант
 
 Ответ строго JSON:
@@ -714,8 +1218,85 @@ CARD JSON:
 }}
 """.strip()
 
-        image_url = _get_card_photo(card)
-        result, tokens = self._call_api(prompt, image_url)
+        result, tokens = self._call_api(
+            prompt,
+            image_url=None,
+            thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_REFIX", 64),
+            max_output_tokens=getattr(settings, "GEMINI_REFIX_MAX_OUTPUT_TOKENS", self.max_output_tokens),
+        )
+        return (result if isinstance(result, dict) else {}), tokens
+
+    def refix_description(
+        self,
+        card: Dict[str, Any],
+        current_description: str,
+        failed_reason: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """
+        Re-generate description when previous AI suggestion failed SEO validation.
+        Returns (result_dict, token_usage).
+        """
+        _empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
+        if not self.is_enabled():
+            return {}, _empty_tokens
+
+        subject = card.get("subjectName") or card.get("subject_name") or ""
+        title = card.get("title") or ""
+        chars_raw = card.get("characteristics") or []
+        char_hints = []
+        if isinstance(chars_raw, list):
+            for ch in chars_raw[:20]:
+                name = ch.get("name")
+                val = ch.get("value", ch.get("values"))
+                if name and val:
+                    char_hints.append({"name": name, "value": val})
+        elif isinstance(chars_raw, dict):
+            for k, v in list(chars_raw.items())[:20]:
+                if v:
+                    char_hints.append({"name": k, "value": v})
+        logic_block = build_wb_logic_block(include_output=False)
+
+        prompt = f"""
+ЗАДАЧА: Исправь описание товара для Wildberries.
+
+{logic_block}
+
+Категория: "{subject}"
+Название: "{title}"
+Текущее описание:
+{current_description[:2800]}
+
+Причина отказа валидатора: {failed_reason}
+
+Характеристики товара:
+{json.dumps(char_hints, ensure_ascii=False)}
+
+СТРОГИЕ ПРАВИЛА:
+• Длина: 1000-1800 символов.
+• Формат: 3-6 абзацев, без списков.
+• Каждый абзац: 2-4 предложения.
+• Структура: вступление -> конструкция/посадка -> материал (если подтвержден) -> назначение -> особенности.
+• Пиши только факты из названия/характеристик/контекста товара.
+• ЗАПРЕЩЕНО: маркетинг, эмоции, обещания эффекта, ссылки, телефоны, CAPS, эмодзи.
+• Описание должно быть согласовано с названием и характеристиками.
+• Верни ОДИН готовый вариант описания.
+
+Ответ строго JSON:
+{{
+  "recommended_value": "<готовое описание 1000-1800>",
+  "reason": "<что исправлено>"
+}}
+""".strip()
+
+        result, tokens = self._call_api(
+            prompt,
+            image_url=None,
+            thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_REFIX", 64),
+            max_output_tokens=max(
+                getattr(settings, "GEMINI_REFIX_MAX_OUTPUT_TOKENS", self.max_output_tokens),
+                2048,
+            ),
+        )
         return (result if isinstance(result, dict) else {}), tokens
 
     def get_suggestions(
@@ -737,3 +1318,18 @@ def get_gemini_service() -> GeminiService:
     if _gemini_service is None:
         _gemini_service = GeminiService()
     return _gemini_service
+
+
+def get_ai_service():
+    """
+    AI_PROVIDER sozlamasiga qarab to'g'ri serviceni qaytaradi.
+    AI_PROVIDER=gemini → GeminiService
+    AI_PROVIDER=gpt / openai → GPTService
+    """
+    from ..core.config import settings as _settings
+    provider = (_settings.AI_PROVIDER or "gemini").lower().strip()
+    if provider in ("gpt", "openai"):
+        from .gpt_service import get_gpt_service
+        return get_gpt_service()
+    return get_gemini_service()
+

@@ -9,6 +9,8 @@ from ..schemas import StoreCreate, StoreUpdate, StoreOut, StoreStats, StoreValid
 from ..schemas.store import OnboardRequest, OnboardResult
 from ..services import (
     create_store, get_store_by_id, get_user_stores,
+    ensure_account_can_create_store,
+    ensure_store_not_exists,
     update_store, update_store_status, update_store_stats,
     delete_store, check_store_access, WildberriesAPI,
     sync_cards_from_wb, analyze_store_cards,
@@ -58,7 +60,11 @@ async def create_new_store(
     current_user: User = Depends(get_current_user),
 ):
     """Create a new store (connect to WB)"""
-    store = await create_store(db, current_user.id, store_data)
+    try:
+        await ensure_account_can_create_store(db, current_user)
+        store = await create_store(db, current_user.id, store_data)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return store
 
 
@@ -248,6 +254,11 @@ async def onboard_store(
     Returns summary of everything done.
     """
     # Step 1: Validate API key
+    try:
+        await ensure_account_can_create_store(db, current_user)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
     wb_api = WildberriesAPI(data.api_key)
     validation = await wb_api.validate_api_key()
     
@@ -258,6 +269,18 @@ async def onboard_store(
         )
     
     supplier_name = validation.get("supplier_name") or validation.get("trade_mark") or "Мой магазин"
+    supplier_id = validation.get("supplier_id")
+
+    # Prevent duplicate onboarding for the same account/supplier
+    try:
+        await ensure_store_not_exists(
+            db,
+            owner_id=current_user.id,
+            api_key=data.api_key,
+            wb_supplier_id=str(supplier_id) if supplier_id is not None else None,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     
     # Step 2: Create store
     store_data = StoreCreate(
@@ -270,7 +293,7 @@ async def onboard_store(
     await update_store_status(
         db, store, StoreStatus.ACTIVE,
         wb_info={
-            "supplier_id": validation.get("supplier_id"),
+            "supplier_id": supplier_id,
             "supplier_name": validation.get("supplier_name"),
         }
     )
@@ -313,7 +336,7 @@ async def onboard_store(
         store_id=store.id,
         store_name=store.name,
         supplier_name=validation.get("supplier_name"),
-        supplier_id=validation.get("supplier_id"),
+        supplier_id=supplier_id,
         cards_synced=sync_result["total"],
         cards_new=sync_result["new"],
         cards_analyzed=analyze_result["analyzed"],

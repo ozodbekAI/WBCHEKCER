@@ -106,8 +106,10 @@ if FRONTEND_DIR.exists():
         if file_path.is_file():
             return FileResponse(str(file_path))
 
-        # Otherwise serve index.html (SPA routing)
-        return FileResponse(str(FRONTEND_DIR / "index.html"))
+        # Read index.html at request time to avoid Content-Length mismatch on deploy
+        from fastapi.responses import Response
+        index_content = (FRONTEND_DIR / "index.html").read_bytes()
+        return Response(content=index_content, media_type="text/html")
 else:
     @app.get("/")
     async def root():

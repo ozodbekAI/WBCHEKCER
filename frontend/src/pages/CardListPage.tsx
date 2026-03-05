@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useStore } from '../contexts/StoreContext';
 import api from '../api/client';
@@ -11,6 +11,7 @@ import {
   FlaskConical,
   Loader2,
   MoreVertical,
+  RotateCcw,
   RefreshCw,
   Search,
   Sparkles,
@@ -31,12 +32,12 @@ interface QualityMetric {
 }
 
 const METRICS: QualityMetric[] = [
+  { label: 'FCS', key: 'fcs', max: 100 },
   { label: 'Хар-ки', key: 'characteristics_score', max: 20 },
   { label: 'Title', key: 'title_score', max: 20 },
   { label: 'Desc', key: 'description_score', max: 20 },
   { label: 'Фото', key: 'photos_score', max: 20 },
   { label: 'Видео', key: 'video_score', max: 10 },
-  { label: 'Ракурс', key: 'angles_score', max: 10 },
   { label: 'Cons', key: 'seo_score', max: 10 },
 ];
 
@@ -75,9 +76,9 @@ function statusForCard(card: Card): {
   label: string;
   detail: string;
 } {
-  const totalIssues = card.critical_issues_count + card.warnings_count + card.improvements_count;
+  const totalIssues = (card.critical_issues_count ?? 0) + (card.warnings_count ?? 0) + (card.improvements_count ?? 0);
 
-  if (card.critical_issues_count > 0) {
+  if ((card.critical_issues_count ?? 0) > 0) {
     return {
       mode: 'critical',
       label: 'Требует исправления',
@@ -85,11 +86,11 @@ function statusForCard(card: Card): {
     };
   }
 
-  if (card.warnings_count > 0 || card.improvements_count > 0) {
+  if ((card.warnings_count ?? 0) > 0 || (card.improvements_count ?? 0) > 0) {
     return {
       mode: 'warning',
       label: 'Есть отложенные',
-      detail: `${card.warnings_count + card.improvements_count} ошибки`,
+      detail: `${(card.warnings_count ?? 0) + (card.improvements_count ?? 0)} ошибки`,
     };
   }
 
@@ -120,27 +121,44 @@ export default function CardListPage() {
   const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
   const [sortBy, setSortBy] = useState<SortFilter>('issues');
   const [openMenuCardId, setOpenMenuCardId] = useState<number | null>(null);
-  const [syncing, setSyncing] = useState(false);
-  const [syncStatus, setSyncStatus] = useState('');
+  const [analysisTask, setAnalysisTask] = useState<{ taskId: string; step: string; progress: number; status: string } | null>(null);
+  const analysisPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [schedulerStatus, setSchedulerStatus] = useState<{ last_tick_at: string | null; next_tick_in_sec: number | null; is_running: boolean } | null>(null);
 
-  const handleSync = async () => {
-    if (!activeStore || syncing) return;
-    setSyncing(true);
+  const loadSchedulerStatus = async () => {
     try {
-      setSyncStatus('Загрузка карточек с WB...');
-      await api.syncCards(activeStore.id);
-      setSyncStatus('AI-анализ (20 карточек)...');
-      const result = await api.analyzeStore(activeStore.id, true, 20);
-      setSyncStatus(`✅ Найдено ${result.issues_found || 0} проблем`);
-      await loadCards();
-      setTimeout(() => setSyncStatus(''), 5000);
+      const s = await api.getSchedulerStatus();
+      setSchedulerStatus(s);
+    } catch { /* ignore */ }
+  };
+
+  const handleResetAndAnalyze = async () => {
+    if (!activeStore || analysisTask?.status === 'running') return;
+    try {
+      const res = await api.startResetAndAnalyze(activeStore.id);
+      setAnalysisTask({ taskId: res.task_id, step: 'Анализ начался...', progress: 0, status: 'pending' });
+
+      if (analysisPollRef.current) clearInterval(analysisPollRef.current);
+      analysisPollRef.current = setInterval(async () => {
+        try {
+          const s = await api.getSyncStatus(activeStore.id, res.task_id);
+          setAnalysisTask({ taskId: res.task_id, step: s.step || '...', progress: s.progress || 0, status: s.status });
+          if (s.status === 'completed' || s.status === 'failed') {
+            if (analysisPollRef.current) clearInterval(analysisPollRef.current);
+            await loadCards();
+            setTimeout(() => setAnalysisTask(null), 6000);
+          }
+        } catch {
+          if (analysisPollRef.current) clearInterval(analysisPollRef.current);
+        }
+      }, 2000);
     } catch (err: any) {
-      setSyncStatus(`Ошибка: ${err.message || 'Попробуйте позже'}`);
-      setTimeout(() => setSyncStatus(''), 5000);
-    } finally {
-      setSyncing(false);
+      setAnalysisTask({ taskId: '', step: `Ошибка: ${err.message}`, progress: 0, status: 'failed' });
+      setTimeout(() => setAnalysisTask(null), 5000);
     }
   };
+
+  useEffect(() => () => { if (analysisPollRef.current) clearInterval(analysisPollRef.current); }, []);
 
   useEffect(() => {
     const querySeverity = searchParams.get('severity');
@@ -162,6 +180,13 @@ export default function CardListPage() {
       void loadCards();
     }
   }, [activeStore, page, severityFilter, sortBy]);
+
+  // Poll scheduler status every 30 seconds
+  useEffect(() => {
+    void loadSchedulerStatus();
+    const interval = setInterval(loadSchedulerStatus, 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   const loadCards = async () => {
     if (!activeStore) return;
@@ -211,19 +236,19 @@ export default function CardListPage() {
     let list = [...cards];
 
     if (severityFilter === 'has_issues') {
-      list = list.filter((card) => card.critical_issues_count + card.warnings_count + card.improvements_count > 0);
+      list = list.filter((card) => (card.critical_issues_count ?? 0) + (card.warnings_count ?? 0) + (card.improvements_count ?? 0) > 0);
     } else if (severityFilter === 'no_issues') {
-      list = list.filter((card) => card.critical_issues_count + card.warnings_count + card.improvements_count === 0);
+      list = list.filter((card) => (card.critical_issues_count ?? 0) + (card.warnings_count ?? 0) + (card.improvements_count ?? 0) === 0);
     } else if (severityFilter === 'postponed') {
-      list = list.filter((card) => card.warnings_count > 0 || card.improvements_count > 0);
+      list = list.filter((card) => (card.warnings_count ?? 0) > 0 || (card.improvements_count ?? 0) > 0);
     } else if (severityFilter === 'unconfirmed') {
-      list = list.filter((card) => card.critical_issues_count > 0);
+      list = list.filter((card) => (card.critical_issues_count ?? 0) > 0);
     }
 
     if (sortBy === 'issues') {
       list.sort((a, b) => {
-        const aIssues = a.critical_issues_count + a.warnings_count + a.improvements_count;
-        const bIssues = b.critical_issues_count + b.warnings_count + b.improvements_count;
+        const aIssues = (a.critical_issues_count ?? 0) + (a.warnings_count ?? 0) + (a.improvements_count ?? 0);
+        const bIssues = (b.critical_issues_count ?? 0) + (b.warnings_count ?? 0) + (b.improvements_count ?? 0);
         return bIssues - aIssues;
       });
     } else {
@@ -234,16 +259,17 @@ export default function CardListPage() {
   }, [cards, severityFilter, sortBy]);
 
   const cardsWithIssues = useMemo(
-    () => visibleCards.filter((card) => card.critical_issues_count + card.warnings_count + card.improvements_count > 0).length,
+    () => visibleCards.filter((card) => (card.critical_issues_count ?? 0) + (card.warnings_count ?? 0) + (card.improvements_count ?? 0) > 0).length,
     [visibleCards],
   );
 
   const criticalCards = useMemo(
-    () => visibleCards.filter((card) => card.critical_issues_count > 0).length,
+    () => visibleCards.filter((card) => (card.critical_issues_count ?? 0) > 0).length,
     [visibleCards],
   );
 
   return (
+    <>
     <div className="card-list-page">
       <div className="card-list-shell">
         <div className="card-list-topline">
@@ -257,14 +283,37 @@ export default function CardListPage() {
           <div className="card-list-headline">Карточки товаров</div>
           <div className="card-list-sync-area">
             <button
-              className={`ws-sync-btn ${syncing ? 'ws-sync-btn--active' : ''}`}
-              onClick={handleSync}
-              disabled={syncing}
+              className={`ws-sync-btn ws-sync-btn--reset ${analysisTask?.status === 'running' || analysisTask?.status === 'pending' ? 'ws-sync-btn--active' : ''}`}
+              onClick={handleResetAndAnalyze}
+              disabled={analysisTask?.status === 'running' || analysisTask?.status === 'pending'}
+              title="Очистить все анализы и запустить заново"
             >
-              {syncing ? <Loader2 size={15} className="ws-spin" /> : <RefreshCw size={15} />}
-              {syncing ? 'Синхронизация...' : 'Синхронизировать'}
+              {analysisTask?.status === 'running' || analysisTask?.status === 'pending'
+                ? <Loader2 size={15} className="ws-spin" />
+                : <RotateCcw size={15} />}
+              Заново
             </button>
-            {syncStatus && <span className="card-list-sync-status">{syncStatus}</span>}
+            {/* Auto-sync status — shows last sync time and next tick */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
+              <RefreshCw size={13} style={{ color: schedulerStatus?.is_running ? 'var(--success, #22c55e)' : 'var(--text-muted)' }} />
+              {schedulerStatus ? (
+                <span>
+                  {schedulerStatus.last_tick_at
+                    ? `Обновлено: ${new Date(schedulerStatus.last_tick_at + 'Z').toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`
+                    : 'Ожидание...'
+                  }
+                  {schedulerStatus.next_tick_in_sec != null && (
+                    <span style={{ marginLeft: 6, color: 'var(--text-muted)' }}>
+                      · след. через {schedulerStatus.next_tick_in_sec < 60
+                        ? `${schedulerStatus.next_tick_in_sec}с`
+                        : `${Math.round(schedulerStatus.next_tick_in_sec / 60)}м`}
+                    </span>
+                  )}
+                </span>
+              ) : (
+                <span>Авто-обновление каждые 10 мин</span>
+              )}
+            </div>
           </div>
         </div>
 
@@ -471,5 +520,32 @@ export default function CardListPage() {
         )}
       </div>
     </div>
+
+    {/* Bottom analysis progress banner */}
+    {analysisTask && (
+      <div className="analysis-progress-banner">
+        <div className="analysis-progress-inner">
+          <div className="analysis-progress-left">
+            {analysisTask.status === 'completed'
+              ? <CheckCircle2 size={16} style={{ color: '#16A34A' }} />
+              : analysisTask.status === 'failed'
+              ? <AlertTriangle size={16} style={{ color: '#EF4444' }} />
+              : <Loader2 size={16} className="ws-spin" />}
+            <span className="analysis-progress-step">
+              {analysisTask.status === 'completed' ? '✅ ' : ''}
+              {analysisTask.step}
+            </span>
+          </div>
+          <div className="analysis-progress-bar-wrap">
+            <div
+              className="analysis-progress-bar-fill"
+              style={{ width: `${analysisTask.progress}%`, background: analysisTask.status === 'failed' ? '#EF4444' : '#6366F1' }}
+            />
+          </div>
+          <span className="analysis-progress-pct">{analysisTask.progress}%</span>
+        </div>
+      </div>
+    )}
+    </>
   );
 }

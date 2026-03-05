@@ -19,7 +19,7 @@ from ..services import (
     WildberriesAPI, update_store_stats,
 )
 from ..services.issue_service import (
-    get_next_issue, get_fixed_issues_for_store,
+    get_next_issue, get_card_pending_count, get_fixed_issues_for_store,
     get_queue_progress, mark_applied_to_wb,
 )
 
@@ -47,6 +47,100 @@ async def get_user_store(
             )
 
     return store
+
+
+# In-memory cache for WB directory values: char_name -> list of values
+_wb_directory_cache: dict[str, list[str]] = {}
+
+
+async def _fresh_allowed_values(issue: CardIssue, store: Store) -> list:
+    """Fetch allowed values from WB directory API (cached), with local catalog fallback."""
+    import re
+    char_name: str | None = None
+    if issue.field_path and issue.field_path.startswith("characteristics."):
+        _EN_TO_RU = {"composition": "Состав", "country": "Страна производства"}
+        raw = issue.field_path[len("characteristics."):]
+        char_name = _EN_TO_RU.get(raw.lower(), raw)
+
+    # Fallback: extract char name from title like "Характеристика 'Покрой': ..."
+    if not char_name and issue.title:
+        m = re.search(r"[Хх]арактеристика\s+['\u2018\u2019\u201C\u201D\"'](.+?)['\u2018\u2019\u201C\u201D\"']", issue.title)
+        if m:
+            char_name = m.group(1).strip()
+
+    if not char_name:
+        return issue.allowed_values or []
+
+    # 1) Check in-memory cache
+    if char_name in _wb_directory_cache:
+        return _wb_directory_cache[char_name]
+
+    # 2) Try WB directory API
+    try:
+        if store.api_key:
+            wb = WildberriesAPI(store.api_key)
+            result = await wb.get_directory_values(char_name)
+            if result.get("success") and result.get("values"):
+                _wb_directory_cache[char_name] = result["values"]
+                return result["values"]
+    except Exception:
+        pass
+
+    # 3) Fallback to local catalog
+    try:
+        from ..services.wb_validator import get_catalog
+        catalog = get_catalog()
+        vals = catalog.get_allowed_values(char_name)
+        if vals:
+            _wb_directory_cache[char_name] = vals
+            return vals
+    except Exception:
+        pass
+
+    return issue.allowed_values or []
+
+
+def _norm_val(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
+async def _auto_resolve_if_now_valid(
+    issue: CardIssue, fresh_allowed: list, db: AsyncSession
+) -> bool:
+    """If all 'invalid' values are now in fresh allowed_values, auto-resolve the issue.
+    Returns True if resolved (caller should skip to next issue)."""
+    if not fresh_allowed:
+        return False
+    # Only applies to allowed_values-type errors
+    error_details = issue.error_details or []
+    has_av_error = any(
+        (e.get("type") == "allowed_values" if isinstance(e, dict) else False)
+        for e in error_details
+    )
+    if not has_av_error:
+        return False
+
+    # Gather all invalid values from error_details
+    invalid_vals: list[str] = []
+    for e in error_details:
+        if isinstance(e, dict) and e.get("type") == "allowed_values":
+            invalid_vals.extend(e.get("invalidValues") or [])
+
+    if not invalid_vals:
+        return False
+
+    allowed_norm = {_norm_val(v) for v in fresh_allowed}
+    all_now_valid = all(_norm_val(str(v)) in allowed_norm for v in invalid_vals)
+
+    if all_now_valid:
+        # Auto-resolve: mark as fixed with original value (no longer an issue)
+        issue.status = IssueStatus.FIXED
+        issue.fixed_value = issue.current_value
+        issue.fixed_at = datetime.utcnow()
+        await db.commit()
+        return True
+
+    return False
 
 
 @router.get("", response_model=IssueListOut)
@@ -91,7 +185,11 @@ async def get_grouped_issues(
     """Get issues grouped by severity"""
     grouped = await get_issues_grouped(db, store.id)
     
-    def issue_to_dict(issue: CardIssue) -> IssueWithCard:
+    async def issue_to_dict(issue: CardIssue) -> Optional[IssueWithCard]:
+        fresh_av = await _fresh_allowed_values(issue, store)
+        # Auto-resolve if "invalid" values are now valid
+        if await _auto_resolve_if_now_valid(issue, fresh_av, db):
+            return None
         return IssueWithCard(
             id=issue.id,
             card_id=issue.card_id,
@@ -104,7 +202,7 @@ async def get_grouped_issues(
             suggested_value=issue.suggested_value,
             alternatives=issue.alternatives or [],
             charc_id=issue.charc_id,
-            allowed_values=issue.allowed_values or [],
+            allowed_values=fresh_av,
             error_details=issue.error_details or [],
             ai_suggested_value=issue.ai_suggested_value,
             ai_reason=issue.ai_reason,
@@ -121,15 +219,21 @@ async def get_grouped_issues(
             card_photos=issue.card.photos[:3] if issue.card.photos else [],
         )
     
+    # Build lists, filtering out auto-resolved (None) issues
+    critical = [x for x in [await issue_to_dict(i) for i in grouped["critical"]] if x is not None]
+    warnings = [x for x in [await issue_to_dict(i) for i in grouped["warnings"]] if x is not None]
+    improvements = [x for x in [await issue_to_dict(i) for i in grouped["improvements"]] if x is not None]
+    postponed = [x for x in [await issue_to_dict(i) for i in grouped["postponed"]] if x is not None]
+
     return IssuesGrouped(
-        critical=[issue_to_dict(i) for i in grouped["critical"]],
-        warnings=[issue_to_dict(i) for i in grouped["warnings"]],
-        improvements=[issue_to_dict(i) for i in grouped["improvements"]],
-        postponed=[issue_to_dict(i) for i in grouped["postponed"]],
-        critical_count=grouped["critical_count"],
-        warnings_count=grouped["warnings_count"],
-        improvements_count=grouped["improvements_count"],
-        postponed_count=grouped["postponed_count"],
+        critical=critical,
+        warnings=warnings,
+        improvements=improvements,
+        postponed=postponed,
+        critical_count=len(critical),
+        warnings_count=len(warnings),
+        improvements_count=len(improvements),
+        postponed_count=len(postponed),
     )
 
 
@@ -178,10 +282,10 @@ async def fix_issue_endpoint(
             detail="Issue not found"
         )
     
-    if issue.status != IssueStatus.PENDING:
+    if issue.status not in (IssueStatus.PENDING, IssueStatus.SKIPPED):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Issue is not pending"
+            detail="Issue is not pending or skipped"
         )
     
     # Apply fix to WB if requested
@@ -224,6 +328,37 @@ async def skip_issue_endpoint(
     return IssueOut.model_validate(updated)
 
 
+@router.post("/{issue_id}/unskip", response_model=IssueOut)
+async def unskip_issue_endpoint(
+    issue_id: int,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reset a skipped issue back to pending"""
+    from ..services.issue_service import unskip_issue
+
+    issue = await get_issue_by_id(db, issue_id)
+
+    if not issue or issue.card.store_id != store.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Issue not found"
+        )
+
+    if issue.status != IssueStatus.SKIPPED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Issue is not skipped"
+        )
+
+    updated = await unskip_issue(db, issue)
+
+    # Update store stats
+    await update_store_stats(db, store.id)
+
+    return IssueOut.model_validate(updated)
+
+
 @router.post("/{issue_id}/postpone", response_model=IssueOut)
 async def postpone_issue_endpoint(
     issue_id: int,
@@ -259,17 +394,59 @@ async def get_next_queue_issue(
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
     after: Optional[int] = Query(None, description="Get issue after this ID"),
+    card_id: Optional[int] = Query(None, description="Limit to specific card"),
+    severity: Optional[str] = Query(None, description="Filter by severity: critical, warning, improvement"),
 ):
     """
     Get next pending issue in the fixing queue.
-    Order: critical → warning → improvement, by score impact.
-    Use `after` param to skip past a specific issue ID.
+    If card_id provided, returns only issues for that card (returns null when card is done).
+    If severity provided, only returns issues of that severity.
+    Otherwise returns the globally next issue by priority.
+    Auto-resolves issues whose 'invalid' values are now valid in the current catalog.
     """
-    issue = await get_next_issue(db, store.id, after_issue_id=after)
-    
-    if not issue:
+    # Loop: fetch next issue, auto-resolve if no longer invalid, repeat
+    _max_auto_resolve = 50  # safety limit
+    for _ in range(_max_auto_resolve):
+        issue = await get_next_issue(db, store.id, after_issue_id=after, card_id=card_id, severity=severity)
+        if not issue:
+            return None
+
+        # Check if this issue's "invalid" values are now valid → auto-resolve
+        fresh_av = await _fresh_allowed_values(issue, store)
+        if await _auto_resolve_if_now_valid(issue, fresh_av, db):
+            # Issue auto-resolved, fetch the next one
+            continue
+
+        break
+    else:
         return None
-    
+
+    pending_count = await get_card_pending_count(db, issue.card_id)
+
+    # Check if this characteristic is is_fixed in WB catalog
+    requires_fixed_file = False
+    try:
+        from ..services.wb_validator import get_catalog
+        catalog = get_catalog()
+        subject_id = issue.card.subject_id if issue.card else None
+        if subject_id:
+            subject_chars = catalog.get_subject_chars(subject_id)
+            # Extract char name from field_path (e.g. "characteristics.Состав" → "Состав")
+            # Also handle legacy English aliases (composition → Состав)
+            _EN_TO_RU = {"composition": "Состав", "country": "Страна производства"}
+            char_name_from_path: str | None = None
+            if issue.field_path and issue.field_path.startswith("characteristics."):
+                raw_name = issue.field_path[len("characteristics."):]
+                char_name_from_path = _EN_TO_RU.get(raw_name.lower(), raw_name)
+            for cm in subject_chars:
+                matched = (issue.charc_id and cm.charc_id == issue.charc_id) or \
+                          (char_name_from_path and cm.name.lower() == char_name_from_path.lower())
+                if matched and cm.is_fixed:
+                    requires_fixed_file = True
+                    break
+    except Exception:
+        pass
+
     return IssueWithCard(
         id=issue.id,
         card_id=issue.card_id,
@@ -282,7 +459,7 @@ async def get_next_queue_issue(
         suggested_value=issue.suggested_value,
         alternatives=issue.alternatives or [],
         charc_id=issue.charc_id,
-        allowed_values=issue.allowed_values or [],
+        allowed_values=fresh_av,
         error_details=issue.error_details or [],
         ai_suggested_value=issue.ai_suggested_value,
         ai_reason=issue.ai_reason,
@@ -297,6 +474,8 @@ async def get_next_queue_issue(
         card_title=issue.card.title,
         card_vendor_code=issue.card.vendor_code,
         card_photos=issue.card.photos[:3] if issue.card.photos else [],
+        card_pending_count=pending_count,
+        requires_fixed_file=requires_fixed_file,
     )
 
 
@@ -304,9 +483,10 @@ async def get_next_queue_issue(
 async def get_queue_progress_endpoint(
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
+    severity: Optional[str] = Query(None, description="Filter by severity: critical, warning, improvement"),
 ):
-    """Get progress of issue fixing queue"""
-    progress = await get_queue_progress(db, store.id)
+    """Get progress of issue fixing queue, optionally filtered by severity"""
+    progress = await get_queue_progress(db, store.id, severity=severity)
     return QueueProgress(**progress)
 
 
@@ -411,6 +591,13 @@ async def apply_all_fixes_to_wb(
         
         if result.get("success"):
             applied_ids.extend([i.id for i in card_issues])
+            # Mark card so scheduler doesn't re-analyze after our fix
+            from sqlalchemy import update as sa_update
+            await db.execute(
+                sa_update(card.__class__)
+                .where(card.__class__.id == card_id)
+                .values(skip_next_reanalyze=True)
+            )
         else:
             error_msg = result.get("error", "Unknown error")
             errors.append(f"Card {card.nm_id}: {error_msg}")

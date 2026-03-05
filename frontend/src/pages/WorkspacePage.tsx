@@ -2,11 +2,10 @@ import React, { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStore } from '../contexts/StoreContext';
 import { useAuth } from '../contexts/AuthContext';
-import api from '../api/client';
+import api, { API_ORIGIN } from '../api/client';
 import type { WorkspaceDashboard, StoreStats, TeamActivity } from '../types';
 import { startSession, flushActiveSession, trackAction, getStats, formatDuration } from '../hooks/useActivityTracker';
 import SettingsPanel from './SettingsPanel';
-import SyncModal from '../components/SyncModal';
 import {
   ClipboardList,
   Circle,
@@ -28,7 +27,6 @@ import {
   Sparkles,
   X,
   Check,
-  RefreshCw,
   Loader2,
   Users,
   ClipboardCheck,
@@ -45,7 +43,7 @@ import {
 
 export default function WorkspacePage() {
   const navigate = useNavigate();
-  const { activeStore, stores, loadStores, selectStore } = useStore();
+  const { activeStore, stores, selectStore } = useStore();
   const { user, logout, hasPermission, hasAnyPermission, isRole } = useAuth();
   const [dashboard, setDashboard] = useState<WorkspaceDashboard | null>(null);
   const [stats, setStats] = useState<StoreStats | null>(null);
@@ -54,7 +52,11 @@ export default function WorkspacePage() {
   const [showProfile, setShowProfile] = useState(false);
   const profileRef = useRef<HTMLDivElement>(null);
   const [reanalyzing, setReanalyzing] = useState(false);
-  const [syncModalOpen, setSyncModalOpen] = useState(false);
+  const [reanalyzeTaskId, setReanalyzeTaskId] = useState<string | null>(null);
+  const [reanalyzeProgress, setReanalyzeProgress] = useState(0);
+  const [reanalyzeStep, setReanalyzeStep] = useState('');
+  const [reanalyzeResult, setReanalyzeResult] = useState<{ total_analyzed?: number; issues_found?: number } | null>(null);
+  const [reanalyzeError, setReanalyzeError] = useState<string | null>(null);
   const [modeModalOpen, setModeModalOpen] = useState(false);
   const [workMode, setWorkMode] = useState<'guided' | 'advanced'>('guided');
   const [startTarget, setStartTarget] = useState<'critical' | 'incoming' | 'cards' | null>(null);
@@ -62,6 +64,10 @@ export default function WorkspacePage() {
   const [todayMin, setTodayMin] = useState(0);
   const [teamActivity, setTeamActivity] = useState<TeamActivity | null>(null);
   const [myPendingCount, setMyPendingCount] = useState(0);
+
+  const avatarUrl = user?.avatar_url
+    ? (/^https?:\/\//i.test(user.avatar_url) ? user.avatar_url : `${API_ORIGIN}${user.avatar_url.startsWith('/') ? '' : '/'}${user.avatar_url}`)
+    : '';
 
   // Activity tracking
   useEffect(() => {
@@ -99,11 +105,10 @@ export default function WorkspacePage() {
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  useEffect(() => { loadStores(); }, []);
   useEffect(() => {
     if (activeStore) loadDashboard();
     else if (!activeStore && stores.length === 0) setLoading(false);
-  }, [activeStore, stores]);
+  }, [activeStore, stores.length]);
 
   // Reload dashboard when background sync completes
   useEffect(() => {
@@ -148,10 +153,57 @@ export default function WorkspacePage() {
     }
   };
 
-  const handleSync = () => {
-    if (!activeStore) return;
-    trackAction();
-    setSyncModalOpen(true);
+  const canConnectStore = isRole('owner');
+
+  // ── Re-analyze handler ──
+  const handleReanalyze = async () => {
+    if (!activeStore || reanalyzing) return;
+    setReanalyzing(true);
+    setReanalyzeProgress(0);
+    setReanalyzeStep('Запуск...');
+    setReanalyzeResult(null);
+    setReanalyzeError(null);
+    try {
+      const res = await api.startResetAndAnalyze(activeStore.id);
+      const taskId = res.task_id;
+      setReanalyzeTaskId(taskId);
+
+      // Poll every 1.5s
+      const poll = setInterval(async () => {
+        try {
+          const st = await api.getSyncStatus(activeStore.id, taskId);
+          setReanalyzeProgress(st.progress || 0);
+          setReanalyzeStep(st.step || '');
+          if (st.status === 'completed') {
+            clearInterval(poll);
+            setReanalyzeResult(st.result || {});
+            setReanalyzeProgress(100);
+            loadDashboard();
+          } else if (st.status === 'failed') {
+            clearInterval(poll);
+            setReanalyzeError(st.error || st.step || 'Ошибка');
+            setReanalyzing(false);
+          } else if (st.status === 'cancelled') {
+            clearInterval(poll);
+            setReanalyzing(false);
+          }
+        } catch {
+          clearInterval(poll);
+          setReanalyzeError('Потеряна связь с сервером');
+          setReanalyzing(false);
+        }
+      }, 1500);
+    } catch (err: any) {
+      setReanalyzeError(err.message || 'Не удалось запустить анализ');
+      setReanalyzing(false);
+    }
+  };
+
+  const closeReanalyzeModal = () => {
+    setReanalyzing(false);
+    setReanalyzeTaskId(null);
+    setReanalyzeResult(null);
+    setReanalyzeError(null);
   };
 
   if (!activeStore && !loading && stores.length === 0) {
@@ -159,13 +211,19 @@ export default function WorkspacePage() {
       <div className="ws-empty-state">
         <LayoutGrid size={48} className="ws-empty-icon" />
         <h3>Нет подключённых магазинов</h3>
-        <p>Подключите магазин Wildberries, чтобы начать оптимизацию карточек</p>
-        <button className="ws-btn ws-btn-primary ws-btn-lg" onClick={() => navigate('/onboard')}>
-          Подключить магазин
-        </button>
+        <p>
+          {canConnectStore
+            ? 'Подключите магазин Wildberries, чтобы начать оптимизацию карточек'
+            : 'Подключать магазин может только пользователь с ролью Owner'}
+        </p>
+        {canConnectStore && (
+          <button className="ws-btn ws-btn-primary ws-btn-lg" onClick={() => navigate('/onboard')}>
+            Подключить магазин
+          </button>
+        )}
         <button
           className="ws-btn ws-btn-lg"
-          style={{ marginTop: 10, color: '#6b7280', background: 'none', border: '1px solid #e5e7eb' }}
+          style={{ marginTop: canConnectStore ? 10 : 0, color: '#6b7280', background: 'none', border: '1px solid #e5e7eb' }}
           onClick={() => logout()}
         >
           Выйти из аккаунта
@@ -206,7 +264,7 @@ export default function WorkspacePage() {
   const startByMode = () => {
     if (!startTarget) return;
     if (workMode === 'guided') {
-      navigate('/workspace/cards');
+      navigate('/workspace/cards/queue');
     } else {
       navigate('/workspace/cards');
     }
@@ -237,9 +295,17 @@ export default function WorkspacePage() {
                     <span className="ws-store-meta">{s.total_cards} карточек</span>
                   </div>
                 ))}
-                <div className="ws-store-add" onClick={() => { setShowStoreMenu(false); navigate('/onboard'); }}>
-                  + Добавить магазин
-                </div>
+                {canConnectStore && (
+                  <div
+                    className="ws-store-add"
+                    onClick={() => {
+                      setShowStoreMenu(false);
+                      navigate('/onboard');
+                    }}
+                  >
+                    + Добавить магазин
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -250,6 +316,10 @@ export default function WorkspacePage() {
             <Clock size={14} />
             <span>Сегодня: {formatDuration(todayMin)}</span>
           </div>
+          <button className="ws-header-btn ws-header-btn--text" title="Profile" onClick={() => navigate('/workspace/profile')}>
+            <User size={16} />
+            <span>Profile</span>
+          </button>
           <button className="ws-header-btn" title="Настройки" onClick={() => setSettingsOpen(true)}>
             <Settings size={18} />
           </button>
@@ -262,7 +332,7 @@ export default function WorkspacePage() {
               title={user?.first_name || user?.email || 'Профиль'}
             >
               <div className="ws-profile-avatar">
-                {user?.first_name ? user.first_name.charAt(0).toUpperCase() : <User size={16} />}
+                {avatarUrl ? <img src={avatarUrl} alt="avatar" className="ws-profile-avatar-img" /> : (user?.first_name ? user.first_name.charAt(0).toUpperCase() : <User size={16} />)}
               </div>
             </button>
 
@@ -271,7 +341,7 @@ export default function WorkspacePage() {
                 {/* User info */}
                 <div className="ws-profile-info">
                   <div className="ws-profile-avatar-lg">
-                    {user.first_name ? user.first_name.charAt(0).toUpperCase() : <User size={22} />}
+                    {avatarUrl ? <img src={avatarUrl} alt="avatar" className="ws-profile-avatar-img" /> : (user.first_name ? user.first_name.charAt(0).toUpperCase() : <User size={22} />)}
                   </div>
                   <div className="ws-profile-details">
                     <span className="ws-profile-name">
@@ -332,6 +402,10 @@ export default function WorkspacePage() {
                 <div className="ws-profile-divider" />
 
                 {/* Quick links */}
+                <button className="ws-profile-action" onClick={() => { setShowProfile(false); navigate('/workspace/profile'); }}>
+                  <User size={16} />
+                  <span>Profile</span>
+                </button>
                 {hasAnyPermission('team.view', 'team.manage') && (
                   <button className="ws-profile-action" onClick={() => { setShowProfile(false); navigate('/workspace/staff'); }}>
                     <Users size={16} />
@@ -363,42 +437,6 @@ export default function WorkspacePage() {
 
       {/* ═══════════ Content ═══════════ */}
       <main className="ws-main">
-        {/* Sync panel */}
-        <div className="ws-sync-panel">
-          <div className="ws-sync-panel-left">
-            <div className="ws-sync-panel-icon">
-              <RefreshCw size={18} />
-            </div>
-            <div className="ws-sync-panel-info">
-              <span className="ws-sync-panel-title">Синхронизация с Wildberries</span>
-              <span className="ws-sync-panel-sub">
-                {activeStore?.last_sync_at
-                  ? `Последняя: ${new Date(activeStore.last_sync_at).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}`
-                  : 'Ещё не синхронизировалось'}
-              </span>
-            </div>
-          </div>
-          {hasPermission('cards.sync') ? (
-            <button
-              className="ws-sync-panel-btn"
-              onClick={handleSync}
-            >
-              <RefreshCw size={15} /> Синхронизировать
-            </button>
-          ) : (
-            <span className="ws-sync-panel-readonly">Только для старшего менеджера</span>
-          )}
-        </div>
-
-        {/* Sync modal */}
-        {syncModalOpen && activeStore && (
-          <SyncModal
-            storeId={activeStore.id}
-            onClose={() => setSyncModalOpen(false)}
-            onStarted={() => setSyncModalOpen(false)}
-          />
-        )}
-
         {/* Section title */}
         <div className="ws-section-title">
           <ClipboardList size={22} />
@@ -554,6 +592,28 @@ export default function WorkspacePage() {
             <div className="ws-tool-body">
               <span className="ws-tool-name">Эталонные значения</span>
               <span className="ws-tool-desc">Excel-файл с правильными составами, сертификатами и декларациями</span>
+            </div>
+            <ChevronRight size={18} className="ws-tool-arrow" />
+          </div>
+
+          {/* Re-analyze all */}
+          <div
+            className="ws-tool"
+            onClick={reanalyzing ? undefined : handleReanalyze}
+            style={reanalyzing ? { opacity: 0.6, cursor: 'not-allowed' } : {}}
+          >
+            <div className="ws-tool-icon" style={{ background: 'rgba(239,68,68,.12)' }}>
+              {reanalyzing ? <Loader2 size={20} className="ws-spin" style={{ color: '#ef4444' }} /> : <Sparkles size={20} style={{ color: '#ef4444' }} />}
+            </div>
+            <div className="ws-tool-body">
+              <span className="ws-tool-name">
+                {reanalyzing ? 'Анализ идёт...' : 'Переанализировать все'}
+              </span>
+              <span className="ws-tool-desc">
+                {reanalyzing
+                  ? `${reanalyzeStep} — ${reanalyzeProgress}%`
+                  : 'Удалить все проблемы и заново проанализировать карточки с AI'}
+              </span>
             </div>
             <ChevronRight size={18} className="ws-tool-arrow" />
           </div>
@@ -724,6 +784,70 @@ export default function WorkspacePage() {
           </div>
         </div>
       </main>
+
+      {/* ═══════════ Re-analyze progress modal ═══════════ */}
+      {(reanalyzing || reanalyzeResult || reanalyzeError) && (
+        <div className="ws-mode-overlay" onClick={reanalyzeResult || reanalyzeError ? closeReanalyzeModal : undefined}>
+          <div className="ws-mode-modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+            <div className="ws-mode-head">
+              <div>
+                <h3>{reanalyzeResult ? '✅ Анализ завершён' : reanalyzeError ? '❌ Ошибка' : '🔄 Переанализ карточек'}</h3>
+                <p style={{ color: '#6b7280', fontSize: 13 }}>
+                  {reanalyzeResult
+                    ? `Проанализировано ${reanalyzeResult.total_analyzed} карточек, найдено ${reanalyzeResult.issues_found} проблем`
+                    : reanalyzeError
+                      ? reanalyzeError
+                      : reanalyzeStep || 'Ожидание...'}
+                </p>
+              </div>
+              {(reanalyzeResult || reanalyzeError) && (
+                <button type="button" className="ws-mode-close" onClick={closeReanalyzeModal}>
+                  <X size={16} />
+                </button>
+              )}
+            </div>
+
+            {/* Progress bar */}
+            {!reanalyzeError && (
+              <div style={{ padding: '0 20px 20px' }}>
+                <div style={{
+                  width: '100%',
+                  height: 8,
+                  borderRadius: 4,
+                  background: '#f3f4f6',
+                  overflow: 'hidden',
+                }}>
+                  <div style={{
+                    width: `${reanalyzeProgress}%`,
+                    height: '100%',
+                    borderRadius: 4,
+                    background: reanalyzeResult ? '#22c55e' : 'linear-gradient(90deg, #6366f1, #8b5cf6)',
+                    transition: 'width 0.5s ease',
+                  }} />
+                </div>
+                <div style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  marginTop: 8,
+                  fontSize: 13,
+                  color: '#6b7280',
+                }}>
+                  <span>{reanalyzeStep}</span>
+                  <span style={{ fontWeight: 600, color: '#111' }}>{reanalyzeProgress}%</span>
+                </div>
+              </div>
+            )}
+
+            {(reanalyzeResult || reanalyzeError) && (
+              <div style={{ padding: '0 20px 20px', display: 'flex', justifyContent: 'flex-end' }}>
+                <button className="btn btn-primary" onClick={closeReanalyzeModal}>
+                  Закрыть
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {modeModalOpen ? (
         <div className="ws-mode-overlay" onClick={() => setModeModalOpen(false)}>

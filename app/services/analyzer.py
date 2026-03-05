@@ -8,6 +8,8 @@ import re
 
 from ..models import Card, CardIssue, IssueSeverity, IssueCategory, IssueStatus
 from ..core.config import settings
+from .title_policy import validate_title
+from .text_policy import validate_description
 
 
 class CardAnalyzer:
@@ -95,6 +97,24 @@ class CardAnalyzer:
                 "score_impact": 10,
             },
             {
+                "code": "description_too_long",
+                "severity": IssueSeverity.WARNING,
+                "category": IssueCategory.DESCRIPTION,
+                "check": self._check_description_too_long,
+                "title": "Описание слишком длинное",
+                "description": f"Описание не должно превышать {settings.MAX_DESCRIPTION_LENGTH} символов",
+                "score_impact": 8,
+            },
+            {
+                "code": "description_policy_violation",
+                "severity": IssueSeverity.WARNING,
+                "category": IssueCategory.DESCRIPTION,
+                "check": self._check_description_policy_violation,
+                "title": "Описание нарушает правила WB",
+                "description": "Описание не соответствует формату и требованиям WB",
+                "score_impact": 12,
+            },
+            {
                 "code": "title_too_long",
                 "severity": IssueSeverity.WARNING,
                 "category": IssueCategory.TITLE,
@@ -102,6 +122,15 @@ class CardAnalyzer:
                 "title": "Название слишком длинное",
                 "description": f"Название обрезается после {settings.MAX_TITLE_LENGTH} символов",
                 "score_impact": 5,
+            },
+            {
+                "code": "title_policy_violation",
+                "severity": IssueSeverity.WARNING,
+                "category": IssueCategory.TITLE,
+                "check": self._check_title_policy_violation,
+                "title": "Название нарушает правила WB",
+                "description": "Название не соответствует структуре или содержит запрещённые признаки",
+                "score_impact": 12,
             },
             {
                 "code": "no_video",
@@ -208,21 +237,17 @@ class CardAnalyzer:
             return {
                 "has_issue": True,
                 "current_value": None,
-                "suggested_value": self._suggest_title(card),
+                "suggested_value": None,  # AI generates title via dedicated prompt
                 "field_path": "title",
             }
         return {"has_issue": False}
     
     def _check_title_too_short(self, card: Card) -> Dict[str, Any]:
         if card.title and len(card.title.strip()) < settings.MIN_TITLE_LENGTH:
-            # Build improved title from card data as fallback
-            improved = self._improve_title(card)
-            if len(improved) < settings.MIN_TITLE_LENGTH:
-                improved = self._suggest_title(card)
             return {
                 "has_issue": True,
                 "current_value": card.title,
-                "suggested_value": improved if len(improved) >= settings.MIN_TITLE_LENGTH else None,
+                "suggested_value": None,  # AI generates title via dedicated prompt
                 "field_path": "title",
             }
         return {"has_issue": False}
@@ -233,6 +258,33 @@ class CardAnalyzer:
                 "has_issue": True,
                 "current_value": card.title,
                 "suggested_value": card.title[:settings.MAX_TITLE_LENGTH].rsplit(" ", 1)[0],
+                "field_path": "title",
+            }
+        return {"has_issue": False}
+
+    def _check_title_policy_violation(self, card: Card) -> Dict[str, Any]:
+        if not card.title or not card.title.strip():
+            return {"has_issue": False}
+        title = card.title.strip()
+        if len(title) < settings.MIN_TITLE_LENGTH or len(title) > settings.MAX_TITLE_LENGTH:
+            return {"has_issue": False}
+
+        raw = card.raw_data if isinstance(card.raw_data, dict) else {}
+        card_ctx: Dict[str, Any] = {
+            "title": card.title or "",
+            "description": card.description or "",
+            "brand": card.brand or "",
+            "subjectName": raw.get("subjectName") or card.subject_name or "",
+            "subject_name": card.subject_name or "",
+            "category_name": card.category_name or "",
+            "characteristics": raw.get("characteristics") or card.characteristics or {},
+        }
+        valid, _ = validate_title(title, card_ctx, settings.MIN_TITLE_LENGTH, settings.MAX_TITLE_LENGTH)
+        if not valid:
+            return {
+                "has_issue": True,
+                "current_value": card.title,
+                "suggested_value": None,  # AI generates title via dedicated prompt
                 "field_path": "title",
             }
         return {"has_issue": False}
@@ -271,7 +323,7 @@ class CardAnalyzer:
             return {
                 "has_issue": True,
                 "current_value": None,
-                "suggested_value": self._suggest_description(card),
+                "suggested_value": None,  # AI generates description via dedicated prompt
                 "field_path": "description",
             }
         return {"has_issue": False}
@@ -282,6 +334,48 @@ class CardAnalyzer:
                 "has_issue": True,
                 "current_value": card.description[:500],
                 "suggested_value": None,  # AI will generate full text
+                "field_path": "description",
+            }
+        return {"has_issue": False}
+
+    def _check_description_too_long(self, card: Card) -> Dict[str, Any]:
+        if card.description and len(card.description.strip()) > settings.MAX_DESCRIPTION_LENGTH:
+            return {
+                "has_issue": True,
+                "current_value": card.description[:500],
+                "suggested_value": None,
+                "field_path": "description",
+            }
+        return {"has_issue": False}
+
+    def _check_description_policy_violation(self, card: Card) -> Dict[str, Any]:
+        if not card.description or not card.description.strip():
+            return {"has_issue": False}
+        text = card.description.strip()
+        if len(text) < settings.MIN_DESCRIPTION_LENGTH or len(text) > settings.MAX_DESCRIPTION_LENGTH:
+            return {"has_issue": False}
+
+        raw = card.raw_data if isinstance(card.raw_data, dict) else {}
+        card_ctx: Dict[str, Any] = {
+            "title": card.title or "",
+            "description": text,
+            "brand": card.brand or "",
+            "subjectName": raw.get("subjectName") or card.subject_name or "",
+            "subject_name": card.subject_name or "",
+            "category_name": card.category_name or "",
+            "characteristics": raw.get("characteristics") or card.characteristics or {},
+        }
+        valid, _ = validate_description(
+            text,
+            card_ctx,
+            settings.MIN_DESCRIPTION_LENGTH,
+            settings.MAX_DESCRIPTION_LENGTH,
+        )
+        if not valid:
+            return {
+                "has_issue": True,
+                "current_value": text[:500],
+                "suggested_value": None,
                 "field_path": "description",
             }
         return {"has_issue": False}
@@ -345,10 +439,12 @@ class CardAnalyzer:
         # Check if composition in characteristics matches description
         chars = card.characteristics or {}
         composition = None
+        composition_key = "Состав"  # default Russian name
         
         for k, v in chars.items():
             if "состав" in k.lower():
                 composition = v
+                composition_key = k
                 break
         
         if composition and card.description:
@@ -361,13 +457,20 @@ class CardAnalyzer:
             desc_materials = [m for m in materials if m in desc_lower]
             
             if comp_materials and desc_materials:
-                if set(comp_materials) != set(desc_materials):
+                comp_set = set(comp_materials)
+                desc_set = set(desc_materials)
+                # If description mentions only a subset of composition materials,
+                # treat it as acceptable (not a contradiction).
+                if desc_set.issubset(comp_set):
+                    return {"has_issue": False}
+                # Conflict only when description introduces materials absent in composition.
+                if not desc_set.issubset(comp_set):
                     return {
                         "has_issue": True,
                         "current_value": composition,
                         "suggested_value": self._suggest_composition(comp_materials),
                         "alternatives": [self._suggest_composition(desc_materials)],
-                        "field_path": "characteristics.composition",
+                        "field_path": f"characteristics.{composition_key}",
                     }
         
         return {"has_issue": False}
@@ -397,45 +500,16 @@ class CardAnalyzer:
     # === SUGGESTION HELPERS ===
     
     def _suggest_title(self, card: Card) -> str:
-        """Generate title suggestion based on card data"""
-        parts = []
-        if card.brand:
-            parts.append(card.brand)
-        if card.subject_name:
-            parts.append(card.subject_name)
-        if card.vendor_code:
-            parts.append(f"арт. {card.vendor_code}")
-        
-        return " ".join(parts) if parts else "Введите название товара"
+        """Title text generation is AI-only."""
+        return ""
     
     def _improve_title(self, card: Card) -> str:
-        """Improve existing title"""
-        title = card.title or ""
-        additions = []
-        
-        if card.brand and card.brand not in title:
-            additions.append(card.brand)
-        if card.subject_name and card.subject_name not in title:
-            additions.append(card.subject_name)
-        
-        if additions:
-            return f"{' '.join(additions)} {title}"
-        return title
+        """Title text generation is AI-only."""
+        return ""
     
     def _suggest_description(self, card: Card) -> str:
-        """Generate description suggestion"""
-        parts = []
-        
-        if card.title:
-            parts.append(f"{card.title}.")
-        if card.brand:
-            parts.append(f"Бренд: {card.brand}.")
-        
-        chars = card.characteristics or {}
-        for k, v in list(chars.items())[:5]:
-            parts.append(f"{k}: {v}.")
-        
-        return " ".join(parts) if parts else "Добавьте описание товара"
+        """Description text generation is AI-only."""
+        return ""
     
     def _suggest_composition(self, materials: List[str]) -> str:
         """Generate composition suggestion"""

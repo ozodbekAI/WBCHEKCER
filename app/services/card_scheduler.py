@@ -1,12 +1,13 @@
 """
 CardScheduler — har 10 daqiqada barcha active store larni WB API dan yangilaydi.
 updatedAt o'zgargan cardlarni qayta analiz qiladi.
+
+threading emas, asyncio.Task ishlatadi — DB session bilan event loop konflikti bo'lmaydi.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import time
 from datetime import datetime
 from typing import List
@@ -25,32 +26,53 @@ logger = logging.getLogger(__name__)
 class CardScheduler:
     def __init__(self, interval_sec: int = 600) -> None:
         self.interval_sec = int(interval_sec)
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._task: asyncio.Task | None = None
+        self.last_tick_at: datetime | None = None
+        self.next_tick_at: datetime | None = None
 
     def start_background(self) -> None:
-        if self._thread and self._thread.is_alive():
+        """Main event loop da background task sifatida ishga tushiradi."""
+        if self._task and not self._task.done():
             return
-        self._thread = threading.Thread(
-            target=self._run_loop, name="card-scheduler", daemon=True
-        )
-        self._thread.start()
+        self._task = asyncio.create_task(self._run_loop())
         logger.info("[card-scheduler] started, interval=%ss", self.interval_sec)
 
     def stop(self) -> None:
-        self._stop_event.set()
-        logger.info("[card-scheduler] stop requested")
+        if self._task and not self._task.done():
+            self._task.cancel()
+        logger.info("[card-scheduler] stopped")
 
-    def _run_loop(self) -> None:
-        while not self._stop_event.is_set():
+    def get_status(self) -> dict:
+        now = datetime.utcnow()
+        next_in_sec: int | None = None
+        if self.next_tick_at:
+            delta = (self.next_tick_at - now).total_seconds()
+            next_in_sec = max(0, int(delta))
+        return {
+            "is_running": bool(self._task and not self._task.done()),
+            "interval_sec": self.interval_sec,
+            "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
+            "next_tick_at": self.next_tick_at.isoformat() if self.next_tick_at else None,
+            "next_tick_in_sec": next_in_sec,
+        }
+
+    async def _run_loop(self) -> None:
+        """Har interval_sec da _tick() chaqiradi."""
+        while True:
             t0 = time.perf_counter()
+            self.last_tick_at = datetime.utcnow()
             try:
-                asyncio.run(self._tick())
+                await self._tick()
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("[card-scheduler] tick failed")
             elapsed = time.perf_counter() - t0
             wait_s = max(float(self.interval_sec) - elapsed, 0.0)
-            self._stop_event.wait(wait_s)
+            self.next_tick_at = datetime.utcnow()
+            import datetime as dt_mod
+            self.next_tick_at = datetime.utcnow().replace(tzinfo=None) + dt_mod.timedelta(seconds=wait_s)
+            await asyncio.sleep(wait_s)
 
     async def _tick(self) -> None:
         async with AsyncSessionLocal() as db:
@@ -96,7 +118,6 @@ class CardScheduler:
             wb_cards.extend(batch)
 
             cursor = resp.get("cursor", {})
-            # WB pagination: if cursor has updatedAt+nmID → more pages
             if cursor.get("updatedAt") and cursor.get("nmID") and len(batch) == 100:
                 updated_at_cursor = cursor["updatedAt"]
                 nm_id_cursor = cursor["nmID"]
@@ -156,21 +177,37 @@ class CardScheduler:
         store_id: int,
         wb_cards: list[dict],
     ) -> list[int]:
-        """WB updatedAt bilan DB raw_data.updatedAt ni solishtiradi."""
+        """WB updatedAt bilan DB raw_data.updatedAt ni solishtiradi.
+        skip_next_reanalyze=True bo'lgan cardlar o'tkazib yuboriladi (biz fix qilgan cardlar)."""
         nm_ids = [c["nmID"] for c in wb_cards if c.get("nmID")]
         if not nm_ids:
             return []
 
         result = await db.execute(
-            select(Card.nm_id, Card.raw_data).where(
+            select(Card.nm_id, Card.raw_data, Card.skip_next_reanalyze).where(
                 Card.store_id == store_id,
                 Card.nm_id.in_(nm_ids),
             )
         )
-        existing: dict[int, str | None] = {
-            row.nm_id: (row.raw_data or {}).get("updatedAt")
+        existing: dict[int, dict] = {
+            row.nm_id: {
+                "updated_at": (row.raw_data or {}).get("updatedAt"),
+                "skip": row.skip_next_reanalyze or False,
+            }
             for row in result.all()
         }
+
+        # Reset skip flag for all cards we're processing
+        skip_nm_ids = [nm_id for nm_id, v in existing.items() if v["skip"]]
+        if skip_nm_ids:
+            from sqlalchemy import update as sa_update
+            await db.execute(
+                sa_update(Card)
+                .where(Card.store_id == store_id, Card.nm_id.in_(skip_nm_ids))
+                .values(skip_next_reanalyze=False)
+            )
+            await db.commit()
+            logger.debug("[card-scheduler] reset skip_next_reanalyze for %d card(s)", len(skip_nm_ids))
 
         changed = []
         for wb_card in wb_cards:
@@ -178,12 +215,14 @@ class CardScheduler:
             if not nm_id:
                 continue
             wb_updated_at = wb_card.get("updatedAt")
-            db_updated_at = existing.get(nm_id)
+            db_entry = existing.get(nm_id)
 
             if nm_id not in existing:
-                # New card — will be analyzed after sync
                 changed.append(nm_id)
-            elif wb_updated_at and db_updated_at != wb_updated_at:
+            elif db_entry and db_entry["skip"]:
+                # Skip: this card was updated by us — WB updatedAt changed because of our fix
+                logger.debug("[card-scheduler] skip nm_id=%d (our fix applied)", nm_id)
+            elif wb_updated_at and (db_entry or {}).get("updated_at") != wb_updated_at:
                 changed.append(nm_id)
 
         return changed

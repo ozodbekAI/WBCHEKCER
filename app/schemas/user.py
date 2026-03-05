@@ -10,6 +10,7 @@ class UserBase(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     phone: Optional[str] = None
+    avatar_url: Optional[str] = None
 
 
 class UserCreate(UserBase):
@@ -67,3 +68,32 @@ class RefreshTokenRequest(BaseModel):
 class PasswordChangeRequest(BaseModel):
     current_password: str
     new_password: str = Field(..., min_length=6)
+
+
+class RegisterAccessRequest(BaseModel):
+    email: EmailStr
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+
+class RegisterAccessResponse(BaseModel):
+    message: str
+    cooldown_seconds: int
+
+
+class RegisterStartRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+
+class RegisterStartResponse(BaseModel):
+    message: str
+    cooldown_seconds: int
+    expires_in_seconds: int
+
+
+class VerifyEmailCodeRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(..., min_length=6, max_length=6)

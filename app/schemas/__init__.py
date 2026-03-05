@@ -1,6 +1,8 @@
 from .user import (
     UserCreate, UserUpdate, UserUpdateAdmin, UserOut, UserWithStats,
-    LoginRequest, TokenResponse, RefreshTokenRequest, PasswordChangeRequest
+    LoginRequest, TokenResponse, RefreshTokenRequest, PasswordChangeRequest,
+    RegisterAccessRequest, RegisterAccessResponse,
+    RegisterStartRequest, RegisterStartResponse, VerifyEmailCodeRequest,
 )
 from .store import (
     StoreCreate, StoreUpdate, StoreOut, StoreStats,
@@ -30,6 +32,8 @@ __all__ = [
     # User
     "UserCreate", "UserUpdate", "UserUpdateAdmin", "UserOut", "UserWithStats",
     "LoginRequest", "TokenResponse", "RefreshTokenRequest", "PasswordChangeRequest",
+    "RegisterAccessRequest", "RegisterAccessResponse",
+    "RegisterStartRequest", "RegisterStartResponse", "VerifyEmailCodeRequest",
     # Store
     "StoreCreate", "StoreUpdate", "StoreOut", "StoreStats",
     "StoreValidationResult", "StoreSyncResult",

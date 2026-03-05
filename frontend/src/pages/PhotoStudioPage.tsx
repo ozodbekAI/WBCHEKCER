@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useStore } from '../contexts/StoreContext';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import api from '../api/client';
+import api, { API_ORIGIN } from '../api/client';
 import {
   ChevronLeft,
   Send,
@@ -108,7 +108,7 @@ interface QuickMenuAction {
   options: Array<{ id?: string; label: string; prompt: string; quickAction?: Record<string, any> }>;
 }
 
-const API_BASE = 'http://localhost:8003';
+const API_BASE = API_ORIGIN;
 
 const WELCOME_MSG: ChatMessage = {
   id: 'welcome',
@@ -227,11 +227,18 @@ export default function PhotoStudioPage() {
   const navigate = useNavigate();
   const cardNmId = searchParams.get('nmId');
   const cardIdParam = searchParams.get('cardId');
+  const requestedMode = searchParams.get('mode');
+  const requestedGenTab = searchParams.get('genTab');
+  const initialMode: 'chat' | 'generator' = requestedMode === 'generator' ? 'generator' : 'chat';
+  const initialGenTab: GeneratorTab =
+    requestedGenTab && GEN_TABS.some((tab) => tab.id === requestedGenTab)
+      ? (requestedGenTab as GeneratorTab)
+      : 'own-model';
 
   const [messages, setMessages] = useState<ChatMessage[]>([WELCOME_MSG]);
   const [inputText, setInputText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const [mode, setMode] = useState<'chat' | 'generator'>('chat');
+  const [mode, setMode] = useState<'chat' | 'generator'>(initialMode);
   const [quickOpen, setQuickOpen] = useState(false);
   const [quickActive, setQuickActive] = useState<QuickActionId>('change-background');
   const [quickMenu, setQuickMenu] = useState<QuickMenuAction[]>(QUICK_MENU);
@@ -284,7 +291,7 @@ export default function PhotoStudioPage() {
   const [selectedMsgIds, setSelectedMsgIds] = useState<Set<string>>(new Set());
 
   // Generator state
-  const [genTab, setGenTab] = useState<GeneratorTab>('own-model');
+  const [genTab, setGenTab] = useState<GeneratorTab>(initialGenTab);
   const [genGarmentPhoto, setGenGarmentPhoto] = useState<PhotoMedia | null>(null);
   const [genModelPhoto, setGenModelPhoto] = useState<PhotoMedia | null>(null);
   const [genCustomPrompt, setGenCustomPrompt] = useState('');

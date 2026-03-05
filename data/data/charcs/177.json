@@ -1,0 +1,547 @@
+{
+  "subjectID": 177,
+  "subjectName": "Костюмы",
+  "characteristics": [
+    {
+      "charcID": 14177450,
+      "name": "Состав",
+      "required": false,
+      "unitName": "",
+      "maxCount": 20,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 14177451,
+      "name": "Страна производства",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 1015,
+      "name": "Материал подкладки",
+      "required": false,
+      "unitName": "",
+      "maxCount": 3,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 165482,
+      "name": "Рост модели на фото",
+      "required": false,
+      "unitName": "см",
+      "maxCount": 0,
+      "popular": false,
+      "charcType": 4,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 165505,
+      "name": "Параметры модели на фото (ОГ-ОТ-ОБ)",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 246961,
+      "name": "Размер на модели",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 7488315,
+      "name": "Коллекция",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 15000001,
+      "name": "ТНВЭД",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": false,
+      "condition": {
+        "action": "fill"
+      },
+      "note": "Генерируется из справочника subject + пол + состав → код"
+    },
+    {
+      "charcID": 15001135,
+      "name": "Номер декларации соответствия",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 15001136,
+      "name": "Номер сертификата соответствия",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 15001137,
+      "name": "Дата регистрации сертификата/декларации",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 15001138,
+      "name": "Дата окончания действия сертификата/декларации",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 15001405,
+      "name": "Ставка НДС",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_fixed": true,
+      "note": "Берется только из Excel файла fixed_data"
+    },
+    {
+      "charcID": 51,
+      "name": "Любимые герои",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_conditional": true,
+      "condition": {
+        "field": "Пол",
+        "values": ["Дети"],
+        "action": "fill"
+      },
+      "note": "Заполняется только если Пол = Дети"
+    },
+    {
+      "charcID": 1010,
+      "name": "Утеплитель",
+      "required": false,
+      "unitName": "",
+      "maxCount": 3,
+      "popular": true,
+      "charcType": 1,
+      "is_conditional": true,
+      "condition": {
+        "field": "Сезон",
+        "values": ["зима"],
+        "action": "skip"
+      },
+      "note": "Не заполняется (или заполняется только для зимы)"
+    },
+    {
+      "charcID": 56827,
+      "name": "Опции капюшона",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Не заполняется"
+    },
+    {
+      "charcID": 88815,
+      "name": "Температурный режим",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": true,
+      "charcType": 1,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Не заполняется"
+    },
+    {
+      "charcID": 89025,
+      "name": "Характеристика пух/перо (fill power)",
+      "required": false,
+      "unitName": "куб. дюйм на унцию",
+      "maxCount": 0,
+      "popular": false,
+      "charcType": 4,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Не заполняется"
+    },
+    {
+      "charcID": 89030,
+      "name": "Плотность синтетического утеплителя",
+      "required": false,
+      "unitName": "г/кв.м",
+      "maxCount": 0,
+      "popular": false,
+      "charcType": 4,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Не заполняется"
+    },
+    {
+      "charcID": 54337,
+      "name": "Размер",
+      "required": false,
+      "unitName": "",
+      "maxCount": 0,
+      "popular": false,
+      "charcType": 0,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Не трогаем (системное поле)"
+    },
+    {
+      "charcID": 14177453,
+      "name": "SKU",
+      "required": false,
+      "unitName": "",
+      "maxCount": 0,
+      "popular": false,
+      "charcType": 1,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Неизменно (системное)"
+    },
+    {
+      "charcID": 14177456,
+      "name": "Рос. размер",
+      "required": false,
+      "unitName": "",
+      "maxCount": 0,
+      "popular": false,
+      "charcType": 0,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Неизменно (системное)"
+    },
+    {
+      "charcID": 15001650,
+      "name": "ИКПУ",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Не заполняется"
+    },
+    {
+      "charcID": 15001706,
+      "name": "Код упаковки",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Не заполняется"
+    },
+    {
+      "charcID": 15003293,
+      "name": "Артикул OZON",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "is_conditional": true,
+      "condition": {
+        "action": "skip"
+      },
+      "note": "Не заполняется"
+    },
+    {
+      "charcID": 14177449,
+      "name": "Цвет",
+      "required": false,
+      "unitName": "",
+      "maxCount": 5,
+      "popular": false,
+      "charcType": 1,
+      "is_color": true,
+      "note": "Обрабатывается отдельно через ColorService"
+    },
+    {
+      "charcID": 4,
+      "name": "Вид застежки",
+      "required": false,
+      "unitName": "",
+      "maxCount": 2,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 6,
+      "name": "Вырез горловины",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 10,
+      "name": "Тип рукава",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 11,
+      "name": "Покрой",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 12,
+      "name": "Рисунок",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 13,
+      "name": "Фактура материала",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 48,
+      "name": "Тип карманов",
+      "required": false,
+      "unitName": "",
+      "maxCount": 3,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 50,
+      "name": "Декоративные элементы",
+      "required": false,
+      "unitName": "",
+      "maxCount": 3,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 6153,
+      "name": "Тип посадки",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 11892,
+      "name": "Уход за вещами",
+      "required": false,
+      "unitName": "",
+      "maxCount": 3,
+      "popular": false,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 18769,
+      "name": "Сезон",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 23771,
+      "name": "Особенности модели",
+      "required": false,
+      "unitName": "",
+      "maxCount": 3,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 23796,
+      "name": "Назначение",
+      "required": false,
+      "unitName": "",
+      "maxCount": 3,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 57021,
+      "name": "Модель юбки",
+      "is_conditional": true,
+      "condition": {
+        "field": "Тип низа",
+        "values": ["юбка", "юбка-брюки", "юбка-шорты"],
+        "action": "fill"
+      },
+      "note": "Заполняется только если Тип низа содержит 'юбка'"
+    },
+    {
+      "charcID": 57556,
+      "name": "Модель костюма",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 85580,
+      "name": "Модель брюк",
+      "is_conditional": true,
+      "condition": {
+        "field": "Тип низа",
+        "values": ["брюки", "юбка-брюки"],
+        "action": "fill"
+      },
+      "note": "Заполняется только если Тип низа содержит 'брюки'"
+    },
+    {
+      "charcID": 204557,
+      "name": "Пол",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": false,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 213929,
+      "name": "Тип ростовки",
+      "required": false,
+      "unitName": "",
+      "maxCount": 1,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 378533,
+      "name": "Комплектация",
+      "required": false,
+      "unitName": "",
+      "maxCount": 12,
+      "popular": false,
+      "charcType": 1,
+      "note": "Генерируется (текстовое поле)"
+    },
+    {
+      "charcID": 15002997,
+      "name": "Тип низа",
+      "required": false,
+      "unitName": "",
+      "maxCount": 2,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    },
+    {
+      "charcID": 15002998,
+      "name": "Тип верха",
+      "required": false,
+      "unitName": "",
+      "maxCount": 3,
+      "popular": true,
+      "charcType": 1,
+      "note": "Генерируется из справочника"
+    }
+  ]
+}

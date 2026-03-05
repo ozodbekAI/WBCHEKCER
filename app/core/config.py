@@ -59,9 +59,15 @@ class Settings(BaseSettings):
     GEMINI_THINKING_BUDGET_REFIX: int = 64
     AI_ENABLED: bool = True
 
-    # OpenAI Settings (GPT-4o-mini for Product DNA vision)
+    # AI Provider: "gemini" yoki "gpt"
+    # gemini → barcha AI chaqiruvlar Gemini orqali (audit, fixes, title, description)
+    # gpt    → barcha AI chaqiruvlar GPT-4o-mini orqali (foto tahlil + generatsiya)
+    AI_PROVIDER: str = "gemini"
+
+    # OpenAI Settings
     OPENAI_API_KEY: str = ""
-    OPENAI_VISION_MODEL: str = "gpt-4o-mini"
+    OPENAI_VISION_MODEL: str = "gpt-4o-mini"  # foto tahlil uchun (product DNA)
+    OPENAI_MODEL: str = "gpt-4o-mini"          # GPT provider rejimida barcha AI uchun
     
     # KIE AI Service
     KIE_API_KEY: str = ""

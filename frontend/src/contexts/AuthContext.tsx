@@ -6,8 +6,11 @@ interface AuthContextType {
   user: User | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string, firstName?: string) => Promise<void>;
+  registerStart: (email: string, password: string, firstName?: string, lastName?: string) => Promise<{ message: string; cooldown_seconds: number; expires_in_seconds: number }>;
+  resendRegisterCode: (email: string) => Promise<{ message: string; cooldown_seconds: number; expires_in_seconds: number }>;
+  verifyRegisterCode: (email: string, code: string) => Promise<void>;
   logout: () => void;
+  refreshUser: () => Promise<void>;
   isAuthenticated: boolean;
   hasPermission: (permission: string) => boolean;
   hasAnyPermission: (...permissions: string[]) => boolean;
@@ -46,15 +49,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(data.user);
   };
 
-  const register = async (email: string, password: string, firstName?: string) => {
-    await api.register(email, password, firstName);
-    await login(email, password);
+  const registerStart = async (email: string, password: string, firstName?: string, lastName?: string) => {
+    return api.registerStart(email, password, firstName, lastName);
+  };
+
+  const resendRegisterCode = async (email: string) => {
+    return api.resendRegisterCode(email);
+  };
+
+  const verifyRegisterCode = async (email: string, code: string) => {
+    const data = await api.verifyRegisterCode(email, code);
+    setUser(data.user);
   };
 
   const logout = () => {
     api.logout();
     setUser(null);
   };
+
+  const refreshUser = useCallback(async () => {
+    const me = await api.getMe();
+    setUser(me);
+  }, []);
 
   const hasPermission = useCallback((permission: string): boolean => {
     if (!user) return false;
@@ -77,8 +93,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         user,
         loading,
         login,
-        register,
+        registerStart,
+        resendRegisterCode,
+        verifyRegisterCode,
         logout,
+        refreshUser,
         isAuthenticated: !!user,
         hasPermission,
         hasAnyPermission,
