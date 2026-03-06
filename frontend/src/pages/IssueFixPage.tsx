@@ -902,12 +902,14 @@ export default function IssueFixPage() {
                     <h4>Рекомендуемое исправление</h4>
                     <div className="fix-compare">
                       <div className="fix-box current">
-                        <div className="fix-box-label">{fieldName || 'Текущее состояние'}</div>
+                        <div className="fix-box-label">Текущее состояние</div>
+                        {fieldName && <div style={{ fontSize: 13, fontWeight: 600, color: '#334155', marginBottom: 6 }}>{fieldName}</div>}
                         <div>{issue.current_value || '—'}</div>
                       </div>
                       <div className="arrow">→</div>
                       <div className="fix-box fix-box--clear">
                         <div className="fix-box-label">После исправления</div>
+                        {fieldName && <div style={{ fontSize: 13, fontWeight: 600, color: '#334155', marginBottom: 6 }}>{fieldName}</div>}
                         <div className="fix-box-empty">
                           <Trash2 size={14} />
                           Очистить (не применимо)
@@ -945,11 +947,13 @@ export default function IssueFixPage() {
                   <div className="fix-compare">
                     <div className="fix-box current">
                       <div className="fix-box-label">Текущее состояние</div>
+                      {fieldName && <div style={{ fontSize: 13, fontWeight: 600, color: '#334155', marginBottom: 6 }}>{fieldName}</div>}
                       <div>{issue.current_value || '—'}</div>
                     </div>
                     <div className="arrow">→</div>
                     <div className="fix-box new">
                       <div className="fix-box-label">После исправления</div>
+                      {fieldName && <div style={{ fontSize: 13, fontWeight: 600, color: '#065f46', marginBottom: 6 }}>{fieldName}</div>}
                       <div>
                         {(selectedValue || getBestValue(currentIssue))
                           ? (selectedValue || getBestValue(currentIssue))

@@ -827,6 +827,10 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             # They are controlled only via fixed file mismatches.
             if _is_date_sensitive_ai_issue(ai_issue):
                 continue
+            # Color characteristics are validated separately via color_names.json — skip AI issues for color
+            ai_name = (ai_issue.get("name") or "").strip().lower()
+            if ai_name in {"цвет", "color", "основной цвет", "цвет товара"}:
+                continue
             # Build error_details with swap/compound info if present
             ai_error_details = ai_issue.get("errors", [])
             fix_action = ai_issue.get("fix_action", "replace")

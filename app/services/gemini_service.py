@@ -316,6 +316,12 @@ class GeminiService:
                 ch for ch in char_list
                 if (ch.get("name") or "").lower() not in fixed_chars_set
             ]
+        # Exclude color characteristics — they are validated separately via color_names.json
+        _COLOR_NAMES = {"цвет", "color", "основной цвет", "цвет товара"}
+        char_list = [
+            ch for ch in char_list
+            if (ch.get("name") or "").strip().lower() not in _COLOR_NAMES
+        ]
         compact["characteristics"] = char_list
 
         # Include valid characteristic names for this category
@@ -376,6 +382,9 @@ SEO-КЛЮЧЕВЫЕ СЛОВА ДЛЯ КАТЕГОРИИ "{subject_name}":
    - НЕ анализируй поля дат, регистрации сертификатов/деклараций, сроки действия.
    - НЕ предлагай исправления дат.
    - Эти поля обрабатываются только по эталонному fixed-файлу на backend.
+
+9. ЦВЕТ
+   - НЕ анализируй характеристику «Цвет», она проверяется отдельно.
 
 7. SEO — КЛЮЧЕВЫЕ СЛОВА
    - Если список SEO-ключевых слов приведён выше:

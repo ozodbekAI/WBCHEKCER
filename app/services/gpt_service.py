@@ -232,6 +232,12 @@ class GPTService:
                 ch for ch in char_list
                 if (ch.get("name") or "").lower() not in fixed_chars_set
             ]
+        # Exclude color characteristics — they are validated separately via color_names.json
+        _COLOR_NAMES = {"цвет", "color", "основной цвет", "цвет товара"}
+        char_list = [
+            ch for ch in char_list
+            if (ch.get("name") or "").strip().lower() not in _COLOR_NAMES
+        ]
         compact["characteristics"] = char_list
 
         valid_char_names = card.get("_valid_char_names") or []
@@ -274,6 +280,7 @@ SEO-КЛЮЧЕВЫЕ СЛОВА ДЛЯ КАТЕГОРИИ "{subject_name}":
 4. ХАРАКТЕРИСТИКИ ↔ КАТЕГОРИЯ — Есть ли характеристики НЕ из допустимого списка?
 5. АРТИКУЛ / VENDORCODE — Если указан цвет, совпадает с «Цвет»?
 6. ДАТЫ/СЕРТИФИКАТЫ — НЕ анализируй, НЕ предлагай исправления.
+9. ЦВЕТ — НЕ анализируй характеристику «Цвет», она проверяется отдельно.
 7. SEO — есть ли ключевые слова категории в названии (≥1) и описании (≥2)?
 8. НАЗВАНИЕ — ФОРМУЛА: начинается с категории, есть ключевой признак, 35–60 символов, нет маркетинга/пола.
 
