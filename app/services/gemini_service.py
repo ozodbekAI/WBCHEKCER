@@ -288,11 +288,9 @@ class GeminiService:
             "subjectName": subject_name,
             "vendorCode": card.get("vendorCode") or card.get("vendor_code"),
             "brand": card.get("brand"),
-            "title": card.get("title"),
         }
-        # Truncate long description
-        desc = card.get("description") or ""
-        compact["description"] = desc[:1500] if len(desc) > 1500 else desc
+        # ❌ НЕ включаем title и description — AI должен анализировать ТОЛЬКО фото и характеристики
+        # Title/Description часто неверные и генерируются ПОСЛЕ исправления характеристик
 
         # Build characteristics — flatten for prompt
         chars_raw = card.get("characteristics") or []
@@ -499,7 +497,7 @@ CARD JSON:
             entry: Dict[str, Any] = {
                 "id": issue.get("id"),
                 "name": issue.get("name"),
-                "current_value": issue.get("value") or issue.get("current_value"),
+                # ❌ НЕ включаем current_value — AI должен выбирать только из allowed_values на основе фото
                 "error_type": issue.get("error_type") or issue.get("category"),
                 "message": issue.get("message"),
             }
@@ -517,13 +515,13 @@ CARD JSON:
 
         # ── Compact card context ──
         subject = card.get("subjectName") or card.get("subject_name") or ""
-        desc = card.get("description") or ""
+        
         compact_card = {
-            "title": card.get("title"),
             "brand": card.get("brand"),
             "subjectName": subject,
-            "description": desc[:800] if len(desc) > 800 else desc,
         }
+        # ❌ ВСЕГДА исключаем title и description — AI генерирует их ПОСЛЕ исправления характеристик
+        # Генерация идёт на основе НОВЫХ исправленных характеристик, старый текст не нужен
         # Add current characteristics for context
         chars_raw = card.get("characteristics") or []
         if isinstance(chars_raw, list):
@@ -675,8 +673,16 @@ CARD JSON:
 • Пиши нейтрально и фактически, без маркетинга и эмоций.
 • Запрещено: «лучший», «премиум», «идеальный», обещания эффекта, CAPS, эмодзи.
 • ЕСТЕСТВЕННО вплети ВСЕ ключевые слова из названия товара в текст.
-• Если текущее описание есть — используй его как основу, дополни и улучши.
-• Если описания нет — создай полностью новое на основе характеристик и фото.
+
+⚠️ КРИТИЧЕСКИ ВАЖНО ДЛЯ ОПИСАНИЙ:
+• НЕ СМОТРИ на текущее описание в карточке (current_value)!
+• ГЕНЕРИРУЙ ПОЛНОСТЬЮ НОВОЕ описание, основываясь ТОЛЬКО на:
+  - ФОТО товара (анализируй что видно на фото)
+  - Характеристиках товара
+  - Категории товара (subjectName)
+• ПИШИ ТО, ЧТО ВИДИШЬ НА ФОТО: цвет, крой, детали, материал (если визуально определяется).
+• Твоя задача — создать описание "с нуля", как будто текущего описания не существует.
+• Это важно для генерации свежего, качественного контента без повторения ошибок старого текста.
 
 ═══ ПРАВИЛА ДЛЯ SEO (error_type = "seo_keywords_missing") ═══
 • Ключевые слова из названия отсутствуют в описании.

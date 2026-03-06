@@ -334,13 +334,13 @@ CARD JSON:
             return {}, _EMPTY_TOKENS
 
         subject = card.get("subjectName") or card.get("subject_name") or ""
+        
         compact_card: Dict[str, Any] = {
             "subjectName": subject,
-            "title": card.get("title"),
-            "description": (card.get("description") or "")[:1200],
             "brand": card.get("brand"),
             "vendorCode": card.get("vendorCode") or card.get("vendor_code"),
         }
+        # ❌ ВСЕГДА исключаем title и description — AI генерирует их ПОСЛЕ исправления характеристик
         chars_raw = card.get("characteristics") or []
         if isinstance(chars_raw, list):
             compact_card["characteristics"] = [
@@ -356,7 +356,7 @@ CARD JSON:
                 "id": str(i),
                 "error_type": iss.get("error_type") or iss.get("code") or "",
                 "name": iss.get("name") or iss.get("title") or "",
-                "current_value": iss.get("current_value") or iss.get("value"),
+                # ❌ НЕ включаем current_value — AI должен выбирать только из allowed_values на основе фото
                 "description": iss.get("description") or iss.get("message") or "",
             }
             # Include allowed_values/limits when they exist
