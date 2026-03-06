@@ -803,12 +803,24 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
         # Enrich raw_data with valid characteristic names for this category
         # so AI knows which characteristics belong to this category
         audit_data = dict(raw_data)
+        valid_char_names_norm: set[str] = set()
+        valid_char_ids: set[int] = set()
         subject_id = raw_data.get("subjectID") or raw_data.get("subject_id")
         if subject_id:
             catalog = get_catalog()
             subject_chars = catalog.get_subject_chars(int(subject_id))
             if subject_chars:
                 audit_data["_valid_char_names"] = [cm.name for cm in subject_chars]
+                valid_char_names_norm = {
+                    _norm_text(cm.name)
+                    for cm in subject_chars
+                    if getattr(cm, "name", None)
+                }
+                valid_char_ids = {
+                    int(cm.charc_id)
+                    for cm in subject_chars
+                    if getattr(cm, "charc_id", None) is not None
+                }
             # Also pass SEO keywords for this category into audit
             subject_name = raw_data.get("subjectName") or raw_data.get("subject_name") or ""
             seo_kws = catalog.get_keywords_for_subject(subject_name)
@@ -831,6 +843,32 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             ai_name = (ai_issue.get("name") or "").strip().lower()
             if ai_name in {"цвет", "color", "основной цвет", "цвет товара"}:
                 continue
+
+            # Guard against false "wrong category" from AI:
+            # if characteristic is objectively valid for this subject (by name/id),
+            # ignore AI's category_mismatch + clear recommendation.
+            ai_errors = ai_issue.get("errors") or []
+            ai_error_types = {
+                str(e.get("type", "")).strip().lower()
+                for e in ai_errors
+                if isinstance(e, dict)
+            }
+            fix_action_raw = str(ai_issue.get("fix_action") or "").strip().lower()
+            is_ai_category_mismatch = bool(
+                ai_error_types.intersection({"category_mismatch", "wrong_category"})
+                or "не входит в допустимый" in str(ai_issue.get("message") or "").lower()
+            )
+            ai_name_norm = _norm_text(str(ai_issue.get("name") or ""))
+            ai_charc_id = ai_issue.get("charcId")
+            ai_charc_id_int = None
+            if ai_charc_id is not None and str(ai_charc_id).isdigit():
+                ai_charc_id_int = int(ai_charc_id)
+
+            if is_ai_category_mismatch and fix_action_raw == "clear":
+                is_valid_by_name = ai_name_norm in valid_char_names_norm if ai_name_norm else False
+                is_valid_by_id = ai_charc_id_int in valid_char_ids if ai_charc_id_int is not None else False
+                if is_valid_by_name or is_valid_by_id:
+                    continue
             # Build error_details with swap/compound info if present
             ai_error_details = ai_issue.get("errors", [])
             fix_action = ai_issue.get("fix_action", "replace")
