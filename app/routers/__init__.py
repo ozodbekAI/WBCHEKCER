@@ -10,6 +10,7 @@ from .photo_chat import router as photo_chat_router
 from .team import router as team_router
 from .sync import router as sync_router
 from .fixed_files import router as fixed_files_router
+from .scheduler import router as scheduler_router
 
 __all__ = [
     "auth_router",
@@ -25,4 +26,5 @@ __all__ = [
     "team_router",
     "sync_router",
     "fixed_files_router",
+    "scheduler_router",
 ]

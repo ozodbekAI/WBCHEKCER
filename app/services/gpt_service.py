@@ -351,15 +351,23 @@ CARD JSON:
 
         issues_data = []
         for i, iss in enumerate(issues):
-            issues_data.append({
+            av = iss.get("allowed_values") or []
+            entry = {
                 "id": str(i),
                 "error_type": iss.get("error_type") or iss.get("code") or "",
                 "name": iss.get("name") or iss.get("title") or "",
                 "current_value": iss.get("current_value") or iss.get("value"),
                 "description": iss.get("description") or iss.get("message") or "",
-                "allowed_values": iss.get("allowed_values") or [],
-                "errors": iss.get("errors") or [],
-            })
+            }
+            # Include allowed_values/limits when they exist
+            if av:
+                entry["allowed_values"] = av[:60]
+            # Extract limits from errors
+            for err in (iss.get("errors") or []):
+                if isinstance(err, dict) and err.get("type") == "limit":
+                    entry["min_limit"] = err.get("min")
+                    entry["max_limit"] = err.get("max")
+            issues_data.append(entry)
 
         dna_block = ""
         if product_dna:
@@ -380,11 +388,17 @@ CARD JSON:
 
 ПРАВИЛА:
 • Если есть allowed_values → выбирай СТРОГО из этого списка (точное совпадение).
-• Для цветовых полей → верни ОДИН parent color строкой.
+• КРИТИЧЕСКИ ВАЖНО: Если есть min_limit/max_limit → СТРЕМИСЬ к максимальному заполнению (max_limit).
+  - Например: min=1, max=5 → постарайся выбрать до 5 подходящих значений из allowed_values.
+  - НО: выбирай ТОЛЬКО те значения, которые ДЕЙСТВИТЕЛЬНО СООТВЕТСТВУЮТ товару на фото/в описании.
+  - НЕ добавляй характеристики, которых нет. Цель: максимально, но ПРАВДИВО.
+  - Если подходящих значений меньше max_limit — верни только подходящие.
+• Для цветовых полей ("Цвет", "Основной цвет") → верни ОДИН parent color строкой, НЕ массив.
 • Для title → 40-60 символов, без бренда, без пола, без маркетинга.
 • Для description → 1000-1800 символов, 3-6 абзацев, без маркетинга.
 • recommended_value — ГОТОВОЕ значение для немедленного применения.
 • ЗАПРЕЩЕНО: советы, инструкции, пустые строки вместо значений.
+• Используй Product DNA (техническое описание по фото) для выбора характеристик.
 
 ФОРМАТ ОТВЕТА — строго JSON:
 {{

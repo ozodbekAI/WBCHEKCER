@@ -23,6 +23,7 @@ from .routers import (
     team_router,
     sync_router,
     fixed_files_router,
+    scheduler_router,
 )
 
 
@@ -71,13 +72,23 @@ app.include_router(photo_chat_router)
 app.include_router(team_router)
 app.include_router(sync_router)
 app.include_router(fixed_files_router)
+app.include_router(scheduler_router)
 
 # Serve frontend static files (built React app)
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    """Health check endpoint with scheduler status"""
+    scheduler_status = card_scheduler.get_status()
+    return {
+        "status": "healthy",
+        "scheduler": {
+            "is_running": scheduler_status["is_running"],
+            "last_tick": scheduler_status["last_tick_at"],
+            "next_tick_in": scheduler_status["next_tick_in_sec"],
+        }
+    }
 
 
 # Serve frontend static files (built React app)

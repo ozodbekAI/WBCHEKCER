@@ -696,9 +696,14 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             sv = wb_issue.get("suggested_value")
             is_fixed = wb_issue.get("is_fixed_field", False)
             
-            # Agar fixed field bo'lsa, severity ni WARNING qilamiz
-            severity = _map_severity(wb_issue.get("severity", "error"))
-            if is_fixed:
+            # WB severity mapping:
+            # - critical stays critical (missing required)
+            # - error → warning (allowed_values, limits)
+            # - fixed fields → warning
+            wb_severity = wb_issue.get("severity", "warning")
+            if wb_severity == "critical" and not is_fixed:
+                severity = IssueSeverity.CRITICAL
+            else:
                 severity = IssueSeverity.WARNING
             
             issue = CardIssue(
@@ -971,11 +976,13 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 status=IssueStatus.PENDING,
                 source=_clip("ai", 50),
             )
-            # Title/description issues from AI are always CRITICAL —
-            # they directly affect search visibility and conversion.
+            # Title/description issues severity based on AI severity,
+            # but override only if completely missing (no_title, no_description)
             _np = (normalized_issue_path or "").strip().lower()
-            if _np in ("title", "description"):
+            _code = ai_issue.get("code", "")
+            if _code in ("no_title", "no_description"):
                 issue.severity = IssueSeverity.CRITICAL
+            # Otherwise keep AI severity (warning for short/long/policy issues)
             issues.append(issue)
 
         # ── STEP 4: AI generates fixes ──────────────────
@@ -1862,11 +1869,18 @@ def _calculate_wb_score_impact(wb_issue: dict) -> int:
 def _calculate_ai_score_impact(ai_issue: dict) -> int:
     """Calculate score impact for AI issue"""
     severity_scores = {
-        "critical": 12,
+        "critical": 15,
         "error": 8,
         "warning": 5,
+        "improvement": 3,
     }
-    return severity_scores.get(ai_issue.get("severity", "warning"), 5)
+    # Reduce impact for non-critical issues
+    base = severity_scores.get(ai_issue.get("severity", "warning"), 5)
+    # Further reduce if category is not core (title/description/photo)
+    category = ai_issue.get("category", "").lower()
+    if category not in ("text", "photo", "identification"):
+        base = max(3, base - 2)
+    return base
 
 
 async def analyze_store_cards(

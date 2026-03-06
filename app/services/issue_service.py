@@ -171,8 +171,18 @@ async def get_store_issues(
     return issues, total
 
 
-async def get_issues_grouped(db: AsyncSession, store_id: int) -> dict:
-    """Get issues grouped by severity — includes PENDING and SKIPPED issues."""
+async def get_issues_grouped(
+    db: AsyncSession, 
+    store_id: int,
+    limit_per_group: int = 30,  # Limit per severity group
+) -> dict:
+    """Get issues grouped by severity — includes PENDING and SKIPPED issues.
+    
+    Args:
+        db: Database session
+        store_id: Store ID
+        limit_per_group: Max issues to return per group (default 30)
+    """
     result = {
         "critical": [],
         "warnings": [],
@@ -195,13 +205,13 @@ async def get_issues_grouped(db: AsyncSession, store_id: int) -> dict:
             db, store_id,
             status=IssueStatus.PENDING,
             severity=severity,
-            limit=100
+            limit=limit_per_group
         )
         skipped, s_count = await get_store_issues(
             db, store_id,
             status=IssueStatus.SKIPPED,
             severity=severity,
-            limit=100
+            limit=max(0, limit_per_group - len(pending))  # Fill remaining space
         )
         result[key] = list(pending) + list(skipped)
         result[f"{key}_count"] = p_count + s_count
@@ -210,7 +220,7 @@ async def get_issues_grouped(db: AsyncSession, store_id: int) -> dict:
     postponed, postponed_count = await get_store_issues(
         db, store_id,
         status=IssueStatus.POSTPONED,
-        limit=100
+        limit=limit_per_group
     )
     result["postponed"] = postponed
     result["postponed_count"] = postponed_count

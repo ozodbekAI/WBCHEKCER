@@ -223,17 +223,32 @@ async def list_issues(
 
 @router.get("/grouped", response_model=IssuesGrouped)
 async def get_grouped_issues(
+    limit: int = 30,  # Limit per severity group
+    skip_validation: bool = True,  # Skip expensive WB API calls for speed
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get issues grouped by severity"""
-    grouped = await get_issues_grouped(db, store.id)
+    """Get issues grouped by severity
+    
+    Args:
+        limit: Max issues to return per group (default 30, max 100)
+        skip_validation: Skip fresh allowed_values lookup for better performance (default True)
+    """
+    # Clamp limit to reasonable range
+    limit = max(10, min(100, limit))
+    grouped = await get_issues_grouped(db, store.id, limit_per_group=limit)
     
     async def issue_to_dict(issue: CardIssue) -> Optional[IssueWithCard]:
-        fresh_av = await _fresh_allowed_values(issue, store)
-        # Auto-resolve if "invalid" values are now valid
-        if await _auto_resolve_if_now_valid(issue, fresh_av, db):
-            return None
+        # For grouped endpoint, skip expensive WB API calls by default
+        # Use cached allowed_values from issue object
+        if skip_validation:
+            fresh_av = issue.allowed_values or []
+        else:
+            fresh_av = await _fresh_allowed_values(issue, store)
+            # Auto-resolve if "invalid" values are now valid
+            if await _auto_resolve_if_now_valid(issue, fresh_av, db):
+                return None
+        
         return IssueWithCard(
             id=issue.id,
             card_id=issue.card_id,

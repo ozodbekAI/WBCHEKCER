@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     # Frontend URL (used in email invite links)
     FRONTEND_URL: str = "http://localhost:3001"
 
+    # Scheduler settings
+    CARD_SCHEDULER_INTERVAL_SEC: int = 600  # 10 minutes
+
     # SMTP Email settings (leave empty to use console logging instead of real email)
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587

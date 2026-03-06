@@ -94,37 +94,52 @@ class CardScheduler:
         return list(result.scalars().all())
 
     async def _sync_store(self, db: AsyncSession, store: Store) -> None:
+        logger.info("[card-scheduler] store_id=%d '%s' sync started", store.id, store.name or "")
         api = WildberriesAPI(api_key=store.api_key)
 
         # Fetch all cards from WB API (paginated)
         wb_cards: list[dict] = []
         updated_at_cursor: str | None = None
         nm_id_cursor: int | None = None
+        page_count = 0
 
-        while True:
-            resp = await api.get_cards(
-                limit=100,
-                updated_at=updated_at_cursor,
-                nm_id=nm_id_cursor,
-            )
-            if not resp.get("success"):
-                logger.warning(
-                    "[card-scheduler] store_id=%d WB API error: %s",
-                    store.id, resp.get("error"),
+        try:
+            while True:
+                page_count += 1
+                resp = await api.get_cards(
+                    limit=100,
+                    updated_at=updated_at_cursor,
+                    nm_id=nm_id_cursor,
                 )
-                break
+                if not resp.get("success"):
+                    logger.warning(
+                        "[card-scheduler] store_id=%d WB API error (page %d): %s",
+                        store.id, page_count, resp.get("error"),
+                    )
+                    break
 
-            batch = resp.get("cards", [])
-            wb_cards.extend(batch)
+                batch = resp.get("cards", [])
+                wb_cards.extend(batch)
 
-            cursor = resp.get("cursor", {})
-            if cursor.get("updatedAt") and cursor.get("nmID") and len(batch) == 100:
-                updated_at_cursor = cursor["updatedAt"]
-                nm_id_cursor = cursor["nmID"]
-            else:
-                break
+                cursor = resp.get("cursor", {})
+                if cursor.get("updatedAt") and cursor.get("nmID") and len(batch) == 100:
+                    updated_at_cursor = cursor["updatedAt"]
+                    nm_id_cursor = cursor["nmID"]
+                    logger.debug(
+                        "[card-scheduler] store_id=%d page %d: fetched %d cards",
+                        store.id, page_count, len(batch)
+                    )
+                else:
+                    break
 
-        if not wb_cards:
+            if not wb_cards:
+                logger.info("[card-scheduler] store_id=%d no cards from WB API", store.id)
+                return
+        except Exception as e:
+            logger.exception(
+                "[card-scheduler] store_id=%d fetch failed: %s",
+                store.id, str(e)
+            )
             return
 
         logger.info(
@@ -158,18 +173,27 @@ class CardScheduler:
         )
         cards = list(result.scalars().all())
 
-        for card in cards:
+        success_count = 0
+        failed_count = 0
+        for idx, card in enumerate(cards, 1):
             try:
                 await analyze_card(db, card, use_ai=True)
-                logger.debug(
-                    "[card-scheduler] store_id=%d nm_id=%d re-analyzed",
-                    store.id, card.nm_id,
+                success_count += 1
+                logger.info(
+                    "[card-scheduler] store_id=%d nm_id=%d re-analyzed (%d/%d)",
+                    store.id, card.nm_id, idx, len(cards)
                 )
-            except Exception:
+            except Exception as e:
+                failed_count += 1
                 logger.exception(
-                    "[card-scheduler] store_id=%d nm_id=%d analyze failed",
-                    store.id, card.nm_id,
+                    "[card-scheduler] store_id=%d nm_id=%d analyze failed (%d/%d): %s",
+                    store.id, card.nm_id, idx, len(cards), str(e)
                 )
+        
+        logger.info(
+            "[card-scheduler] store_id=%d completed: %d analyzed, %d failed",
+            store.id, success_count, failed_count
+        )
 
     async def _find_changed_cards(
         self,
@@ -217,16 +241,32 @@ class CardScheduler:
             wb_updated_at = wb_card.get("updatedAt")
             db_entry = existing.get(nm_id)
 
+            # New card — always analyze
             if nm_id not in existing:
                 changed.append(nm_id)
-            elif db_entry and db_entry["skip"]:
-                # Skip: this card was updated by us — WB updatedAt changed because of our fix
-                logger.debug("[card-scheduler] skip nm_id=%d (our fix applied)", nm_id)
-            elif wb_updated_at and (db_entry or {}).get("updated_at") != wb_updated_at:
-                changed.append(nm_id)
+                logger.debug("[card-scheduler] new card nm_id=%d", nm_id)
+                continue
+
+            # Card exists — check if updatedAt changed
+            if wb_updated_at and (db_entry or {}).get("updated_at") != wb_updated_at:
+                if db_entry and db_entry["skip"]:
+                    # This was updated by us — WB updatedAt changed because of our fix
+                    # Still log but don't re-analyze immediately
+                    logger.info(
+                        "[card-scheduler] nm_id=%d updated by us (skip re-analyze), old=%s new=%s",
+                        nm_id, (db_entry or {}).get("updated_at"), wb_updated_at
+                    )
+                else:
+                    # External change — re-analyze
+                    changed.append(nm_id)
+                    logger.debug(
+                        "[card-scheduler] changed nm_id=%d, old=%s new=%s",
+                        nm_id, (db_entry or {}).get("updated_at"), wb_updated_at
+                    )
 
         return changed
 
 
 # Singleton
-card_scheduler = CardScheduler(interval_sec=600)
+from app.core.config import settings
+card_scheduler = CardScheduler(interval_sec=settings.CARD_SCHEDULER_INTERVAL_SEC)
