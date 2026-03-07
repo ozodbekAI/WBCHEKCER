@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 from typing import List, Optional
-from sqlalchemy import select, update, func, and_, or_, not_
+from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -121,23 +121,15 @@ async def get_store_issues(
     limit: int = 50,
 ) -> tuple[List[CardIssue], int]:
     """Get all issues for a store with filters"""
-    # Exclude characteristics issues where AI couldn't generate any suggestion
-    _has_suggestion = or_(
-        not_(CardIssue.field_path.like('characteristics.%')),
-        CardIssue.field_path.is_(None),
-        CardIssue.suggested_value.isnot(None),
-        CardIssue.ai_suggested_value.isnot(None),
-    )
-
     base_filter = (
         select(CardIssue)
         .join(Card)
-        .where(Card.store_id == store_id, _has_suggestion)
+        .where(Card.store_id == store_id)
     )
     count_filter = (
         select(func.count(CardIssue.id))
         .join(Card)
-        .where(Card.store_id == store_id, _has_suggestion)
+        .where(Card.store_id == store_id)
     )
     
     if status:
@@ -413,18 +405,9 @@ async def get_next_issue(
     Otherwise orders by card priority (cards with critical issues first),
     then by severity/score_impact within the card.
     """
-    # Exclude characteristics issues where AI couldn't generate a suggestion
-    _has_suggestion = or_(
-        not_(CardIssue.field_path.like('characteristics.%')),
-        CardIssue.field_path.is_(None),
-        CardIssue.suggested_value.isnot(None),
-        CardIssue.ai_suggested_value.isnot(None),
-    )
-
     conditions = [
         Card.store_id == store_id,
         CardIssue.status == IssueStatus.PENDING,
-        _has_suggestion,
     ]
 
     if card_id is not None:
@@ -497,13 +480,6 @@ async def get_queue_progress(db: AsyncSession, store_id: int, severity: Optional
         except ValueError:
             pass
 
-    _has_suggestion = or_(
-        not_(CardIssue.field_path.like('characteristics.%')),
-        CardIssue.field_path.is_(None),
-        CardIssue.suggested_value.isnot(None),
-        CardIssue.ai_suggested_value.isnot(None),
-    )
-
     # Total pending
     pending_result = await db.execute(
         select(func.count(CardIssue.id))
@@ -511,7 +487,6 @@ async def get_queue_progress(db: AsyncSession, store_id: int, severity: Optional
         .where(
             Card.store_id == store_id,
             CardIssue.status == IssueStatus.PENDING,
-            _has_suggestion,
             *severity_filter,
         )
     )
@@ -524,7 +499,6 @@ async def get_queue_progress(db: AsyncSession, store_id: int, severity: Optional
         .where(
             Card.store_id == store_id,
             CardIssue.status == IssueStatus.FIXED,
-            _has_suggestion,
             *severity_filter,
         )
     )
@@ -537,7 +511,6 @@ async def get_queue_progress(db: AsyncSession, store_id: int, severity: Optional
         .where(
             Card.store_id == store_id,
             CardIssue.status == IssueStatus.SKIPPED,
-            _has_suggestion,
             *severity_filter,
         )
     )
@@ -550,7 +523,6 @@ async def get_queue_progress(db: AsyncSession, store_id: int, severity: Optional
         .where(
             Card.store_id == store_id,
             CardIssue.status == IssueStatus.POSTPONED,
-            _has_suggestion,
             *severity_filter,
         )
     )

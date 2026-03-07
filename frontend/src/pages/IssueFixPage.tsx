@@ -281,6 +281,20 @@ export default function IssueFixPage() {
     return alts;
   };
 
+  const isCompositionLikeIssue = (issue: IssueWithCard): boolean => {
+    const fp = String(issue.field_path || '').toLowerCase();
+    const title = String(issue.title || '').toLowerCase();
+    const desc = String(issue.description || '').toLowerCase();
+    return (
+      fp.includes('состав') ||
+      fp.includes('composition') ||
+      title.includes('состав') ||
+      title.includes('composition') ||
+      desc.includes('состав') ||
+      desc.includes('composition')
+    );
+  };
+
   // Sidebar issues: all pending + skipped for this severity
   const issues: IssueWithCard[] = allSidebarIssues;
   const currentIdx = currentIssue ? allSidebarIssues.findIndex(i => i.id === currentIssue.id) : -1;
@@ -758,7 +772,7 @@ export default function IssueFixPage() {
 
           <div className="issue-body">
             {/* Fixed file warning — shown only when this characteristic requires fixed file data */}
-            {hasFixedFile !== true && issue.requires_fixed_file && issue.source !== 'fixed_file' && (
+            {hasFixedFile !== true && (issue.requires_fixed_file || isCompositionLikeIssue(issue)) && issue.source !== 'fixed_file' && (
               <div style={{ background: '#fffbeb', border: '1px solid #fbbf24', borderRadius: 8, padding: '10px 14px', marginBottom: 14, display: 'flex', gap: 10, alignItems: 'flex-start', fontSize: 13 }}>
                 <AlertTriangle size={15} style={{ color: '#d97706', flexShrink: 0, marginTop: 1 }} />
                 <div>

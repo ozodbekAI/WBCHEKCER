@@ -309,8 +309,10 @@ class ApiClient {
     return this.request<any>('GET', `/stores/${storeId}/issues`, undefined, params);
   }
 
-  async getIssuesGrouped(storeId: number) {
-    return this.request<any>('GET', `/stores/${storeId}/issues/grouped`);
+  async getIssuesGrouped(storeId: number, limit = 200) {
+    return this.request<any>('GET', `/stores/${storeId}/issues/grouped`, undefined, {
+      limit,
+    });
   }
 
   async getIssueStats(storeId: number) {

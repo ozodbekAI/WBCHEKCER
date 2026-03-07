@@ -235,7 +235,7 @@ async def get_grouped_issues(
         skip_validation: Skip fresh allowed_values lookup for better performance (default True)
     """
     # Clamp limit to reasonable range
-    limit = max(10, min(100, limit))
+    limit = max(10, min(500, limit))
     grouped = await get_issues_grouped(db, store.id, limit_per_group=limit)
     
     async def issue_to_dict(issue: CardIssue) -> Optional[IssueWithCard]:

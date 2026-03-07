@@ -91,6 +91,12 @@ def _normalize_issue_field_path(name: Optional[str]) -> Optional[str]:
     return f"characteristics.{raw}"
 
 
+def _is_same_issue_field(path_a: Optional[str], path_b: Optional[str]) -> bool:
+    a = _normalize_issue_field_path(path_a) if path_a else None
+    b = _normalize_issue_field_path(path_b) if path_b else None
+    return bool(a and b and a.strip().lower() == b.strip().lower())
+
+
 def _is_title_issue_obj(issue: CardIssue) -> bool:
     path = (issue.field_path or "").strip().lower()
     return issue.code in _TITLE_CODES or path in _TITLE_FIELD_PATHS
@@ -261,6 +267,34 @@ def _is_date_sensitive_ai_issue(ai_issue: dict) -> bool:
             texts.append(str(fx.get("name") or ""))
             texts.append(str(fx.get("value") or ""))
     return any(_contains_date_context_text(t) for t in texts if t)
+
+
+def _is_text_based_ai_issue(ai_issue: dict) -> bool:
+    """True when AI issue is based on title/description text, not photo+characteristics."""
+    cat = str(ai_issue.get("category") or "").strip().lower()
+    if cat == "text":
+        return True
+
+    texts: List[str] = [
+        str(ai_issue.get("name") or "").lower(),
+        str(ai_issue.get("message") or "").lower(),
+        str(ai_issue.get("description") or "").lower(),
+    ]
+    for err in (ai_issue.get("errors") or []):
+        if isinstance(err, dict):
+            texts.append(str(err.get("type") or "").lower())
+            texts.append(str(err.get("message") or "").lower())
+
+    blob = " | ".join(t for t in texts if t)
+    if not blob:
+        return False
+
+    # Any direct text/title/description reference should be excluded from AI audit stage.
+    text_markers = (
+        "text_mismatch", "seo", "ключев", "описан", "description", "title",
+        "назван", "текст", "в описании", "по описанию",
+    )
+    return any(m in blob for m in text_markers)
 
 
 def _is_non_fixed_date_issue_obj(issue: CardIssue) -> bool:
@@ -844,6 +878,9 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             # They are controlled only via fixed file mismatches.
             if _is_date_sensitive_ai_issue(ai_issue):
                 continue
+            # Text-based issues are out of AI audit scope (title/description are generated later)
+            if _is_text_based_ai_issue(ai_issue):
+                continue
             # Color characteristics are validated separately via color_names.json — skip AI issues for color
             ai_name = (ai_issue.get("name") or "").strip().lower()
             if ai_name in {"цвет", "color", "основной цвет", "цвет товара"}:
@@ -982,6 +1019,8 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             _code = ai_issue.get("code", "")
             if _code in ("no_title", "no_description"):
                 issue.severity = IssueSeverity.CRITICAL
+            elif issue.category == IssueCategory.CHARACTERISTICS:
+                issue.severity = IssueSeverity.WARNING
             # Otherwise keep AI severity (warning for short/long/policy issues)
             issues.append(issue)
 
@@ -1054,6 +1093,12 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 fix_action = str(suggestion.get("fix_action", "replace") or "replace").strip().lower()
                 if fix_action not in {"replace", "clear", "swap"}:
                     fix_action = "replace"
+                if fix_action == "swap":
+                    swap_to_name = suggestion.get("swap_to_name")
+                    if (not swap_to_name) or _is_same_issue_field(iss.field_path, str(swap_to_name)):
+                        fix_action = "replace"
+                        if rec_value in (None, "", []):
+                            rec_value = suggestion.get("swap_to_value")
 
                 is_title_issue = _is_title_issue_obj(iss)
                 is_description_issue = _is_description_issue_obj(iss)
@@ -1276,6 +1321,12 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                         fix_action = str(suggestion.get("fix_action", "replace") or "replace").strip().lower()
                         if fix_action not in {"replace", "clear", "swap"}:
                             fix_action = "replace"
+                        if fix_action == "swap":
+                            swap_to_name = suggestion.get("swap_to_name")
+                            if (not swap_to_name) or _is_same_issue_field(iss.field_path, str(swap_to_name)):
+                                fix_action = "replace"
+                                if rec_value in (None, "", []):
+                                    rec_value = suggestion.get("swap_to_value")
 
                         if _is_title_issue_obj(iss) and rec_value:
                             valid, _ = _validate_title_fix(str(rec_value), ai_context)
@@ -1810,7 +1861,8 @@ def _map_severity(severity: str) -> IssueSeverity:
     """Map string severity to enum"""
     mapping = {
         "critical": IssueSeverity.CRITICAL,
-        "error": IssueSeverity.CRITICAL,
+        # AI "error" is too aggressive in current flow; keep it as warning
+        "error": IssueSeverity.WARNING,
         "warning": IssueSeverity.WARNING,
         "info": IssueSeverity.INFO,
     }

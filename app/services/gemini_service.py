@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import re
 import time
@@ -15,6 +16,15 @@ import httpx
 
 from ..core.config import settings
 from .wb_logic_prompt import build_wb_logic_block
+
+logger = logging.getLogger(__name__)
+
+
+def _console_dump(tag: str, data: Any) -> None:
+    try:
+        print(f"\n[{tag}]\n{json.dumps(data, ensure_ascii=False, indent=2)}\n")
+    except Exception:
+        print(f"\n[{tag}] {data}\n")
 
 
 def _strip_code_fences(text: str) -> str:
@@ -206,6 +216,15 @@ class GeminiService:
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": generation_config,
         }
+
+        _console_dump("GEMINI_API_REQUEST_META", {
+            "model": self.model,
+            "image_url": image_url,
+            "prompt_len": len(prompt),
+            "has_image_part": bool(image_url),
+            "generation_config": generation_config,
+        })
+        _console_dump("GEMINI_API_PROMPT_FULL", prompt)
         
         try:
             with httpx.Client(timeout=120.0) as client:
@@ -289,8 +308,8 @@ class GeminiService:
             "vendorCode": card.get("vendorCode") or card.get("vendor_code"),
             "brand": card.get("brand"),
         }
-        # ❌ НЕ включаем title и description — AI должен анализировать ТОЛЬКО фото и характеристики
-        # Title/Description часто неверные и генерируются ПОСЛЕ исправления характеристик
+        # ❌ НЕ включаем title и description — audit faqat foto + characteristics
+        _console_dump("GEMINI_AUDIT_COMPACT_CARD", compact)
 
         # Build characteristics — flatten for prompt
         chars_raw = card.get("characteristics") or []
@@ -331,16 +350,8 @@ class GeminiService:
 {json.dumps(valid_char_names, ensure_ascii=False)}
 Если в карточке есть характеристики НЕ из этого списка и они заполнены — это ошибка.
 """
-        # Include SEO keywords for this category
-        seo_keywords_list = card.get("_seo_keywords") or []
+        # SEO text checks are disabled in AI audit (title/description not sent here)
         seo_keywords_section = ""
-        if seo_keywords_list:
-            seo_keywords_section = f"""
-SEO-КЛЮЧЕВЫЕ СЛОВА ДЛЯ КАТЕГОРИИ "{subject_name}":
-{', '.join(seo_keywords_list[:20])}
-Проверь: есть ли хотя бы 1 ключевое слово в названии, минимум 2 в описании.
-Если ни одного нет — это проблема SEO (severity="warning", category="text").
-"""
         logic_block = build_wb_logic_block(include_output=False)
 
         prompt = f"""
@@ -348,7 +359,7 @@ SEO-КЛЮЧЕВЫЕ СЛОВА ДЛЯ КАТЕГОРИИ "{subject_name}":
 
 {logic_block}
 
-ЗАДАЧА: Проанализируй фото товара и JSON-карточку. Найди РЕАЛЬНЫЕ ошибки
+ЗАДАЧА: Проанализируй фото товара и JSON-карточку характеристик. Найди РЕАЛЬНЫЕ ошибки
 и несоответствия. Не выдумывай — если не уверен, ставь severity="warning".
 
 КАТЕГОРИЯ ТОВАРА: "{subject_name}" (subjectID={subject_id})
@@ -360,43 +371,27 @@ SEO-КЛЮЧЕВЫЕ СЛОВА ДЛЯ КАТЕГОРИИ "{subject_name}":
    - Комплектность: кол-во предметов на фото = «Комплектация»?
    - Фасон/модель на фото = характеристики (рукав, длина, застежка)?
 
-2. КАТЕГОРИЯ ↔ ТЕКСТ
-   - Название/описание соответствуют категории "{subject_name}"?
-   - Нет ли упоминания другого типа товара, пола, возраста?
-
-3. ТЕКСТ ↔ ХАРАКТЕРИСТИКИ
-   - Описание не противоречит характеристикам?
-   - Нет обрезанных/неполных значений (напр. "ж" вместо "жакет")?
-   - Нет логических конфликтов (напр. "без рисунка" и "в полоску")?
-
-4. ХАРАКТЕРИСТИКИ ↔ КАТЕГОРИЯ
+2. ХАРАКТЕРИСТИКИ ↔ КАТЕГОРИЯ
    - Есть ли заполненные характеристики, которых НЕТ в списке допустимых выше?
    - Если да — fix_action: "clear" для каждой такой характеристики
+   - ⚠️ ИСКЛЮЧЕНИЕ: НЕ проверяй характеристики с allowed_values=null/пусто
+   - Если allowed_values нет — это СВОБОДНОЕ ПОЛЕ (free-form), можно писать что угодно
+   - Примеры free-form полей: "Комплектация", "Описание наполнителя", "Дополнительная информация"
 
-5. АРТИКУЛ / VENDORCODE
+3. АРТИКУЛ / VENDORCODE
    - Если в артикуле указан цвет — совпадает с «Цвет»?
 
-6. ДАТЫ/СЕРТИФИКАТЫ/ДЕКЛАРАЦИИ
+4. ДАТЫ/СЕРТИФИКАТЫ/ДЕКЛАРАЦИИ
    - НЕ анализируй поля дат, регистрации сертификатов/деклараций, сроки действия.
    - НЕ предлагай исправления дат.
    - Эти поля обрабатываются только по эталонному fixed-файлу на backend.
 
-9. ЦВЕТ
+5. ЦВЕТ
    - НЕ анализируй характеристику «Цвет», она проверяется отдельно.
 
-7. SEO — КЛЮЧЕВЫЕ СЛОВА
-   - Если список SEO-ключевых слов приведён выше:
-     • Есть ли хотя бы 1 ключевое слово в названии?
-     • Есть ли минимум 2 ключевых слова в описании?
-   - Если нет — сообщи как "warning" с name="title" или name="description", category="text".
-   - Пример: name="description", message="Описание не содержит SEO-ключевых слов категории..."
-
-8. НАЗВАНИЕ — ФОРМУЛА
-   - Название должно начинаться с категории товара ("{subject_name}") или её синонима.
-   - Должен быть ключевой признак модели (фасон, силуэт, конструктив).
-   - Запрещены: маркетинг, пол, эмоции, CAPS, эмодзи, запятые.
-   - Длина: 35–60 символов.
-   - Если нарушено — ошибка с name="title", severity="error", category="text".
+ВАЖНО:
+• НЕ анализируй title/description — они генерируются отдельно после исправления характеристик.
+• Никаких text_mismatch на основе описания не возвращай.
 
 CARD JSON:
 {json.dumps(compact, ensure_ascii=False)[:4000]}
@@ -460,6 +455,8 @@ CARD JSON:
 Если ошибок нет — верни: {{"errors": []}}
 """.strip()
 
+        _console_dump("GEMINI_AUDIT_PROMPT_FULL", prompt)
+
         image_url = None if product_dna else _get_card_photo(card)
         result, tokens = self._call_api(
             prompt,
@@ -497,7 +494,7 @@ CARD JSON:
             entry: Dict[str, Any] = {
                 "id": issue.get("id"),
                 "name": issue.get("name"),
-                # ❌ НЕ включаем current_value — AI должен выбирать только из allowed_values на основе фото
+                "current_value": issue.get("value") or issue.get("current_value"),  # ✅ Qaytardik - bo'sh qiymatlarni ko'rsatish kerak
                 "error_type": issue.get("error_type") or issue.get("category"),
                 "message": issue.get("message"),
             }
@@ -513,6 +510,8 @@ CARD JSON:
                     entry["max_limit"] = err.get("max")
             issues_data.append(entry)
 
+        _console_dump("GEMINI_FIX_ISSUES_DATA", issues_data)
+
         # ── Compact card context ──
         subject = card.get("subjectName") or card.get("subject_name") or ""
         
@@ -522,6 +521,7 @@ CARD JSON:
         }
         # ❌ ВСЕГДА исключаем title и description — AI генерирует их ПОСЛЕ исправления характеристик
         # Генерация идёт на основе НОВЫХ исправленных характеристик, старый текст не нужен
+        _console_dump("GEMINI_FIX_COMPACT_CARD", compact_card)
         # Add current characteristics for context
         chars_raw = card.get("characteristics") or []
         if isinstance(chars_raw, list):
@@ -550,6 +550,13 @@ CARD JSON:
 • Если в проблеме есть "allowed_values" → выбирай СТРОГО из этого списка.
   КОПИРУЙ значения ТОЧНО как написано (с тем же регистром, пробелами).
   НЕ придумывай свои значения. Это справочник Wildberries.
+
+• ⚠️ СВОБОДНЫЕ ПОЛЯ (FREE-FORM):
+  - Если в проблеме НЕТ "allowed_values" — это СВОБОДНОЕ ПОЛЕ.
+  - Можно писать ЛЮБОЙ текст, правдиво описывающий товар.
+  - Примеры: "Комплектация" (пример: "костюм-двойка, Жакет - 1шт, Брюки - 1шт")
+  - НЕ предлагай clear/swap для free-form полей — просто скорректируй текст на основе фото.
+  - Формат текста СВОБОДНЫЙ (можно с дефисами, цифрами, скобками).
 
 • МАКСИМИЗАЦИЯ ЗАПОЛНЕНИЯ (КРИТИЧЕСКИ ВАЖНО!):
   - Если есть min_limit/max_limit → ВСЕГДА возвращай массив МАКСИМАЛЬНОЙ длины (max_limit).
@@ -764,6 +771,8 @@ CARD JSON:
   }}
 }}
 """.strip()
+
+        _console_dump("GEMINI_FIX_PROMPT_FULL", prompt)
 
         has_text_issue = any(
             str((it or {}).get("error_type") or "").strip().lower() in {

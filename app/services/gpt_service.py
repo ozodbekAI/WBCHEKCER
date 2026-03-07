@@ -21,6 +21,13 @@ from .wb_logic_prompt import build_wb_logic_block
 
 logger = logging.getLogger(__name__)
 
+
+def _console_dump(tag: str, data: Any) -> None:
+    try:
+        print(f"\n[{tag}]\n{json.dumps(data, ensure_ascii=False, indent=2)}\n")
+    except Exception:
+        print(f"\n[{tag}] {data}\n")
+
 _EMPTY_TOKENS = {"prompt_tokens": 0, "completion_tokens": 0, "thinking_tokens": 0, "total_tokens": 0}
 
 
@@ -150,6 +157,16 @@ class GPTService:
             "response_format": {"type": "json_object"},
         }
 
+        _console_dump("GPT_API_REQUEST_META", {
+            "model": self._model,
+            "image_url": image_url,
+            "prompt_len": len(prompt),
+            "has_image_part": bool(image_url),
+            "max_tokens": mt,
+            "temperature": settings.GEMINI_TEMPERATURE,
+        })
+        _console_dump("GPT_API_PROMPT_FULL", prompt)
+
         try:
             with httpx.Client(timeout=120.0) as client:
                 resp = client.post(
@@ -208,10 +225,8 @@ class GPTService:
             "subjectName": subject_name,
             "vendorCode": card.get("vendorCode") or card.get("vendor_code"),
             "brand": card.get("brand"),
-            "title": card.get("title"),
         }
-        desc = card.get("description") or ""
-        compact["description"] = desc[:1500] if len(desc) > 1500 else desc
+        _console_dump("GPT_AUDIT_COMPACT_CARD", compact)
 
         chars_raw = card.get("characteristics") or []
         if isinstance(chars_raw, list):
@@ -248,14 +263,8 @@ class GPTService:
 {json.dumps(valid_char_names, ensure_ascii=False)}
 Если в карточке есть характеристики НЕ из этого списка и они заполнены — это ошибка.
 """
-        seo_keywords_list = card.get("_seo_keywords") or []
+        # SEO text checks are disabled in AI audit (title/description not sent here)
         seo_keywords_section = ""
-        if seo_keywords_list:
-            seo_keywords_section = f"""
-SEO-КЛЮЧЕВЫЕ СЛОВА ДЛЯ КАТЕГОРИИ "{subject_name}":
-{', '.join(seo_keywords_list[:20])}
-Проверь: есть ли хотя бы 1 ключевое слово в названии, минимум 2 в описании.
-"""
         logic_block = build_wb_logic_block(include_output=False)
 
         dna_block = ""
@@ -267,22 +276,22 @@ SEO-КЛЮЧЕВЫЕ СЛОВА ДЛЯ КАТЕГОРИИ "{subject_name}":
 
 {logic_block}
 
-ЗАДАЧА: Проанализируй карточку товара. Найди РЕАЛЬНЫЕ ошибки и несоответствия.
+ЗАДАЧА: Проанализируй фото и карточку характеристик товара. Найди РЕАЛЬНЫЕ ошибки и несоответствия.
 Не выдумывай — если не уверен, ставь severity="warning".
 
 КАТЕГОРИЯ ТОВАРА: "{subject_name}" (subjectID={subject_id})
 {valid_chars_section}{seo_keywords_section}
 {dna_block}
 ЧТО ПРОВЕРЯТЬ:
-1. ОПИСАНИЕ ↔ ХАРАКТЕРИСТИКИ — Цвет, тип, фасон, комплектность соответствуют?
-2. КАТЕГОРИЯ ↔ ТЕКСТ — Название/описание соответствуют категории "{subject_name}"?
-3. ТЕКСТ ↔ ХАРАКТЕРИСТИКИ — Нет ли обрезанных/неполных значений, логических конфликтов?
-4. ХАРАКТЕРИСТИКИ ↔ КАТЕГОРИЯ — Есть ли характеристики НЕ из допустимого списка?
-5. АРТИКУЛ / VENDORCODE — Если указан цвет, совпадает с «Цвет»?
-6. ДАТЫ/СЕРТИФИКАТЫ — НЕ анализируй, НЕ предлагай исправления.
-9. ЦВЕТ — НЕ анализируй характеристику «Цвет», она проверяется отдельно.
-7. SEO — есть ли ключевые слова категории в названии (≥1) и описании (≥2)?
-8. НАЗВАНИЕ — ФОРМУЛА: начинается с категории, есть ключевой признак, 35–60 символов, нет маркетинга/пола.
+1. ФОТО ↔ ХАРАКТЕРИСТИКИ — Цвет, тип, фасон, комплектность соответствуют?
+2. ХАРАКТЕРИСТИКИ ↔ КАТЕГОРИЯ — Есть ли характеристики НЕ из допустимого списка?
+3. АРТИКУЛ / VENDORCODE — Если указан цвет, совпадает с «Цвет»?
+4. ДАТЫ/СЕРТИФИКАТЫ — НЕ анализируй, НЕ предлагай исправления.
+5. ЦВЕТ — НЕ анализируй характеристику «Цвет», она проверяется отдельно.
+
+ВАЖНО:
+• НЕ анализируй title/description — они генерируются отдельно после исправления характеристик.
+• Никаких text_mismatch на основе описания не возвращай.
 
 CARD JSON:
 {json.dumps(compact, ensure_ascii=False)[:4000]}
@@ -308,6 +317,8 @@ CARD JSON:
 
 Если ошибок нет — верни: {{"errors": []}}
 """.strip()
+
+        _console_dump("GPT_AUDIT_PROMPT_FULL", prompt)
 
         image_url = None if product_dna else _get_card_photo(card)
         result, tokens = self._call_api(
@@ -356,7 +367,7 @@ CARD JSON:
                 "id": str(i),
                 "error_type": iss.get("error_type") or iss.get("code") or "",
                 "name": iss.get("name") or iss.get("title") or "",
-                # ❌ НЕ включаем current_value — AI должен выбирать только из allowed_values на основе фото
+                "current_value": iss.get("current_value") or iss.get("value"),  # ✅ Qaytardik - bo'sh qiymatlarni ko'rsatish kerak
                 "description": iss.get("description") or iss.get("message") or "",
             }
             # Include allowed_values/limits when they exist
@@ -368,6 +379,9 @@ CARD JSON:
                     entry["min_limit"] = err.get("min")
                     entry["max_limit"] = err.get("max")
             issues_data.append(entry)
+
+        _console_dump("GPT_FIX_COMPACT_CARD", compact_card)
+        _console_dump("GPT_FIX_ISSUES_DATA", issues_data)
 
         dna_block = ""
         if product_dna:
@@ -388,6 +402,11 @@ CARD JSON:
 
 ПРАВИЛА:
 • Если есть allowed_values → выбирай СТРОГО из этого списка (точное совпадение).
+• ⚠️ СВОБОДНЫЕ ПОЛЯ (FREE-FORM):
+  - Если allowed_values НЕТ — это СВОБОДНОЕ ПОЛЕ, можно писать любой текст.
+  - Примеры: "Комплектация" ("костюм-двойка, Жакет - 1шт, Брюки - 1шт").
+  - Формат свободный (дефисы, цифры, скобки допустимы).
+  - НЕ предлагай clear — просто скорректируй текст на основе фото.
 • КРИТИЧЕСКИ ВАЖНО: Если есть min_limit/max_limit → СТРЕМИСЬ к максимальному заполнению (max_limit).
   - Например: min=1, max=5 → постарайся выбрать до 5 подходящих значений из allowed_values.
   - НО: выбирай ТОЛЬКО те значения, которые ДЕЙСТВИТЕЛЬНО СООТВЕТСТВУЮТ товару на фото/в описании.
@@ -413,6 +432,8 @@ CARD JSON:
   }}
 }}
 """.strip()
+
+        _console_dump("GPT_FIX_PROMPT_FULL", prompt)
 
         needs_vision = not product_dna and any(
             str((it or {}).get("error_type") or "").startswith("ai_")

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import uuid
 from datetime import datetime
 from typing import Optional, List
@@ -19,6 +20,7 @@ from ..services import (
 from ..services.card_service import analyze_card
 
 router = APIRouter(prefix="/stores", tags=["Sync"])
+logger = logging.getLogger(__name__)
 
 # In-memory task store (survives navigation, lost on server restart)
 SYNC_TASKS: dict[str, dict] = {}
@@ -362,6 +364,7 @@ async def _run_analyze_all(task_id: str, store_id: int):
             task["progress"] = 10
 
             issues_found = 0
+            failed_cards = 0
 
             for i, cid in enumerate(card_ids):
                 pct = 10 + int((i + 1) / max(total, 1) * 80)
@@ -377,23 +380,35 @@ async def _run_analyze_all(task_id: str, store_id: int):
                     )
                     issues, _ = await analyze_card(db, card, use_ai=True)
                     issues_found += len(issues)
-                except Exception:
-                    pass
+                except Exception as e:
+                    failed_cards += 1
+                    logger.exception(
+                        "[sync.analyze_all] card analysis failed | store_id=%s task_id=%s card_id=%s nm_id=%s error=%s",
+                        store_id,
+                        task_id,
+                        cid,
+                        getattr(card, "nm_id", None) if 'card' in locals() else None,
+                        str(e),
+                    )
+                    task["step"] = f"[{i + 1}/{total}] Ошибка анализа card_id={cid}: {str(e)[:120]}"
 
             from ..services import update_store_stats
             await update_store_stats(db, store_id)
 
         task["status"] = "completed"
         task["progress"] = 100
-        task["step"] = "Готово!"
+        task["step"] = f"Готово! Найдено {issues_found} проблем, ошибок анализа: {failed_cards}"
         task["result"] = {
             "total_analyzed": total,
             "issues_found": issues_found,
+            "failed_cards": failed_cards,
         }
+        task["completed_at"] = datetime.utcnow().isoformat()
     except Exception as e:
         task["status"] = "failed"
         task["error"] = str(e)
         task["step"] = f"Ошибка: {e}"
+        task["completed_at"] = datetime.utcnow().isoformat()
 
 
 @router.post("/{store_id}/sync/analyze-all")
@@ -470,6 +485,7 @@ async def _run_reset_and_analyze(task_id: str, store_id: int):
             task["progress"] = 5
             total = len(card_ids)
             issues_found = 0
+            failed_cards = 0
 
             for i, cid in enumerate(card_ids):
                 pct = 5 + int((i + 1) / max(total, 1) * 88)
@@ -486,20 +502,35 @@ async def _run_reset_and_analyze(task_id: str, store_id: int):
                     )
                     issues, _ = await analyze_card(db, card, use_ai=True)
                     issues_found += len(issues)
-                except Exception:
-                    pass
+                except Exception as e:
+                    failed_cards += 1
+                    logger.exception(
+                        "[sync.reset_and_analyze] card analysis failed | store_id=%s task_id=%s card_id=%s nm_id=%s error=%s",
+                        store_id,
+                        task_id,
+                        cid,
+                        getattr(card, "nm_id", None) if 'card' in locals() else None,
+                        str(e),
+                    )
+                    task["step"] = f"[{i + 1}/{total}] Ошибка анализа card_id={cid}: {str(e)[:120]}"
 
             from ..services import update_store_stats
             await update_store_stats(db, store_id)
 
         task["status"] = "completed"
         task["progress"] = 100
-        task["step"] = f"Готово! Найдено {issues_found} проблем"
-        task["result"] = {"total_analyzed": total, "issues_found": issues_found}
+        task["step"] = f"Готово! Найдено {issues_found} проблем, ошибок анализа: {failed_cards}"
+        task["result"] = {
+            "total_analyzed": total,
+            "issues_found": issues_found,
+            "failed_cards": failed_cards,
+        }
+        task["completed_at"] = datetime.utcnow().isoformat()
     except Exception as e:
         task["status"] = "failed"
         task["error"] = str(e)
         task["step"] = f"Ошибка: {e}"
+        task["completed_at"] = datetime.utcnow().isoformat()
 
 
 @router.post("/{store_id}/sync/reset-and-analyze")
