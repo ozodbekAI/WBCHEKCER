@@ -145,16 +145,35 @@ def _load_image_b64(image: str) -> Tuple[Optional[str], Optional[str]]:
 
 def _get_card_photo(card: Dict[str, Any]) -> Optional[str]:
     """Get first big photo from card"""
+    photos = _get_card_photos(card, limit=1)
+    return photos[0] if photos else None
+
+
+def _get_card_photos(card: Dict[str, Any], limit: int = 2) -> List[str]:
+    """Get up to N photo URLs from card in original order."""
     photos = card.get("photos") or []
-    if not photos:
-        return None
-    
-    p0 = photos[0]
-    if isinstance(p0, dict):
-        return p0.get("big") or p0.get("url")
-    if isinstance(p0, str):
-        return p0
-    return None
+    if not isinstance(photos, list) or not photos:
+        return []
+
+    out: List[str] = []
+    seen: set[str] = set()
+    safe_limit = max(1, min(int(limit or 1), 5))
+
+    for p in photos:
+        if len(out) >= safe_limit:
+            break
+        url = ""
+        if isinstance(p, dict):
+            url = p.get("big") or p.get("c516x688") or p.get("square") or p.get("url") or ""
+        elif isinstance(p, str):
+            url = p
+        url = str(url or "").strip()
+        if not url or url in seen:
+            continue
+        out.append(url)
+        seen.add(url)
+
+    return out
 
 
 class GeminiService:
@@ -174,6 +193,7 @@ class GeminiService:
         self, 
         prompt: str, 
         image_url: Optional[str] = None,
+        image_urls: Optional[List[str]] = None,
         thinking_budget: Optional[int] = None,
         max_output_tokens: Optional[int] = None,
         retry_count: int = 0,
@@ -194,14 +214,26 @@ class GeminiService:
         params = {"key": self.api_key}
         
         parts: List[Dict[str, Any]] = [{"text": prompt}]
-        
-        # Add image if provided
+
+        candidate_urls = list(image_urls or [])
         if image_url:
-            img_b64, mime = _load_image_b64(image_url)
+            candidate_urls = [image_url] + candidate_urls
+        uniq_urls: List[str] = []
+        seen_urls: set[str] = set()
+        for u in candidate_urls:
+            uu = str(u or "").strip()
+            if not uu or uu in seen_urls:
+                continue
+            uniq_urls.append(uu)
+            seen_urls.add(uu)
+
+        image_parts: List[Dict[str, Any]] = []
+        for iu in uniq_urls[:5]:
+            img_b64, mime = _load_image_b64(iu)
             if img_b64 and mime:
-                parts.insert(0, {
-                    "inline_data": {"mime_type": mime, "data": img_b64}
-                })
+                image_parts.append({"inline_data": {"mime_type": mime, "data": img_b64}})
+        if image_parts:
+            parts = image_parts + parts
         
         generation_config: Dict[str, Any] = {
             "temperature": self.temperature,
@@ -220,8 +252,9 @@ class GeminiService:
         _console_dump("GEMINI_API_REQUEST_META", {
             "model": self.model,
             "image_url": image_url,
+            "image_urls_count": len(uniq_urls),
             "prompt_len": len(prompt),
-            "has_image_part": bool(image_url),
+            "has_image_part": bool(image_parts),
             "generation_config": generation_config,
         })
         _console_dump("GEMINI_API_PROMPT_FULL", prompt)
@@ -242,6 +275,7 @@ class GeminiService:
                     return self._call_api(
                         prompt,
                         image_url,
+                        image_urls=image_urls,
                         thinking_budget=thinking_budget,
                         max_output_tokens=max_output_tokens,
                         retry_count=retry_count + 1,
@@ -360,6 +394,8 @@ class GeminiService:
 
 ЗАДАЧА: Проанализируй фото товара и JSON-карточку характеристик. Найди РЕАЛЬНЫЕ ошибки
 и несоответствия. Не выдумывай — если не уверен, ставь severity="warning".
+Если на одном фото есть текст/плашки/обрезка или часть товара не видна — сверяй вывод по другим фото,
+не делай вывод только по одному кадру.
 
 КАТЕГОРИЯ ТОВАРА: "{subject_name}" (subjectID={subject_id})
 {valid_chars_section}{seo_keywords_section}
@@ -454,10 +490,13 @@ CARD JSON:
 
         _console_dump("GEMINI_AUDIT_PROMPT_FULL", prompt)
 
-        image_url = None if product_dna else _get_card_photo(card)
+        image_urls = None
+        if not product_dna:
+            limit = max(1, min(int(getattr(settings, "AI_CONTEXT_PHOTOS_COUNT", 2) or 2), 5))
+            image_urls = _get_card_photos(card, limit=limit)
         result, tokens = self._call_api(
             prompt,
-            image_url,
+            image_urls=image_urls,
             thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_AUDIT", 512),
             max_output_tokens=getattr(settings, "GEMINI_AUDIT_MAX_OUTPUT_TOKENS", self.max_output_tokens),
         )
@@ -828,11 +867,14 @@ CARD JSON:
             str((it or {}).get("error_type") or "").startswith("ai_")
             for it in issues_data
         )
-        image_url = _get_card_photo(card) if needs_vision_context else None
+        image_urls = None
+        if needs_vision_context:
+            limit = max(1, min(int(getattr(settings, "AI_CONTEXT_PHOTOS_COUNT", 2) or 2), 5))
+            image_urls = _get_card_photos(card, limit=limit)
 
         result, tokens = self._call_api(
             prompt,
-            image_url=image_url,
+            image_urls=image_urls,
             thinking_budget=getattr(settings, "GEMINI_THINKING_BUDGET_FIX", 128),
             max_output_tokens=getattr(settings, "GEMINI_FIX_MAX_OUTPUT_TOKENS", self.max_output_tokens),
         )
@@ -969,6 +1011,7 @@ CARD JSON:
         self,
         image_url: str,
         subject_name: str = "",
+        image_urls: Optional[List[str]] = None,
     ) -> str:
         """
         Mahsulot fotosini bir marta tahlil qilib texnik tavsif (Product DNA) yaratadi.
@@ -980,8 +1023,9 @@ CARD JSON:
             return ""
 
         prompt = f"""Ты — эксперт по анализу fashion-товаров для маркетплейса Wildberries.
-Твоя задача — по фотографии товара создать максимально подробное и объективное описание изделия,
+Твоя задача — по 1-3 фотографиям товара создать максимально подробное и объективное описание изделия,
 которое будет использоваться как базовое описание товара для дальнейшей обработки системой.
+Если первый кадр частично закрыт текстом, плашками или обрезан — используй другие кадры как основной источник истины.
 
 ВАЖНО: Это техническое описание товара — не финальный текст для карточки. Используй его для:
 - проверки характеристик
@@ -1031,9 +1075,12 @@ casual / городской / офисный / минимализм / базов
 Верни ТОЛЬКО структурированный текст. Без JSON, без вводных фраз."""
 
         try:
+            dna_image_urls = list(image_urls or [])
+            if image_url:
+                dna_image_urls = [image_url] + dna_image_urls
             result, _ = self._call_api(
                 prompt,
-                image_url=image_url,
+                image_urls=dna_image_urls,
                 thinking_budget=0,
                 max_output_tokens=1500,
                 raw_text=True,

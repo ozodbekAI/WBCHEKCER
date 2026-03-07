@@ -86,15 +86,34 @@ def _load_image_b64(url: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def _get_card_photo(card: Dict[str, Any]) -> Optional[str]:
+    photos = _get_card_photos(card, limit=1)
+    return photos[0] if photos else None
+
+
+def _get_card_photos(card: Dict[str, Any], limit: int = 2) -> List[str]:
     photos = card.get("photos") or []
-    if not photos:
-        return None
-    p0 = photos[0]
-    if isinstance(p0, dict):
-        return p0.get("big") or p0.get("url")
-    if isinstance(p0, str):
-        return p0
-    return None
+    if not isinstance(photos, list) or not photos:
+        return []
+
+    out: List[str] = []
+    seen: set[str] = set()
+    safe_limit = max(1, min(int(limit or 1), 5))
+
+    for p in photos:
+        if len(out) >= safe_limit:
+            break
+        url = ""
+        if isinstance(p, dict):
+            url = p.get("big") or p.get("c516x688") or p.get("square") or p.get("url") or ""
+        elif isinstance(p, str):
+            url = p
+        url = str(url or "").strip()
+        if not url or url in seen:
+            continue
+        out.append(url)
+        seen.add(url)
+
+    return out
 
 
 class GPTService:
@@ -115,6 +134,7 @@ class GPTService:
         self,
         prompt: str,
         image_url: Optional[str] = None,
+        image_urls: Optional[List[str]] = None,
         max_tokens: Optional[int] = None,
         retry_count: int = 0,
         max_retries: int = 3,
@@ -131,19 +151,35 @@ class GPTService:
 
         # Build message content
         user_content: Any
+        candidate_urls = list(image_urls or [])
         if image_url:
-            img_b64, mime = _load_image_b64(image_url)
-            if img_b64 and mime:
-                user_content = [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime};base64,{img_b64}",
-                            "detail": "high",
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ]
+            candidate_urls = [image_url] + candidate_urls
+        uniq_urls: List[str] = []
+        seen_urls: set[str] = set()
+        for u in candidate_urls:
+            uu = str(u or "").strip()
+            if not uu or uu in seen_urls:
+                continue
+            uniq_urls.append(uu)
+            seen_urls.add(uu)
+
+        if uniq_urls:
+            content_parts: List[Dict[str, Any]] = []
+            for iu in uniq_urls[:5]:
+                img_b64, mime = _load_image_b64(iu)
+                if img_b64 and mime:
+                    content_parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime};base64,{img_b64}",
+                                "detail": "high",
+                            },
+                        }
+                    )
+            if content_parts:
+                content_parts.append({"type": "text", "text": prompt})
+                user_content = content_parts
             else:
                 user_content = prompt
         else:
@@ -160,8 +196,9 @@ class GPTService:
         _console_dump("GPT_API_REQUEST_META", {
             "model": self._model,
             "image_url": image_url,
+            "image_urls_count": len(uniq_urls),
             "prompt_len": len(prompt),
-            "has_image_part": bool(image_url),
+            "has_image_part": bool(uniq_urls),
             "max_tokens": mt,
             "temperature": settings.GEMINI_TEMPERATURE,
         })
@@ -184,7 +221,14 @@ class GPTService:
                 wait = 2 ** retry_count
                 logger.warning("[gpt] %d error, retry %d/%d after %ds", e.response.status_code, retry_count + 1, max_retries, wait)
                 time.sleep(wait)
-                return self._call_api(prompt, image_url, max_tokens, retry_count + 1, max_retries)
+                return self._call_api(
+                    prompt,
+                    image_url=image_url,
+                    image_urls=image_urls,
+                    max_tokens=max_tokens,
+                    retry_count=retry_count + 1,
+                    max_retries=max_retries,
+                )
             logger.error("[gpt] HTTP %d: %s", e.response.status_code, str(e)[:200])
             return {}, _EMPTY_TOKENS
         except Exception as e:
@@ -277,6 +321,8 @@ class GPTService:
 
 ЗАДАЧА: Проанализируй фото и карточку характеристик товара. Найди РЕАЛЬНЫЕ ошибки и несоответствия.
 Не выдумывай — если не уверен, ставь severity="warning".
+Если на одном фото есть текст/плашки/обрезка или часть товара не видна — сверяй вывод по другим фото,
+не делай вывод только по одному кадру.
 
 КАТЕГОРИЯ ТОВАРА: "{subject_name}" (subjectID={subject_id})
 {valid_chars_section}{seo_keywords_section}
@@ -319,10 +365,13 @@ CARD JSON:
 
         _console_dump("GPT_AUDIT_PROMPT_FULL", prompt)
 
-        image_url = None if product_dna else _get_card_photo(card)
+        image_urls = None
+        if not product_dna:
+            limit = max(1, min(int(getattr(settings, "AI_CONTEXT_PHOTOS_COUNT", 2) or 2), 5))
+            image_urls = _get_card_photos(card, limit=limit)
         result, tokens = self._call_api(
             prompt,
-            image_url=image_url,
+            image_urls=image_urls,
             max_tokens=settings.GEMINI_AUDIT_MAX_OUTPUT_TOKENS,
         )
 
@@ -439,7 +488,12 @@ CARD JSON:
         )
         result, tokens = self._call_api(
             prompt,
-            image_url=_get_card_photo(card) if needs_vision else None,
+            image_urls=(
+                _get_card_photos(
+                    card,
+                    limit=max(1, min(int(getattr(settings, "AI_CONTEXT_PHOTOS_COUNT", 2) or 2), 5)),
+                ) if needs_vision else None
+            ),
             max_tokens=settings.GEMINI_FIX_MAX_OUTPUT_TOKENS,
         )
 
@@ -557,6 +611,7 @@ CARD JSON:
         self,
         image_url: str,
         subject_name: str = "",
+        image_urls: Optional[List[str]] = None,
     ) -> str:
         """
         GPT-4o-mini orqali mahsulot fotosidan Product DNA yaratadi.
@@ -566,7 +621,8 @@ CARD JSON:
             return ""
 
         prompt = f"""Ты — эксперт по анализу fashion-товаров для маркетплейса Wildberries.
-Создай техническое описание товара по фотографии.
+Создай техническое описание товара по 1-3 фотографиям.
+Если первый кадр частично закрыт текстом, плашками или обрезан — используй другие кадры как основной источник истины.
 
 Проанализируй изображение по блокам:
 1. ТИП ТОВАРА — категория, комплект или одиночное, элементы комплекта.
@@ -585,18 +641,32 @@ CARD JSON:
 Верни ТОЛЬКО текст по блокам."""
 
         try:
+            dna_urls = list(image_urls or [])
+            if image_url:
+                dna_urls = [image_url] + dna_urls
+            content_parts: List[Dict[str, Any]] = []
+            seen_urls: set[str] = set()
+            for u in dna_urls:
+                uu = str(u or "").strip()
+                if not uu or uu in seen_urls:
+                    continue
+                seen_urls.add(uu)
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": uu, "detail": "high"},
+                    }
+                )
+                if len(content_parts) >= 5:
+                    break
+            content_parts.append({"type": "text", "text": prompt})
+
             payload = {
                 "model": self._model,
                 "messages": [
                     {
                         "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": image_url, "detail": "high"},
-                            },
-                            {"type": "text", "text": prompt},
-                        ],
+                        "content": content_parts,
                     }
                 ],
                 "max_tokens": 1500,

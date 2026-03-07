@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     GEMINI_THINKING_BUDGET_AUDIT: int = 512
     GEMINI_THINKING_BUDGET_FIX: int = 128
     GEMINI_THINKING_BUDGET_REFIX: int = 64
+    AI_CONTEXT_PHOTOS_COUNT: int = 2
     AI_ENABLED: bool = True
 
     # AI Provider: "gemini" yoki "gpt"

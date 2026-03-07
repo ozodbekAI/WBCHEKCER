@@ -6,6 +6,7 @@ from typing import List, Optional
 from sqlalchemy import select, update, delete, func, and_, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..core.config import settings
 from ..models import Card, CardIssue, IssueSeverity, IssueCategory, IssueStatus
 from ..services.analyzer import card_analyzer
 from ..services.wb_validator import validate_card_characteristics, get_catalog, find_best_match, calculate_card_fcs
@@ -56,6 +57,33 @@ def _extract_seed_colors(value: Optional[str]) -> List[str]:
     if "," in text:
         return [x.strip() for x in text.split(",") if x.strip()]
     return [text]
+
+
+def _extract_photo_urls(raw_data: dict, limit: int = 2) -> List[str]:
+    """Extract up to N photo URLs from WB card payload in original order."""
+    media = raw_data.get("photos") or raw_data.get("mediaFiles") or []
+    if not isinstance(media, list) or not media:
+        return []
+
+    out: List[str] = []
+    seen: set[str] = set()
+    safe_limit = max(1, min(int(limit or 1), 5))
+
+    for item in media:
+        if len(out) >= safe_limit:
+            break
+        url = ""
+        if isinstance(item, dict):
+            url = item.get("big") or item.get("c516x688") or item.get("square") or item.get("url") or ""
+        else:
+            url = str(item or "")
+        url = str(url or "").strip()
+        if not url or url in seen:
+            continue
+        out.append(url)
+        seen.add(url)
+
+    return out
 
 
 def _allowed_values_for_ai(iss: CardIssue) -> List[str]:
@@ -829,24 +857,26 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     # All subsequent AI calls use this text → no re-sending photo.
     # Provider selection: GPT uses VisionService (GPT-4o-mini), Gemini uses GeminiService.
     if use_ai and raw_data and not card.product_dna:
-        photo_url_dna: str = ""
-        media = raw_data.get("photos") or raw_data.get("mediaFiles") or []
-        if isinstance(media, list) and media:
-            first = media[0]
-            photo_url_dna = (first.get("big") or first.get("c516x688") or first.get("square")
-                   or first.get("url") or "") if isinstance(first, dict) else str(first)
+        dna_limit = max(1, min(int(getattr(settings, "AI_CONTEXT_PHOTOS_COUNT", 2) or 2), 5))
+        photo_urls_dna = _extract_photo_urls(raw_data, limit=dna_limit)
 
-        if photo_url_dna:
+        if photo_urls_dna:
             subject_name_dna = raw_data.get("subjectName") or raw_data.get("subject_name") or ""
             ai_svc = get_ai_service()
-            # Use Gemini's built-in vision if provider=gemini, else use VisionService (GPT-4o-mini)
+            primary_photo = photo_urls_dna[0]
+            # Use provider's own vision if available; pass additional photos as fallback context.
             if ai_svc.is_enabled() and hasattr(ai_svc, "generate_product_dna_text"):
                 dna_text = await asyncio.to_thread(
-                    ai_svc.generate_product_dna_text, photo_url_dna, subject_name_dna
+                    ai_svc.generate_product_dna_text,
+                    primary_photo,
+                    subject_name_dna,
+                    photo_urls_dna,
                 )
             elif vision_service.is_enabled:
                 dna_text = await vision_service.generate_product_dna_text(
-                    photo_url_dna, subject_name_dna
+                    primary_photo,
+                    subject_name_dna,
+                    photo_urls=photo_urls_dna,
                 )
             else:
                 dna_text = ""
