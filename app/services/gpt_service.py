@@ -223,7 +223,6 @@ class GPTService:
         compact: Dict[str, Any] = {
             "subjectID": subject_id,
             "subjectName": subject_name,
-            "vendorCode": card.get("vendorCode") or card.get("vendor_code"),
             "brand": card.get("brand"),
         }
         _console_dump("GPT_AUDIT_COMPACT_CARD", compact)
@@ -285,12 +284,12 @@ class GPTService:
 ЧТО ПРОВЕРЯТЬ:
 1. ФОТО ↔ ХАРАКТЕРИСТИКИ — Цвет, тип, фасон, комплектность соответствуют?
 2. ХАРАКТЕРИСТИКИ ↔ КАТЕГОРИЯ — Есть ли характеристики НЕ из допустимого списка?
-3. АРТИКУЛ / VENDORCODE — Если указан цвет, совпадает с «Цвет»?
-4. ДАТЫ/СЕРТИФИКАТЫ — НЕ анализируй, НЕ предлагай исправления.
-5. ЦВЕТ — НЕ анализируй характеристику «Цвет», она проверяется отдельно.
+3. ДАТЫ/СЕРТИФИКАТЫ — НЕ анализируй, НЕ предлагай исправления.
+4. ЦВЕТ — НЕ анализируй характеристику «Цвет», она проверяется отдельно.
 
 ВАЖНО:
 • НЕ анализируй title/description — они генерируются отдельно после исправления характеристик.
+• НЕ анализируй vendorCode/артикул — работай ТОЛЬКО по характеристикам.
 • Никаких text_mismatch на основе описания не возвращай.
 
 CARD JSON:
@@ -349,7 +348,6 @@ CARD JSON:
         compact_card: Dict[str, Any] = {
             "subjectName": subject,
             "brand": card.get("brand"),
-            "vendorCode": card.get("vendorCode") or card.get("vendor_code"),
         }
         # ❌ ВСЕГДА исключаем title и description — AI генерирует их ПОСЛЕ исправления характеристик
         chars_raw = card.get("characteristics") or []

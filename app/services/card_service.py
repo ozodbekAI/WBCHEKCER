@@ -297,6 +297,25 @@ def _is_text_based_ai_issue(ai_issue: dict) -> bool:
     return any(m in blob for m in text_markers)
 
 
+def _is_vendorcode_ai_issue(ai_issue: dict) -> bool:
+    texts: List[str] = [
+        str(ai_issue.get("name") or "").lower(),
+        str(ai_issue.get("message") or "").lower(),
+        str(ai_issue.get("description") or "").lower(),
+        str(ai_issue.get("value") or "").lower(),
+    ]
+    for err in (ai_issue.get("errors") or []):
+        if isinstance(err, dict):
+            texts.append(str(err.get("type") or "").lower())
+            texts.append(str(err.get("message") or "").lower())
+
+    blob = " | ".join(t for t in texts if t)
+    if not blob:
+        return False
+    markers = ("vendorcode", "vendor_code", "vendor code", "артикул")
+    return any(m in blob for m in markers)
+
+
 def _is_non_fixed_date_issue_obj(issue: CardIssue) -> bool:
     if (issue.source or "").lower() == "fixed_file":
         return False
@@ -880,6 +899,9 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 continue
             # Text-based issues are out of AI audit scope (title/description are generated later)
             if _is_text_based_ai_issue(ai_issue):
+                continue
+            # vendorCode/article checks are out of scope (characteristics only)
+            if _is_vendorcode_ai_issue(ai_issue):
                 continue
             # Color characteristics are validated separately via color_names.json — skip AI issues for color
             ai_name = (ai_issue.get("name") or "").strip().lower()
