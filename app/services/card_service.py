@@ -1453,6 +1453,42 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                                     rec_value,
                                 )
 
+        # If characteristics need changes, force a description-refresh issue
+        # so AI-generated new description is visible in the issues list.
+        has_non_text_characteristic_issue = any(
+            (iss.category == IssueCategory.CHARACTERISTICS)
+            and not _is_title_issue_obj(iss)
+            and not _is_description_issue_obj(iss)
+            and (iss.source != "fixed_file")
+            for iss in issues
+        )
+        has_description_issue = any(_is_description_issue_obj(iss) for iss in issues)
+        if has_non_text_characteristic_issue and not has_description_issue:
+            current_description = str(
+                ai_context.get("description")
+                or raw_data.get("description")
+                or ""
+            )
+            issues.append(
+                CardIssue(
+                    card_id=card.id,
+                    code=_clip("description_refresh_needed", 100),
+                    severity=IssueSeverity.WARNING,
+                    category=IssueCategory.DESCRIPTION,
+                    title=_clip("Нужно обновить описание после исправления характеристик", 500),
+                    description=(
+                        "После изменения характеристик описание может стать неактуальным. "
+                        "Сгенерировано новое описание с учетом исправлений."
+                    ),
+                    current_value=current_description,
+                    suggested_value=None,
+                    field_path="description",
+                    score_impact=4,
+                    status=IssueStatus.PENDING,
+                    source=_clip("ai", 50),
+                )
+            )
+
         # ── STEP 5c: Title/Description — AI generates from scratch, then validates ──
         for iss in issues:
             already_auto_fixed = (iss.source == "auto_fix")
