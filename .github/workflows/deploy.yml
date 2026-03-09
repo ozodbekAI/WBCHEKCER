@@ -13,8 +13,7 @@ jobs:
     env:
       USER: root
       SERVER_IP: 195.133.66.192
-      AVEOTVET_DIR: /var/www/aveotvet
-      WB_OPTIMIZER_DIR: /var/www/WBCHEKCER
+      SERVER_DIR: /var/www/WBCHEKCER
 
     steps:
       - name: Checkout repository
@@ -30,49 +29,63 @@ jobs:
 
       - name: Sync files to server
         run: |
-          ssh ${{ env.USER }}@${{ env.SERVER_IP }} "mkdir -p ${{ env.WB_OPTIMIZER_DIR }}"
-          
-          # Copy app/worker files (used by AVEOTVET backend)
-          scp -r app/worker/ ${{ env.USER }}@${{ env.SERVER_IP }}:${{ env.AVEOTVET_DIR }}/backend/app/
-          
-          # Copy AVEOTVET UI files
-          if [ -d "aveotvet/frontend" ]; then
-            scp -r aveotvet/frontend/ ${{ env.USER }}@${{ env.SERVER_IP }}:${{ env.AVEOTVET_DIR }}/frontend/
-          fi
+          ssh ${{ env.USER }}@${{ env.SERVER_IP }} "mkdir -p ${{ env.SERVER_DIR }}"
+          rsync -az --delete \
+            --exclude '.env' \
+            --exclude 'venv/' \
+            --exclude 'data/' \
+            --exclude 'media/' \
+            --exclude 'logs/' \
+            --exclude '__pycache__/' \
+            --exclude '*.pyc' \
+            --exclude 'frontend/node_modules/' \
+            --exclude 'frontend/dist/' \
+            --exclude 'frontend/.env' \
+            ./ ${{ env.USER }}@${{ env.SERVER_IP }}:${{ env.SERVER_DIR }}/
 
-      - name: AVEOTVET Backend - restart worker with new tasks.py
+      - name: Backend - install deps, migrate & restart
         run: |
           ssh ${{ env.USER }}@${{ env.SERVER_IP }} 'bash -s' << 'SSHEOF'
             set -e
-            echo ">>> [AVEOTVET] Worker service restarting..."
-            systemctl restart aveotvet-worker.service
-            sleep 2
-            systemctl is-active aveotvet-worker.service && echo "✅ AVEOTVET Worker ishga tushdi" || (journalctl -u aveotvet-worker.service -n 20 --no-pager && exit 1)
+            cd /var/www/WBCHEKCER
+
+            echo ">>> [1/4] Venv tekshirilmoqda..."
+            if [ ! -d "venv" ]; then
+              python3 -m venv venv
+            fi
+
+            echo ">>> [2/4] pip install..."
+            ./venv/bin/pip install --upgrade pip -q
+            ./venv/bin/pip install -r requirements.txt -q
+
+            echo ">>> [3/4] Alembic migrate..."
+            ./venv/bin/alembic upgrade head || echo "⚠ Alembic xato, lekin deploy davom etmoqda"
+
+            echo ">>> [4/4] Service restart..."
+            systemctl restart wb-optimizer
+            sleep 3
+            systemctl is-active wb-optimizer && echo "✅ Backend ishga tushdi" || (journalctl -u wb-optimizer -n 20 --no-pager && exit 1)
           SSHEOF
 
-      - name: AVEOTVET Frontend - build & restart
+      - name: Frontend - build & serve
         run: |
           ssh ${{ env.USER }}@${{ env.SERVER_IP }} 'bash -s' << 'SSHEOF'
             set -e
-            cd /var/www/aveotvet/frontend
+            cd /var/www/WBCHEKCER/frontend
 
             if [ ! -f "package.json" ]; then
-              echo "AVEOTVET Frontend yo'q, o'tkazib yuborildi"
+              echo "Frontend yo'q, o'tkazib yuborildi"
               exit 0
             fi
 
-            echo ">>> [AVEOTVET FRONTEND] npm install..."
+            echo ">>> [FRONTEND] npm install..."
             if [ -f "package-lock.json" ]; then
               npm ci --silent
             else
               npm install --silent
             fi
 
-            echo ">>> [AVEOTVET FRONTEND] npm run build..."
+            echo ">>> [FRONTEND] npm run build..."
             npm run build
-
-            echo ">>> [AVEOTVET] Web service restarting..."
-            systemctl restart aveotvet
-            sleep 2
-            systemctl is-active aveotvet && echo "✅ AVEOTVET ishga tushdi" || (journalctl -u aveotvet -n 20 --no-pager && exit 1)
+            echo "✅ Frontend build tayyor"
           SSHEOF

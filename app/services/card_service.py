@@ -1738,17 +1738,18 @@ def _norm_issue_value(val: Optional[str]) -> str:
 def _drop_noop_issues(issues: List[CardIssue]) -> List[CardIssue]:
     """
     Remove issues that provide no actionable fix to the user:
-    1. composition_mismatch where suggested == current (no-op)
+    1. Any issue where suggested == current (no-op)
     2. Any issue where allowed_values is non-empty in principle but AI couldn't produce
        a suggested_value — meaning the field has constraints and there's nothing valid to set.
        (If allowed_values is empty, free-text is accepted and we keep the issue so user can type.)
     """
     out: List[CardIssue] = []
     for iss in issues:
-        # Rule 1: no-op composition mismatch
-        if iss.code == "composition_mismatch":
+        # Rule 1: no-op suggestion (current value already equals suggested value)
+        # Skip only for AI/code-generated issues; keep fixed_file/auto_fix visible by design.
+        if iss.source in {"ai", "code"}:
             cur = _norm_issue_value(iss.current_value)
-            sug = _norm_issue_value(iss.suggested_value)
+            sug = _norm_issue_value(iss.suggested_value or iss.ai_suggested_value)
             if cur and sug and cur == sug:
                 continue
 
