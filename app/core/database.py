@@ -23,6 +23,7 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
+
 # Sync engine for Alembic
 sync_engine = create_engine(
     settings.DATABASE_URL_SYNC,
