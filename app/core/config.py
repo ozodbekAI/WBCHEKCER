@@ -77,8 +77,8 @@ class Settings(BaseSettings):
     WB_API_KEY: str = ""
     WB_ADVERT_API_KEY: str = ""
     
-    # WB Validator Data
-    WB_DATA_ZIP_PATH: str = "data/data.zip"
+    # WB Validator Data (extracted folder only)
+    WB_DATA_PATH: str = "data/data"
 
     # Media / public URL (used by photo chat + photo assets)
     MEDIA_ROOT: str = str((BASE_DIR / "media").resolve())

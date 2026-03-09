@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import math
-import zipfile
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -78,11 +77,12 @@ class CharMetadata:
 
 
 class DataCatalog:
-    """WB Data Catalog - loads limits, allowed values, and per-subject metadata from data.zip"""
-    
-    def __init__(self, data_zip_path: Union[str, Path]):
-        self.data_zip_path = str(data_zip_path)
-        self.zf = zipfile.ZipFile(self.data_zip_path, "r")
+    """WB Data Catalog - loads limits/allowed values/metadata from extracted folder."""
+
+    def __init__(self, data_path: Union[str, Path]):
+        self.data_path = Path(data_path)
+        if not self.data_path.is_dir():
+            raise FileNotFoundError(f"WB data directory not found: {self.data_path}")
 
         # Limits by characteristic name
         self.limits_by_name: Dict[str, Dict[str, int]] = {}
@@ -110,7 +110,7 @@ class DataCatalog:
         # Per-subject validation rules: subject_id -> {charc_id_str: rule_dict}
         self._validation_cache: Dict[int, Dict[str, Dict]] = {}
 
-        # Set of available subject IDs in data.zip
+        # Set of available subject IDs in the data source
         self._available_subjects: Set[int] = set()
 
         self._load_limits()
@@ -121,26 +121,26 @@ class DataCatalog:
         self._scan_available_subjects()
 
     def close(self) -> None:
-        """Close zip file"""
-        try:
-            self.zf.close()
-        except Exception:
-            pass
+        """No-op: filesystem mode has nothing to close."""
+        return None
 
     def _read_json(self, inner_path: str) -> Any:
-        """Read JSON from zip"""
-        with self.zf.open(inner_path) as f:
+        """Read JSON from extracted data directory."""
+        rel_path = inner_path[5:] if inner_path.startswith("data/") else inner_path
+        fs_path = self.data_path / rel_path
+        with fs_path.open("r", encoding="utf-8") as f:
             return json.load(f)
 
     def _scan_available_subjects(self) -> None:
-        """Scan charcs/ folder to know which subject IDs are available"""
-        for name in self.zf.namelist():
-            if name.startswith("data/charcs/") and name.endswith(".json"):
-                try:
-                    sid = int(name.split("/")[-1].replace(".json", ""))
-                    self._available_subjects.add(sid)
-                except ValueError:
-                    pass
+        """Scan charcs/ folder to know which subject IDs are available."""
+        charcs_dir = self.data_path / "charcs"
+        if not charcs_dir.is_dir():
+            return
+        for fp in charcs_dir.glob("*.json"):
+            try:
+                self._available_subjects.add(int(fp.stem))
+            except ValueError:
+                continue
 
     def _load_limits(self) -> None:
         """Load characteristic limits"""
@@ -831,7 +831,7 @@ def get_catalog() -> DataCatalog:
     """Get or create catalog instance"""
     global _catalog
     if _catalog is None:
-        _catalog = DataCatalog(settings.WB_DATA_ZIP_PATH)
+        _catalog = DataCatalog(settings.WB_DATA_PATH)
     return _catalog
 
 

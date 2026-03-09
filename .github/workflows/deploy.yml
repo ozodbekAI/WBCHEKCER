@@ -33,7 +33,6 @@ jobs:
           rsync -az --delete \
             --exclude '.env' \
             --exclude 'venv/' \
-            --exclude 'data/' \
             --exclude 'media/' \
             --exclude 'logs/' \
             --exclude '__pycache__/' \
