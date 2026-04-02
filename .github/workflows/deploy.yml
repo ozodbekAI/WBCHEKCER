@@ -32,14 +32,20 @@ jobs:
           ssh ${{ env.USER }}@${{ env.SERVER_IP }} "mkdir -p ${{ env.SERVER_DIR }}"
           rsync -az --delete \
             --exclude '.env' \
+            --exclude '.git/' \
             --exclude 'venv/' \
             --exclude 'media/' \
             --exclude 'logs/' \
             --exclude '__pycache__/' \
             --exclude '*.pyc' \
+            --exclude '.pytest_cache/' \
             --exclude 'frontend/node_modules/' \
             --exclude 'frontend/dist/' \
             --exclude 'frontend/.env' \
+            --exclude 'reports/' \
+            --exclude 'wb_optimizer.db' \
+            --exclude 'sku_cost_test_store4.xlsx' \
+            --exclude 'frontend/fr.zip' \
             ./ ${{ env.USER }}@${{ env.SERVER_IP }}:${{ env.SERVER_DIR }}/
 
       - name: Backend - install deps, migrate & restart

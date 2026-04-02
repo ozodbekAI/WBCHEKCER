@@ -62,6 +62,30 @@ export interface TeamActivity {
   total_members: number;
 }
 
+export interface TeamTicket {
+  id: number;
+  type: 'delegation' | 'approval';
+  status: 'pending' | 'done';
+  store_id: number;
+  issue_id?: number | null;
+  approval_id?: number | null;
+  card_id?: number | null;
+  issue_title?: string | null;
+  issue_severity?: string | null;
+  issue_code?: string | null;
+  card_title?: string | null;
+  card_photo?: string | null;
+  card_nm_id?: number | null;
+  card_vendor_code?: string | null;
+  from_user_id?: number | null;
+  from_user_name?: string | null;
+  to_user_id?: number | null;
+  to_user_name?: string | null;
+  note?: string | null;
+  created_at: string;
+  completed_at?: string | null;
+}
+
 export interface RoleInfo {
   id: string;
   name: string;
@@ -172,6 +196,7 @@ export interface Card {
   warnings_count: number | null;
   improvements_count: number | null;
   growth_points_count: number | null;
+  confirmation_summary?: CardConfirmationSummary | null;
   last_analysis_at: string | null;
   created_at: string;
   updated_at: string;
@@ -185,6 +210,22 @@ export interface CardDetail extends Card {
   dimensions: Record<string, any>;
   raw_data: Record<string, any>;
   issues: Issue[];
+}
+
+export interface DescriptionEditorDraftPayload {
+  title?: string | null;
+  description?: string | null;
+  characteristics?: Record<string, any>;
+}
+
+export interface DescriptionEditorContext {
+  field: 'description';
+  keywords: string[];
+}
+
+export interface DescriptionEditorGenerateResult extends DescriptionEditorContext {
+  value: string;
+  reason: string | null;
 }
 
 export interface CardListResponse {
@@ -210,6 +251,7 @@ export interface Issue {
   alternatives: string[];
   charc_id: number | null;
   allowed_values: any[];
+  max_count: number | null;
   error_details: any[];
   ai_suggested_value: string | null;
   ai_reason: string | null;
@@ -317,4 +359,287 @@ export interface RecheckResult {
   nm_id: number;
   mismatches: FixedFileMismatch[];
   total: number;
+}
+
+// ==================== Card Draft ====================
+export interface CardDraftPayload {
+  title?: string;
+  description?: string;
+  brand?: string;
+  subject_name?: string;
+  characteristics?: Record<string, string>;
+  dimensions?: { length?: string; width?: string; height?: string; weight?: string };
+  package_type?: string;
+  complectation?: string;
+}
+
+export interface CardDraft {
+  id: number;
+  card_id: number;
+  author_id: number;
+  author_name: string | null;
+  data: CardDraftPayload;
+  updated_at: string;
+}
+
+export interface CardConfirmationSummary {
+  total_sections: number;
+  confirmed_count: number;
+  is_fully_confirmed: boolean;
+  last_confirmed_at: string | null;
+  last_confirmed_by_id: number | null;
+  last_confirmed_by_name: string | null;
+}
+
+export interface TeamActionLogPayload {
+  action: string;
+  label: string;
+  timestamp?: string;
+  meta?: Record<string, any>;
+}
+
+export interface TeamWorkAction {
+  id: string;
+  type: string;
+  label: string;
+  timestamp: string;
+  meta?: Record<string, any>;
+}
+
+export interface TeamWorkSession {
+  id: string;
+  startedAt: string;
+  endedAt: string | null;
+  activeTimeMs: number;
+  actions: TeamWorkAction[];
+}
+
+export interface TeamWorkDay {
+  date: string;
+  minutes: number;
+  sessions: number;
+  fixes: number;
+}
+
+export interface TeamWorkMember {
+  id: number;
+  name: string;
+  email: string;
+  role: string;
+  is_online: boolean;
+  today_minutes: number;
+  week_minutes: number;
+  month_minutes: number;
+  fixes_today: number;
+  fixes_week: number;
+  actions_today: number;
+  work_start_today: string | null;
+  work_end_today: string | null;
+  daily_breakdown: TeamWorkDay[];
+  sessions: TeamWorkSession[];
+}
+
+export interface TeamWorklog {
+  members: TeamWorkMember[];
+  total_today_minutes: number;
+  total_week_minutes: number;
+  team_daily: TeamWorkDay[];
+}
+
+// ==================== Ad Analysis / SKU Economics ====================
+export type AdAnalysisSourceMode = 'ok' | 'partial' | 'manual' | 'manual_required' | 'error' | 'empty';
+export type AdAnalysisItemStatus = 'stop' | 'rescue' | 'control' | 'grow' | 'low_data';
+export type AdAnalysisDiagnosis = 'traffic' | 'card' | 'economics' | 'data';
+export type AdAnalysisPrecision = 'exact' | 'estimated' | 'manual' | 'mixed' | 'unallocated';
+export type AdAnalysisPriority = 'critical' | 'high' | 'medium' | 'low';
+export type AdAnalysisTrendSignal = 'worsening' | 'improving' | 'stable' | 'volatile' | 'new' | 'no_history';
+
+export interface AdAnalysisSourceStatus {
+  id: string;
+  label: string;
+  mode: AdAnalysisSourceMode;
+  detail: string | null;
+  records: number;
+  automatic: boolean;
+}
+
+export interface AdAnalysisAlert {
+  level: 'info' | 'warning' | 'error' | 'success';
+  title: string;
+  description: string;
+  action: string | null;
+}
+
+export interface AdAnalysisBudgetMove {
+  from_nm_id: number | null;
+  from_title: string;
+  from_amount: number;
+  to_nm_id: number | null;
+  to_title: string;
+  uplift_percent: number | null;
+}
+
+export interface AdAnalysisCampaign {
+  advert_id: number | null;
+  title: string;
+  ad_cost: number;
+  ad_gmv: number;
+  drr: number;
+  linked_skus: number;
+  precision: AdAnalysisPrecision;
+  precision_label: string;
+}
+
+export interface AdAnalysisIssueSummary {
+  total: number;
+  critical: number;
+  warnings: number;
+  photos: number;
+  price: number;
+  text: number;
+  docs: number;
+  top_titles: string[];
+}
+
+export interface AdAnalysisMetrics {
+  revenue: number;
+  wb_costs: number;
+  cost_price: number;
+  gross_profit_before_ads: number;
+  ad_cost: number;
+  net_profit: number;
+  profit_per_order: number;
+  max_cpo: number;
+  actual_cpo: number;
+  profit_delta: number;
+  views: number;
+  clicks: number;
+  ad_orders: number;
+  ad_gmv: number;
+  ctr: number;
+  cr: number;
+  open_count: number;
+  cart_count: number;
+  order_count: number;
+  buyout_count: number;
+  add_to_cart_percent: number;
+  cart_to_order_percent: number;
+  cpc: number;
+  drr: number;
+}
+
+export interface AdAnalysisTrend {
+  signal: AdAnalysisTrendSignal;
+  label: string;
+  summary: string;
+  actual_cpo_change: number;
+  net_profit_change: number;
+  profit_delta_change: number;
+  orders_change: number;
+  ctr_change: number;
+  cr_change: number;
+}
+
+export interface AdAnalysisItem {
+  nm_id: number;
+  card_id: number | null;
+  title: string | null;
+  vendor_code: string | null;
+  photo_url: string | null;
+  wb_link: string | null;
+  workspace_link: string | null;
+  price: number | null;
+  card_score: number | null;
+  status: AdAnalysisItemStatus;
+  status_label: string;
+  diagnosis: AdAnalysisDiagnosis;
+  diagnosis_label: string;
+  status_reason: string;
+  status_hint: string;
+  action_title: string;
+  action_description: string;
+  priority: AdAnalysisPriority;
+  priority_label: string;
+  precision: AdAnalysisPrecision;
+  precision_label: string;
+  trend: AdAnalysisTrend;
+  issue_summary: AdAnalysisIssueSummary;
+  metrics: AdAnalysisMetrics;
+  spend_sources: Record<string, number>;
+  insights: string[];
+  steps: string[];
+  risk_flags: string[];
+}
+
+export interface AdAnalysisUploadNeeds {
+  period_start: string;
+  period_end: string;
+  missing_costs_count: number;
+  missing_cost_nm_ids: number[];
+  needs_manual_spend: boolean;
+  needs_manual_finance: boolean;
+  can_upload_costs: boolean;
+  can_upload_manual_spend: boolean;
+  can_upload_manual_finance: boolean;
+}
+
+export interface AdAnalysisOverview {
+  store_id: number;
+  generated_at: string;
+  snapshot_ready: boolean;
+  period_start: string;
+  period_end: string;
+  available_period_start: string | null;
+  available_period_end: string | null;
+  previous_period_start: string | null;
+  previous_period_end: string | null;
+  selected_preset: string;
+  page: number;
+  page_size: number;
+  total_items: number;
+  total_pages: number;
+  total_skus: number;
+  total_revenue: number;
+  total_ad_spend: number;
+  total_net_profit: number;
+  exact_spend: number;
+  estimated_spend: number;
+  manual_spend: number;
+  unallocated_spend: number;
+  profitable_count: number;
+  problematic_count: number;
+  loss_count: number;
+  worsening_count: number;
+  improving_count: number;
+  main_takeaway: string;
+  status_counts: Record<string, number>;
+  source_statuses: AdAnalysisSourceStatus[];
+  alerts: AdAnalysisAlert[];
+  budget_moves: AdAnalysisBudgetMove[];
+  campaigns: AdAnalysisCampaign[];
+  upload_needs: AdAnalysisUploadNeeds;
+  critical_preview: AdAnalysisItem[];
+  growth_preview: AdAnalysisItem[];
+  items: AdAnalysisItem[];
+}
+
+export interface AdAnalysisUploadUnresolvedRow {
+  row_number: number;
+  raw_nm_id: string | null;
+  raw_vendor_code: string | null;
+  raw_title: string | null;
+}
+
+export interface AdAnalysisUploadResult {
+  imported: number;
+  updated: number;
+  file_name: string;
+  period_start: string | null;
+  period_end: string | null;
+  notes: string[];
+  detected_headers: string[];
+  matched_fields: Record<string, string>;
+  resolved_by_vendor_code: number;
+  unresolved_count: number;
+  unresolved_preview: AdAnalysisUploadUnresolvedRow[];
 }

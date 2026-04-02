@@ -4,7 +4,7 @@ Team management & card approval endpoints.
 from typing import List, Optional
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -23,13 +23,25 @@ from ..schemas.approval import (
     ApprovalListOut, TeamMemberOut, TeamMemberUpdate,
     TeamInviteRequest, RoleInfo, PermissionInfo, PermissionsListOut,
 )
+from ..schemas.workflow import TeamActivityLogIn, TeamTicketCreate, TeamTicketOut, TeamWorklogOut
 from ..services import get_store_by_id, update_store_stats
 from ..services.approval_service import (
+    apply_card_raw_snapshot,
+    build_card_update_payload,
     submit_for_review, review_approval,
     get_store_approvals, get_approval_by_id,
     get_user_approval_stats, mark_approval_applied,
 )
+from ..services.card_service import analyze_card
 from ..services.issue_service import get_fixed_issues_for_store, mark_applied_to_wb
+from ..services.workflow_service import (
+    build_team_worklog,
+    create_team_ticket,
+    delete_card_draft,
+    list_team_tickets,
+    log_team_activity,
+    mark_team_ticket_done,
+)
 
 router = APIRouter(prefix="/stores/{store_id}/team", tags=["Team & Approvals"])
 
@@ -328,6 +340,42 @@ async def submit_card_for_review(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    reviewer_ids = list(dict.fromkeys(data.reviewer_ids or []))
+    if reviewer_ids:
+        card_result = await db.execute(select(Card).where(Card.id == data.card_id))
+        card = card_result.scalar_one_or_none()
+        if not card:
+            raise HTTPException(status_code=404, detail="Card not found")
+
+        members_r = await db.execute(
+            select(User).where(
+                User.id.in_(reviewer_ids),
+                User.is_active == True,
+            )
+        )
+        members = {member.id: member for member in members_r.scalars().all()}
+        for reviewer_id in reviewer_ids:
+            reviewer = members.get(reviewer_id)
+            if not reviewer:
+                continue
+            role_val = reviewer.role.value if hasattr(reviewer.role, "value") else reviewer.role
+            if role_val != "admin" and reviewer.id != store.owner_id and getattr(reviewer, "store_id", None) != store.id:
+                continue
+            await create_team_ticket(
+                db,
+                store_id=store.id,
+                from_user_id=current_user.id,
+                to_user_id=reviewer.id,
+                ticket_type="approval",
+                approval_id=approval.id,
+                card_id=card.id,
+                card_title=card.title,
+                card_photo=(card.photos[0] if card.photos else None),
+                card_nm_id=card.nm_id,
+                card_vendor_code=card.vendor_code,
+                note=data.note,
+            )
+
     # Re-fetch with relationships
     full = await get_approval_by_id(db, approval.id)
     return _approval_to_out(full)
@@ -375,55 +423,52 @@ async def apply_approved_to_wb(
     if approval.status != ApprovalStatus.APPROVED:
         raise HTTPException(status_code=400, detail="Approval must be in 'approved' status")
 
-    # Build WB update from the card's fixed issues
     from ..services.wb_api import WildberriesAPI
 
-    issue_ids = [c["issue_id"] for c in (approval.changes or []) if "issue_id" in c]
+    card = approval.card
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
 
-    result_r = await db.execute(
-        select(CardIssue)
-        .where(CardIssue.id.in_(issue_ids))
-        .options(selectinload(CardIssue.card))
-    )
-    issues = list(result_r.scalars().all())
+    changes = approval.changes or []
+    if not changes:
+        raise HTTPException(status_code=400, detail="No approval changes to apply")
 
-    if not issues:
-        raise HTTPException(status_code=400, detail="No issues to apply")
-
-    card = issues[0].card
-    raw = card.raw_data or {}
-    characteristics = raw.get("characteristics", [])
-
-    for issue in issues:
-        if issue.field_path and issue.field_path.startswith("characteristics.") and issue.fixed_value:
-            char_name = issue.field_path.replace("characteristics.", "")
-            for ch in characteristics:
-                if ch.get("name") == char_name or str(ch.get("id")) == str(issue.charc_id):
-                    import json as _json
-                    try:
-                        val = _json.loads(issue.fixed_value)
-                        ch["value"] = val if isinstance(val, list) else [str(val)]
-                    except (_json.JSONDecodeError, TypeError):
-                        ch["value"] = [issue.fixed_value]
-                    break
-
-    update_payload = {
-        "nmID": card.nm_id,
-        "vendorCode": card.vendor_code or "",
-        "characteristics": characteristics,
-    }
-    for issue in issues:
-        if issue.field_path == "title" and issue.fixed_value:
-            update_payload["title"] = issue.fixed_value
-        elif issue.field_path == "description" and issue.fixed_value:
-            update_payload["description"] = issue.fixed_value
+    update_payload, next_raw_data = build_card_update_payload(card, changes)
 
     wb_api = WildberriesAPI(store.api_key)
     wb_result = await wb_api.update_card(update_payload)
 
     if wb_result.get("success"):
-        await mark_applied_to_wb(db, [i.id for i in issues])
+        issue_ids = [int(change["issue_id"]) for change in changes if change.get("issue_id")]
+        if issue_ids:
+            await mark_applied_to_wb(db, issue_ids)
+
+        apply_card_raw_snapshot(card, next_raw_data)
+        card.skip_next_reanalyze = True
+        await db.commit()
+
+        try:
+            await analyze_card(db, card)
+        except Exception:
+            pending_by_severity = await db.execute(
+                select(CardIssue.severity, func.count())
+                .where(
+                    CardIssue.card_id == card.id,
+                    CardIssue.status == IssueStatus.PENDING,
+                )
+                .group_by(CardIssue.severity)
+            )
+            counts = {
+                str(severity.value if hasattr(severity, "value") else severity): count
+                for severity, count in pending_by_severity.all()
+            }
+            card.critical_issues_count = int(counts.get("critical", 0) or 0)
+            card.warnings_count = int(counts.get("warning", 0) or 0)
+            card.improvements_count = int(counts.get("improvement", 0) or 0)
+            await db.commit()
+
         await mark_approval_applied(db, approval_id)
+        await delete_card_draft(db, card.id, approval.prepared_by_id)
         await update_store_stats(db, store.id)
     else:
         error_msg = wb_result.get("error", "Unknown WB error")
@@ -472,6 +517,108 @@ async def list_permissions(
                 group=group_name,
             ))
     return PermissionsListOut(permissions=perms, groups=PERMISSION_GROUPS)
+
+
+@router.get("/tickets", response_model=List[TeamTicketOut])
+async def get_team_tickets(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    ticket_type: Optional[str] = Query(None, alias="type"),
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await list_team_tickets(
+        db,
+        store_id=store.id,
+        participant_user_id=current_user.id,
+        status_filter=status_filter,
+        ticket_type=ticket_type,
+    )
+
+
+@router.post("/tickets", response_model=TeamTicketOut, status_code=201)
+async def create_ticket_endpoint(
+    data: TeamTicketCreate,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    assignee_r = await db.execute(select(User).where(User.id == data.to_user_id, User.is_active == True))
+    assignee = assignee_r.scalar_one_or_none()
+    if not assignee:
+        raise HTTPException(status_code=404, detail="Assignee not found")
+    role_val = assignee.role.value if hasattr(assignee.role, "value") else assignee.role
+    if role_val != "admin" and assignee.id != store.owner_id and getattr(assignee, "store_id", None) != store.id:
+        raise HTTPException(status_code=400, detail="Assignee has no access to this store")
+
+    try:
+        return await create_team_ticket(
+            db,
+            store_id=store.id,
+            from_user_id=current_user.id,
+            to_user_id=assignee.id,
+            ticket_type=data.type,
+            issue_id=data.issue_id,
+            approval_id=data.approval_id,
+            card_id=data.card_id,
+            issue_title=data.issue_title,
+            issue_severity=data.issue_severity,
+            issue_code=data.issue_code,
+            card_title=data.card_title,
+            card_photo=data.card_photo,
+            card_nm_id=data.card_nm_id,
+            card_vendor_code=data.card_vendor_code,
+            note=data.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/tickets/{ticket_id}/done", response_model=TeamTicketOut)
+async def complete_ticket_endpoint(
+    ticket_id: int,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ticket = await mark_team_ticket_done(
+        db,
+        store_id=store.id,
+        ticket_id=ticket_id,
+        current_user_id=current_user.id,
+    )
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return ticket
+
+
+@router.post("/activity/log", status_code=204)
+async def log_activity_endpoint(
+    data: TeamActivityLogIn,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await log_team_activity(
+        db,
+        user_id=current_user.id,
+        store_id=store.id,
+        action=data.action,
+        label=data.label,
+        timestamp=data.timestamp,
+        meta=data.meta,
+    )
+    return Response(status_code=204)
+
+
+@router.get("/worklog", response_model=TeamWorklogOut)
+async def get_team_worklog(
+    days: int = Query(30, ge=7, le=30),
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("team.view", "team.manage")),
+):
+    return await build_team_worklog(db, store_id=store.id, days=days)
 
 
 # ====================================================

@@ -76,8 +76,8 @@ class WBAdvertRepository:
     _CAMPAIGN_IDS_CACHE: Optional[Tuple[float, List[int]]] = None
     _CAMPAIGN_IDS_TTL_S = 60.0
 
-    def __init__(self) -> None:
-        token = settings.WB_API_KEY
+    def __init__(self, token: Optional[str] = None) -> None:
+        token = token or settings.WB_ADVERT_API_KEY or settings.WB_API_KEY
         self._token = token or ""
 
     def _headers(self) -> Dict[str, str]:

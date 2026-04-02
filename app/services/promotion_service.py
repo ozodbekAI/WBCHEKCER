@@ -17,6 +17,7 @@ from urllib.parse import unquote, urlparse
 import uuid
 import requests
 
+from app.core.config import settings
 from sqlalchemy.orm import Session
 
 from app.services.promotion_math import calc_spend_rub
@@ -24,6 +25,8 @@ from app.services.wb_repository import WBRepository
 from app.services.wb_advert_repository import WBAdvertRepository
 from app.services.promotion_repository import PromotionRepository
 from app.models.promotion import PromotionCompany, PromotionPhoto, PromotionStatus
+from app.models.store import Store, StoreStatus
+from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,49 @@ class PromotionService:
     def __init__(self) -> None:
         self.wb_repo = WBRepository()
         self.wb_advert = WBAdvertRepository()
+
+    def _resolve_advert_token(self, db: Session, user_id: int) -> str:
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        candidate_store_ids: list[int] = []
+        if user and getattr(user, "store_id", None):
+            candidate_store_ids.append(int(user.store_id))
+
+        owned_ids = [
+            int(store_id)
+            for (store_id,) in db.query(Store.id)
+            .filter(Store.owner_id == int(user_id))
+            .order_by(Store.id.asc())
+            .all()
+        ]
+        candidate_store_ids.extend(owned_ids)
+
+        # Admin fallback: first active store with an API key.
+        active_store_ids = [
+            int(store_id)
+            for (store_id,) in db.query(Store.id)
+            .filter(Store.status == StoreStatus.ACTIVE)
+            .order_by(Store.id.asc())
+            .all()
+        ]
+        candidate_store_ids.extend(active_store_ids)
+
+        seen: set[int] = set()
+        for store_id in candidate_store_ids:
+            if store_id in seen:
+                continue
+            seen.add(store_id)
+            store = db.query(Store).filter(Store.id == store_id).first()
+            if not store:
+                continue
+            token = str(getattr(store, "api_key", "") or "").strip()
+            if token:
+                return token
+
+        return str(settings.WB_ADVERT_API_KEY or settings.WB_API_KEY or "").strip()
+
+    def _get_wb_advert(self, db: Session, user_id: int) -> WBAdvertRepository:
+        token = self._resolve_advert_token(db, user_id)
+        return WBAdvertRepository(token=token)
 
     @classmethod
     def _get_media_lock(cls, nm_id: int) -> threading.Lock:
@@ -743,6 +789,7 @@ class PromotionService:
     # ============================================
     def create_company(self, db: Session, user_id: int, payload: dict) -> dict:
         repo = PromotionRepository(db)
+        wb_advert = self._get_wb_advert(db, user_id)
 
         nm_id = int(payload["nm_id"])
         card_id = int(payload.get("card_id") or nm_id)
@@ -759,7 +806,7 @@ class PromotionService:
         if len(photos_norm) < 2:
             raise ValueError("At least 2 photos are required")
 
-        wb_company_id, _ = self.wb_advert.create_seacat_campaign(name=title, nms=[nm_id])
+        wb_company_id, _ = wb_advert.create_seacat_campaign(name=title, nms=[nm_id])
 
         company = repo.create_company(
             user_id=user_id,
@@ -772,7 +819,7 @@ class PromotionService:
             photos=[{"order": int(p["order"]), "file_url": str(p["file_url"])} for p in photos_norm],
         )
 
-        wb_min_bids = self.wb_advert.get_min_bids(
+        wb_min_bids = wb_advert.get_min_bids(
             advert_id=int(company.wb_company_id),
             nm_id=nm_id,
             search=False,
@@ -795,6 +842,7 @@ class PromotionService:
 
     def update_company_and_start(self, db: Session, user_id: int, payload: dict) -> dict:
         repo = PromotionRepository(db)
+        wb_advert = self._get_wb_advert(db, user_id)
 
         raw_company_id = payload.get("id_company") or payload.get("company_id")
         if not raw_company_id:
@@ -830,7 +878,7 @@ class PromotionService:
         max_slots = max(int(max_slots), int(photos_count))
 
         # 2) Min bids
-        wb_min_bids = self.wb_advert.get_min_bids(
+        wb_min_bids = wb_advert.get_min_bids(
             advert_id=int(company.wb_company_id),
             nm_id=nm_id,
             search=False,
@@ -907,7 +955,7 @@ class PromotionService:
         repo.set_current_uploaded(company, None)
 
         # 7) Bids
-        self.wb_advert.set_bid(
+        wb_advert.set_bid(
             advert_id=int(company.wb_company_id),
             nm_id=nm_id,
             placement="combined",
@@ -920,12 +968,12 @@ class PromotionService:
         auto_deposit = bool(payload.get("auto_deposit", True))
         if auto_deposit:
             try:
-                wb_budget_info = self.wb_advert.get_campaign_budget(int(company.wb_company_id))
+                wb_budget_info = wb_advert.get_campaign_budget(int(company.wb_company_id))
                 current_budget = int(wb_budget_info.get("total") or 0)
                 if current_budget < int(spend_total):
                     deposit_needed = int(spend_total) - current_budget
                     deposit_amount = int(payload.get("deposit_rub") or deposit_needed or spend_total)
-                    self.wb_advert.deposit_budget(
+                    wb_advert.deposit_budget(
                         advert_id=int(company.wb_company_id),
                         amount_rub=int(deposit_amount),
                         source_type=1,
@@ -937,13 +985,13 @@ class PromotionService:
         # 9) Baseline stats
         begin_date = date.today().isoformat()
         end_date = (date.today() + timedelta(days=1)).isoformat()
-        stats = self.wb_advert.get_fullstats([int(company.wb_company_id)], begin_date=begin_date, end_date=end_date)
+        stats = wb_advert.get_fullstats([int(company.wb_company_id)], begin_date=begin_date, end_date=end_date)
         total_shows, total_clicks = self.parse_stats_totals(stats, advert_id=int(company.wb_company_id))
         repo.update_last_totals(company, shows=total_shows, clicks=total_clicks)
 
         # 10) Start
         try:
-            self.wb_advert.start_campaign(int(company.wb_company_id))
+            wb_advert.start_campaign(int(company.wb_company_id))
             repo.mark_started(company)
 
             logger.info("[update:%s] SUCCESS: %sms", trace_id, int((time.perf_counter() - t0) * 1000))
@@ -980,8 +1028,17 @@ class PromotionService:
 
 
     def get_balance(self, db: Session, user_id: int) -> dict:
-        balance = self.wb_advert.get_balance()
-        return {"balance": balance.get("net")}
+        wb_advert = self._get_wb_advert(db, user_id)
+        try:
+            balance = wb_advert.get_balance() or {}
+        except Exception as e:
+            logger.warning("promotion balance fallback for user_id=%s: %s", user_id, e)
+            return {"balance": 0, "promo_bonus_rub": 0, "error": str(e)}
+
+        return {
+            "balance": int(balance.get("net") or 0),
+            "promo_bonus_rub": int(balance.get("bonus") or 0),
+        }
 
     def company_stats(self, db: Session, user_id: int, company_id: int) -> dict:
         repo = PromotionRepository(db)
@@ -1018,10 +1075,11 @@ class PromotionService:
 
     def company_debug(self, db: Session, user_id: int, company_id: int) -> dict:
         repo = PromotionRepository(db)
+        wb_advert = self._get_wb_advert(db, user_id)
         company = self._load_company_any_id(db, repo, user_id, int(company_id))
 
-        wb_budget = self.wb_advert.get_campaign_budget(int(company.wb_company_id))
-        wb_balance = self.wb_advert.get_balance()
+        wb_budget = wb_advert.get_campaign_budget(int(company.wb_company_id))
+        wb_balance = wb_advert.get_balance()
 
         return {
             "id_company": company.id,
@@ -1034,14 +1092,15 @@ class PromotionService:
 
     def start_company(self, db: Session, user_id: int, company_id: int) -> dict:
         repo = PromotionRepository(db)
+        wb_advert = self._get_wb_advert(db, user_id)
         company = self._load_company_any_id(db, repo, user_id, int(company_id))
 
         try:
-            self.wb_advert.start_campaign(int(company.wb_company_id))
+            wb_advert.start_campaign(int(company.wb_company_id))
 
             begin_date = date.today().isoformat()
             end_date = (date.today() + timedelta(days=1)).isoformat()
-            stats = self.wb_advert.get_fullstats([int(company.wb_company_id)], begin_date=begin_date, end_date=end_date)
+            stats = wb_advert.get_fullstats([int(company.wb_company_id)], begin_date=begin_date, end_date=end_date)
             shows, clicks = self.parse_stats_totals(stats, advert_id=int(company.wb_company_id))
             repo.update_last_totals(company, shows=shows, clicks=clicks)
             repo.mark_started(company)
@@ -1333,7 +1392,7 @@ class PromotionService:
 
         if stop_campaign:
             try:
-                self.wb_advert.stop_campaign(int(company.wb_company_id))
+                self._get_wb_advert(db, int(company.user_id)).stop_campaign(int(company.wb_company_id))
             except Exception:
                 pass
 

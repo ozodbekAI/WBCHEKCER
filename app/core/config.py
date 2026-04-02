@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     MAX_DESCRIPTION_LENGTH: int = 1800
     MIN_PHOTOS_COUNT: int = 3
     RECOMMENDED_PHOTOS_COUNT: int = 6
+    MEDIA_WARNING_PHOTOS_COUNT: int = 30
     
     # Gemini AI Settings
     GEMINI_API_KEY: str = ""
@@ -82,7 +83,7 @@ class Settings(BaseSettings):
 
     # Media / public URL (used by photo chat + photo assets)
     MEDIA_ROOT: str = str((BASE_DIR / "media").resolve())
-    PUBLIC_BASE_URL: str = "http://localhost:8003"
+    PUBLIC_BASE_URL: str = "http://localhost:8002"
 
     # Frontend URL (used in email invite links)
     FRONTEND_URL: str = "http://localhost:3001"

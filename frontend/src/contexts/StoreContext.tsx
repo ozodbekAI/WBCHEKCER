@@ -14,6 +14,7 @@ interface StoreContextType {
 }
 
 const StoreContext = createContext<StoreContextType | null>(null);
+const ACTIVE_STORE_KEY = 'avemod_active_store_id';
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, loading: authLoading } = useAuth();
@@ -28,7 +29,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     try {
       const data = await api.getStores();
       setStores(data);
-      if (data.length > 0 && !activeStore) {
+      const storedId = Number(localStorage.getItem(ACTIVE_STORE_KEY) || 0);
+      const preferred = data.find(s => s.id === storedId);
+      if (preferred) {
+        setActiveStore(preferred);
+      } else if (activeStore) {
+        const refreshed = data.find(s => s.id === activeStore.id);
+        setActiveStore(refreshed || data[0] || null);
+      } else if (data.length > 0) {
         setActiveStore(data[0]);
       }
     } catch (e) {
@@ -39,13 +47,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [activeStore]);
 
-  // Auto-load stores once auth is ready and user is authenticated
+  useEffect(() => {
+    if (activeStore) {
+      localStorage.setItem(ACTIVE_STORE_KEY, String(activeStore.id));
+    } else {
+      localStorage.removeItem(ACTIVE_STORE_KEY);
+    }
+  }, [activeStore]);
+
   useEffect(() => {
     if (!authLoading && isAuthenticated && !loadedOnce.current) {
       loadedOnce.current = true;
       loadStores();
     }
-    // Reset when user logs out so stores reload on next login
     if (!isAuthenticated && !authLoading) {
       loadedOnce.current = false;
       setStoresReady(false);

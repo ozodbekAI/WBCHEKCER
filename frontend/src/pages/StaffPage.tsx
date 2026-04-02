@@ -112,8 +112,7 @@ function ProgressBar({ value, max = 100, color = '#6366f1', height = 6, label }:
   );
 }
 
-export default function StaffPage() {
-  const navigate = useNavigate();
+export function StaffContent() {
   const { activeStore } = useStore();
   const [data, setData] = useState<TeamActivity | null>(null);
   const [loading, setLoading] = useState(true);
@@ -135,8 +134,6 @@ export default function StaffPage() {
   }, [activeStore]);
 
   useEffect(() => { load(); }, [load]);
-
-  // Auto-refresh every 30s
   useEffect(() => {
     const iv = setInterval(() => setTick(t => t + 1), 30_000);
     return () => clearInterval(iv);
@@ -149,35 +146,7 @@ export default function StaffPage() {
   const todayFixers = members.filter(m => m.fixes_today > 0).length;
 
   return (
-    <div style={{ minHeight: '100vh', background: 'var(--bg-secondary, #f9fafb)' }}>
-      {/* Header */}
-      <div style={{
-        background: 'white', borderBottom: '1px solid #e5e7eb',
-        padding: '12px 24px', display: 'flex', alignItems: 'center', gap: 12, position: 'sticky', top: 0, zIndex: 10
-      }}>
-        <button
-          onClick={() => navigate('/workspace')}
-          style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 6, borderRadius: 8, display: 'flex', color: '#374151' }}
-        >
-          <ArrowLeft size={20} />
-        </button>
-        <Users size={20} color="#6366f1" />
-        <div>
-          <h1 style={{ fontSize: 18, fontWeight: 700, margin: 0 }}>Сотрудники</h1>
-          <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>
-            {activeStore?.name || 'Магазин'} · {onlineCount} онлайн из {members.length}
-          </p>
-        </div>
-        <button
-          onClick={load}
-          style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', padding: 6, borderRadius: 8, color: '#6b7280' }}
-          title="Обновить"
-        >
-          <RefreshCw size={16} />
-        </button>
-      </div>
-
-      <div style={{ maxWidth: 900, margin: '0 auto', padding: '24px 16px' }}>
+    <div>
         {loading && (
           <div style={{ textAlign: 'center', padding: '60px 0', color: '#6b7280' }}>
             <div className="spinner" style={{ margin: '0 auto 12px' }} />
@@ -363,6 +332,15 @@ export default function StaffPage() {
             </div>
           </>
         )}
+    </div>
+  );
+}
+
+export default function StaffPage() {
+  return (
+    <div className="min-h-screen bg-background">
+      <div className="max-w-[900px] mx-auto px-4 py-6">
+        <StaffContent />
       </div>
     </div>
   );

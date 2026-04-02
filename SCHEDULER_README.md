@@ -35,7 +35,7 @@ Agar siz kartochkani to'g'rilab WB'ga yuklasangiz:
 
 ### API orqali:
 ```bash
-curl http://localhost:8003/api/scheduler/status
+curl http://localhost:8002/api/scheduler/status
 ```
 
 Javob:
@@ -82,7 +82,7 @@ DEBUG=true
 ### Scheduler ishlamayapti
 1. Server ishga tushganini tekshiring:
    ```bash
-   curl http://localhost:8003/health
+   curl http://localhost:8002/health
    ```
 
 2. Loglarni tekshiring:
@@ -92,7 +92,7 @@ DEBUG=true
 
 3. Status API'ni tekshiring:
    ```bash
-   curl http://localhost:8003/api/scheduler/status
+   curl http://localhost:8002/api/scheduler/status
    ```
 
 ### WB API xatolari
@@ -110,7 +110,7 @@ DEBUG=true
 - Manual test qilish:
   ```bash
   # WB'da kartochkani o'zgartiring, keyin
-  curl -X POST http://localhost:8003/api/stores/1/sync
+  curl -X POST http://localhost:8002/api/stores/1/sync
   ```
 
 ## Manual Sinxronizatsiya
@@ -135,7 +135,7 @@ Scheduler faqat server qayta ishga tushganda to'xtaydi va qayta ishga tushadi:
 ```bash
 # Server restart
 pkill -f "uvicorn app.main:app"
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8003
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8002
 ```
 
 Scheduler avtomatik qayta ishga tushadi `lifespan` hook orqali.

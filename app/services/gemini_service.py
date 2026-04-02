@@ -1182,6 +1182,7 @@ SEO-КЛЮЧЕВЫЕ СЛОВА КАТЕГОРИИ "{subject}" (использу
         card: Dict[str, Any],
         product_dna: str = "",
         seo_keywords: list = None,
+        extra_instructions: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, int]]:
         """
         Generate a fresh description for a WB card from scratch using AI.
@@ -1218,6 +1219,13 @@ SEO-КЛЮЧЕВЫЕ СЛОВА КАТЕГОРИИ "{subject}" (обязател
 {', '.join(kw_sample)}
 """
 
+        instructions_block = ""
+        if extra_instructions:
+            instructions_block = f"""
+ДОПОЛНИТЕЛЬНЫЕ ИНСТРУКЦИИ ПОЛЬЗОВАТЕЛЯ:
+{extra_instructions[:1200]}
+"""
+
         prompt = f"""
 ЗАДАЧА: Создай описание товара для Wildberries на основе характеристик карточки.
 
@@ -1233,6 +1241,7 @@ SEO-КЛЮЧЕВЫЕ СЛОВА КАТЕГОРИИ "{subject}" (обязател
 
 {"" if not product_dna else "ВИЗУАЛЬНОЕ ОПИСАНИЕ ТОВАРА (из фото):" + chr(10) + product_dna[:1500]}
 {kw_block}
+{instructions_block}
 СТРОГИЕ ПРАВИЛА:
 • Длина: 1000–1800 символов
 • Формат: 3–6 абзацев, без списков, маркеров, нумерации
@@ -1440,4 +1449,3 @@ def get_ai_service():
         from .gpt_service import get_gpt_service
         return get_gpt_service()
     return get_gemini_service()
-

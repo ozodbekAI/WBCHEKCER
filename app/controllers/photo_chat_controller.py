@@ -46,8 +46,8 @@ def _sse(event: str, data: Dict[str, Any]) -> str:
 
 MAX_REMOTE_BYTES = 15 * 1024 * 1024
 
-# Chat message cap (hard-stop). When reached, the user must delete/clear messages.
-MAX_CHAT_MESSAGES = 100
+# Chat history is intentionally unlimited. Set an integer to restore a hard cap.
+MAX_CHAT_MESSAGES: Optional[int] = None
 
 ALLOWED_REMOTE_HOST_SUFFIXES = (
     "wbbasket.ru",
@@ -101,6 +101,10 @@ def _resolve_local_media_path(source_url: str) -> Optional[Path]:
     if not str(full_path).startswith(str(media_root) + os.sep) and full_path != media_root:
         return None
     return full_path
+
+
+def _is_chat_locked(message_count: int) -> bool:
+    return MAX_CHAT_MESSAGES is not None and message_count >= MAX_CHAT_MESSAGES
 
 
 async def _download_image_bytes(source_url: str) -> Tuple[bytes, str]:
@@ -855,12 +859,12 @@ class PhotoChatController:
         repo = PhotoChatRepository(db)
         sess = repo.get_or_create_user_session(uid)
 
-        # Hard-stop when the chat is too long (user must delete/clear messages).
+        # Optional hard-stop for installations that want to cap chat history.
         try:
             msg_count = repo.count_messages(sess.id)
         except Exception:
             msg_count = len(repo.list_messages(sess.id, limit=None))
-        if msg_count >= MAX_CHAT_MESSAGES:
+        if _is_chat_locked(msg_count):
             yield _sse(
                 "message",
                 {
@@ -1504,7 +1508,7 @@ class PhotoChatController:
                 }
             )
 
-        # Count messages for client-side lock UX.
+        # Return message stats for the client.
         try:
             msg_count = repo.count_messages(sess.id)
         except Exception:
@@ -1514,7 +1518,7 @@ class PhotoChatController:
             "session_key": str(int(uid)),
             "message_count": msg_count,
             "limit": MAX_CHAT_MESSAGES,
-            "locked": bool(msg_count >= MAX_CHAT_MESSAGES),
+            "locked": _is_chat_locked(msg_count),
             "messages": messages,
             "assets": assets,
         }
@@ -1554,7 +1558,7 @@ class PhotoChatController:
             "deleted_media": 0,
             "message_count": msg_count,
             "limit": MAX_CHAT_MESSAGES,
-            "locked": bool(msg_count >= MAX_CHAT_MESSAGES),
+            "locked": _is_chat_locked(msg_count),
         }
 
     async def clear_history(self, *, user: Any, db) -> Dict[str, Any]:
@@ -1583,5 +1587,5 @@ class PhotoChatController:
             "deleted_media": 0,
             "message_count": msg_count,
             "limit": MAX_CHAT_MESSAGES,
-            "locked": bool(msg_count >= MAX_CHAT_MESSAGES),
+            "locked": _is_chat_locked(msg_count),
         }

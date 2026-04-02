@@ -759,6 +759,7 @@ CARD JSON:
         card: Dict[str, Any],
         product_dna: str = "",
         seo_keywords: list = None,
+        extra_instructions: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, int]]:
         if not self.is_enabled():
             return {}, _EMPTY_TOKENS
@@ -788,6 +789,10 @@ CARD JSON:
         if seo_keywords:
             kw_block = f"\nSEO-КЛЮЧЕВЫЕ СЛОВА КАТЕГОРИИ \"{subject}\" (обязательно включи минимум 2-3 из них естественно):\n{', '.join(seo_keywords[:20])}\n"
 
+        instructions_block = ""
+        if extra_instructions:
+            instructions_block = f"\nДОПОЛНИТЕЛЬНЫЕ ИНСТРУКЦИИ ПОЛЬЗОВАТЕЛЯ:\n{extra_instructions[:1200]}\n"
+
         prompt = f"""
 ЗАДАЧА: Создай описание товара для Wildberries на основе характеристик карточки.
 
@@ -800,7 +805,7 @@ CARD JSON:
 {json.dumps(char_hints, ensure_ascii=False)}
 
 {'Техническое описание (источник истины):' + chr(10) + tech_desc[:1000] if tech_desc else ''}
-{dna_block}{kw_block}
+{dna_block}{kw_block}{instructions_block}
 СТРОГИЕ ПРАВИЛА:
 • Длина: 1000–1800 символов
 • Формат: 3–6 абзацев, без списков, маркеров, нумерации

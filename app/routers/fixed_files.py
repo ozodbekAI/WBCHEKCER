@@ -267,6 +267,8 @@ async def generate_fixed_from_photo(
         has_openai=vision_service.is_enabled,
     )
 
+
+@router.post("/recheck/{nm_id}")
 async def recheck_card_fixed(
     nm_id: int,
     store: Store = Depends(_get_store),

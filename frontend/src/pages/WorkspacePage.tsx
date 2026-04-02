@@ -4,41 +4,24 @@ import { useStore } from '../contexts/StoreContext';
 import { useAuth } from '../contexts/AuthContext';
 import api, { API_ORIGIN } from '../api/client';
 import type { WorkspaceDashboard, StoreStats, TeamActivity } from '../types';
-import { startSession, flushActiveSession, trackAction, getStats, formatDuration } from '../hooks/useActivityTracker';
+import { useWorkTracker, formatDuration } from '../hooks/useWorkTracker';
 import SettingsPanel from './SettingsPanel';
 import {
-  ClipboardList,
-  Circle,
-  CheckSquare,
-  LayoutGrid,
-  FlaskConical,
-  Camera,
-  MessageCircle,
-  TrendingUp,
-  Activity,
-  ChevronDown,
-  Settings,
-  Clock,
-  ChevronRight,
-  AlertTriangle,
-  CheckCircle2,
-  Info,
-  SlidersHorizontal,
-  Sparkles,
-  X,
-  Check,
-  Users,
-  ClipboardCheck,
-  Shield,
-  LogOut,
-  User,
-  Crown,
-  Briefcase,
-  Eye,
-  Wrench,
-  Zap,
-  FileCheck,
+  ClipboardList, Circle, CheckSquare, LayoutGrid, FlaskConical, Camera,
+  MessageCircle, TrendingUp, Activity, ChevronDown, Settings, Clock,
+  ChevronRight, AlertTriangle, CheckCircle2, Info, SlidersHorizontal,
+  Sparkles, X, Check, Users, ClipboardCheck, Shield, LogOut, User,
+  Crown, Briefcase, Eye, Wrench, Zap, FileCheck,
 } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
+} from '@/components/ui/dialog';
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 
 export default function WorkspacePage() {
   const navigate = useNavigate();
@@ -48,68 +31,30 @@ export default function WorkspacePage() {
   const [stats, setStats] = useState<StoreStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [showStoreMenu, setShowStoreMenu] = useState(false);
-  const [showProfile, setShowProfile] = useState(false);
-  const profileRef = useRef<HTMLDivElement>(null);
   const [modeModalOpen, setModeModalOpen] = useState(false);
   const [workMode, setWorkMode] = useState<'guided' | 'advanced'>('guided');
   const [startTarget, setStartTarget] = useState<'critical' | 'incoming' | 'cards' | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [todayMin, setTodayMin] = useState(0);
+  const { todayStats, isActive, currentSessionTimeMs, logAction: doLogAction } = useWorkTracker();
   const [teamActivity, setTeamActivity] = useState<TeamActivity | null>(null);
   const [myPendingCount, setMyPendingCount] = useState(0);
+  const [hasFixedFile, setHasFixedFile] = useState<boolean | null>(null);
 
   const avatarUrl = user?.avatar_url
     ? (/^https?:\/\//i.test(user.avatar_url) ? user.avatar_url : `${API_ORIGIN}${user.avatar_url.startsWith('/') ? '' : '/'}${user.avatar_url}`)
     : '';
 
-  // Activity tracking
-  useEffect(() => {
-    startSession(activeStore?.id ?? null);
-    const updateToday = () => {
-      const s = getStats(1);
-      setTodayMin(s.totalMinutes);
-    };
-    updateToday();
-    const iv = setInterval(updateToday, 30_000);
-
-    const handleUnload = () => flushActiveSession();
-    const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') flushActiveSession();
-      else startSession(activeStore?.id ?? null);
-    };
-    window.addEventListener('beforeunload', handleUnload);
-    document.addEventListener('visibilitychange', handleVisibility);
-    return () => {
-      clearInterval(iv);
-      window.removeEventListener('beforeunload', handleUnload);
-      document.removeEventListener('visibilitychange', handleVisibility);
-      flushActiveSession();
-    };
-  }, [activeStore]);
-
-  // Close profile dropdown on outside click
-  useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (profileRef.current && !profileRef.current.contains(e.target as Node)) {
-        setShowProfile(false);
-      }
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, []);
+  // Activity tracking removed — useWorkTracker handles sessions automatically
 
   useEffect(() => {
     if (activeStore) loadDashboard();
     else if (!activeStore && stores.length === 0) setLoading(false);
   }, [activeStore, stores.length]);
 
-  // Reload dashboard when background sync completes
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
-      if (activeStore && detail?.storeId === activeStore.id) {
-        loadDashboard();
-      }
+      if (activeStore && detail?.storeId === activeStore.id) loadDashboard();
     };
     window.addEventListener('syncCompleted', handler);
     return () => window.removeEventListener('syncCompleted', handler);
@@ -125,14 +70,15 @@ export default function WorkspacePage() {
       ]);
       setDashboard(dashData);
       setStats(statsData);
-      // Load team activity for owners/managers
       if (hasAnyPermission('team.view', 'team.manage')) {
-        try {
-          const ta = await api.getTeamActivity(activeStore.id);
-          setTeamActivity(ta);
-        } catch {}
+        try { setTeamActivity(await api.getTeamActivity(activeStore.id)); } catch {}
       }
-      // Load manager's own pending approvals count
+      if (isRole('admin', 'owner', 'head_manager')) {
+        try {
+          const fs = await api.getFixedFileStatus(activeStore.id);
+          setHasFixedFile(fs.has_fixed_file);
+        } catch { setHasFixedFile(null); }
+      }
       if (!hasPermission('cards.approve')) {
         try {
           const approvalData = await api.getApprovals(activeStore.id, { status: 'pending', limit: 1 });
@@ -150,35 +96,27 @@ export default function WorkspacePage() {
 
   if (!activeStore && !loading && stores.length === 0) {
     return (
-      <div className="ws-empty-state">
-        <LayoutGrid size={48} className="ws-empty-icon" />
-        <h3>Нет подключённых магазинов</h3>
-        <p>
+      <div className="flex flex-col items-center justify-center min-h-screen gap-4 text-center px-10">
+        <LayoutGrid size={48} className="text-muted-foreground" />
+        <h3 className="text-xl font-bold text-foreground">Нет подключённых магазинов</h3>
+        <p className="text-sm text-muted-foreground max-w-sm">
           {canConnectStore
             ? 'Подключите магазин Wildberries, чтобы начать оптимизацию карточек'
             : 'Подключать магазин может только пользователь с ролью Owner'}
         </p>
         {canConnectStore && (
-          <button className="ws-btn ws-btn-primary ws-btn-lg" onClick={() => navigate('/onboard')}>
-            Подключить магазин
-          </button>
+          <Button size="lg" onClick={() => navigate('/onboard')}>Подключить магазин</Button>
         )}
-        <button
-          className="ws-btn ws-btn-lg"
-          style={{ marginTop: canConnectStore ? 10 : 0, color: '#6b7280', background: 'none', border: '1px solid #e5e7eb' }}
-          onClick={() => logout()}
-        >
-          Выйти из аккаунта
-        </button>
+        <Button variant="outline" size="lg" onClick={() => logout()}>Выйти из аккаунта</Button>
       </div>
     );
   }
 
   if (loading || !dashboard) {
     return (
-      <div className="ws-loading">
-        <div className="ws-spinner" />
-        <span>Загрузка рабочего пространства...</span>
+      <div className="flex flex-col items-center justify-center min-h-screen gap-3 text-muted-foreground">
+        <div className="w-8 h-8 border-3 border-border border-t-primary rounded-full animate-spin" />
+        <span className="text-sm">Загрузка рабочего пространства...</span>
       </div>
     );
   }
@@ -187,17 +125,9 @@ export default function WorkspacePage() {
   const warningsCount = stats?.warnings_count || 0;
 
   const openModeModal = (target: 'critical' | 'incoming' | 'cards') => {
-    trackAction();
-    // Для критичных и входящих — сразу переходим без модалки
-    if (target === 'critical') {
-      navigate('/workspace/fix/critical');
-      return;
-    }
-    if (target === 'incoming') {
-      navigate('/workspace/incoming');
-      return;
-    }
-    // Только для "По карточкам" показываем выбор режима
+    doLogAction('card_opened', `Открыт раздел: ${target}`);
+    if (target === 'critical') { navigate('/workspace/fix/critical'); return; }
+    if (target === 'incoming') { navigate('/workspace/incoming'); return; }
     setStartTarget(target);
     setWorkMode('guided');
     setModeModalOpen(true);
@@ -205,576 +135,403 @@ export default function WorkspacePage() {
 
   const startByMode = () => {
     if (!startTarget) return;
-    if (workMode === 'guided') {
-      navigate('/workspace/cards/queue');
-    } else {
-      navigate('/workspace/cards');
-    }
+    navigate(workMode === 'guided' ? '/workspace/cards/queue' : '/workspace/cards');
     setModeModalOpen(false);
   };
 
+  const roleLabels: Record<string, string> = {
+    admin: 'Администратор', owner: 'Владелец', head_manager: 'Старший менеджер',
+    manager: 'Менеджер', viewer: 'Наблюдатель', user: 'Пользователь',
+  };
+
+  const roleIcons: Record<string, React.ReactNode> = {
+    admin: <Crown size={14} />, owner: <Crown size={14} />,
+    head_manager: <Shield size={14} />, manager: <Briefcase size={14} />,
+    viewer: <Eye size={14} />,
+  };
+
   return (
-    <div className="ws-root">
+    <div className="min-h-screen bg-background">
       {/* ═══════════ Header ═══════════ */}
-      <header className="ws-header">
-        <div className="ws-header-left">
-          <div className="ws-logo">WB</div>
+      <header className="h-14 flex items-center justify-between px-6 bg-card border-b border-border sticky top-0 z-50 backdrop-blur-sm">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-[10px] bg-gradient-to-br from-primary to-primary/80 text-primary-foreground font-extrabold text-sm flex items-center justify-center">
+            WB
+          </div>
 
           {/* Store selector */}
-          <div className="ws-store-selector" onClick={() => setShowStoreMenu(!showStoreMenu)}>
-            <span className="ws-store-name">Магазин &quot;{activeStore?.name || '...'}&quot;</span>
-            <ChevronDown size={16} />
-
-            {showStoreMenu && (
-              <div className="ws-store-dropdown" onClick={e => e.stopPropagation()}>
-                {stores.map(s => (
-                  <div
-                    key={s.id}
-                    className={`ws-store-item ${s.id === activeStore?.id ? 'ws-store-item--active' : ''}`}
-                    onClick={() => { selectStore(s.id); setShowStoreMenu(false); }}
-                  >
+          <DropdownMenu open={showStoreMenu} onOpenChange={setShowStoreMenu}>
+            <DropdownMenuTrigger asChild>
+              <button className="flex items-center gap-1.5 text-[15px] font-semibold text-foreground px-2 py-1 rounded-lg hover:bg-muted transition-colors">
+                Магазин &quot;{activeStore?.name || '...'}&quot;
+                <ChevronDown size={16} className="text-muted-foreground" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="min-w-[240px]">
+              {stores.map(s => (
+                <DropdownMenuItem
+                  key={s.id}
+                  className={s.id === activeStore?.id ? 'bg-primary/10 font-semibold' : ''}
+                  onClick={() => { selectStore(s.id); setShowStoreMenu(false); }}
+                >
+                  <div>
                     <span>{s.name}</span>
-                    <span className="ws-store-meta">{s.total_cards} карточек</span>
+                    <span className="block text-xs text-muted-foreground font-normal mt-0.5">{s.total_cards} карточек</span>
                   </div>
-                ))}
-                {canConnectStore && (
-                  <div
-                    className="ws-store-add"
-                    onClick={() => {
-                      setShowStoreMenu(false);
-                      navigate('/onboard');
-                    }}
-                  >
+                </DropdownMenuItem>
+              ))}
+              {canConnectStore && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => navigate('/onboard')} className="text-primary font-medium">
                     + Добавить магазин
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
+                  </DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
 
-        <div className="ws-header-right">
-          <div className="ws-header-time">
-            <Clock size={14} />
-            <span>Сегодня: {formatDuration(todayMin)}</span>
-          </div>
-          <button className="ws-header-btn ws-header-btn--text" title="Profile" onClick={() => navigate('/workspace/profile')}>
-            <User size={16} />
-            <span>Profile</span>
-          </button>
-          <button className="ws-header-btn" title="Настройки" onClick={() => setSettingsOpen(true)}>
-            <Settings size={18} />
-          </button>
-
-          {/* Profile */}
-          <div className="ws-profile" ref={profileRef}>
-            <button
-              className="ws-profile-trigger"
-              onClick={() => setShowProfile(!showProfile)}
-              title={user?.first_name || user?.email || 'Профиль'}
-            >
-              <div className="ws-profile-avatar">
-                {avatarUrl ? <img src={avatarUrl} alt="avatar" className="ws-profile-avatar-img" /> : (user?.first_name ? user.first_name.charAt(0).toUpperCase() : <User size={16} />)}
-              </div>
-            </button>
-
-            {showProfile && user && (
-              <div className="ws-profile-dropdown">
-                {/* User info */}
-                <div className="ws-profile-info">
-                  <div className="ws-profile-avatar-lg">
-                    {avatarUrl ? <img src={avatarUrl} alt="avatar" className="ws-profile-avatar-img" /> : (user.first_name ? user.first_name.charAt(0).toUpperCase() : <User size={22} />)}
-                  </div>
-                  <div className="ws-profile-details">
-                    <span className="ws-profile-name">
-                      {user.first_name || 'Пользователь'} {user.last_name || ''}
-                    </span>
-                    <span className="ws-profile-email">{user.email}</span>
-                  </div>
-                </div>
-
-                {/* Role badge */}
-                <div className="ws-profile-role-section">
-                  <span className="ws-profile-role-label">Роль</span>
-                  <div className={`ws-profile-role-badge ws-profile-role--${user.role}`}>
-                    {user.role === 'admin' || user.role === 'owner' ? <Crown size={14} /> :
-                     user.role === 'head_manager' ? <Shield size={14} /> :
-                     user.role === 'manager' ? <Briefcase size={14} /> :
-                     user.role === 'viewer' ? <Eye size={14} /> :
-                     <User size={14} />}
-                    <span>{{
-                      admin: 'Администратор',
-                      owner: 'Владелец',
-                      head_manager: 'Старший менеджер',
-                      manager: 'Менеджер',
-                      viewer: 'Наблюдатель',
-                      user: 'Пользователь',
-                    }[user.role] || user.role}</span>
-                  </div>
-                  {hasPermission('team.manage') && (
-                    <button
-                      className="ws-profile-role-manage"
-                      onClick={() => { setShowProfile(false); navigate('/workspace/team'); }}
-                      title="Управление ролями"
-                    >
-                      <Settings size={12} />
-                    </button>
-                  )}
-                </div>
-
-                {/* Permissions summary */}
-                <div className="ws-profile-perms">
-                  <span className="ws-profile-perms-label">Доступ</span>
-                  <div className="ws-profile-perms-list">
-                    {(user.permissions || []).includes('*') ? (
-                      <span className="ws-profile-perm-tag ws-profile-perm--full">Полный доступ</span>
-                    ) : (
-                      <>
-                        {hasPermission('cards.edit') && <span className="ws-profile-perm-tag">Карточки</span>}
-                        {hasPermission('cards.approve') && <span className="ws-profile-perm-tag">Одобрение</span>}
-                        {hasPermission('issues.fix') && <span className="ws-profile-perm-tag">Исправления</span>}
-                        {hasPermission('photos.manage') && <span className="ws-profile-perm-tag">Фото</span>}
-                        {hasPermission('team.manage') && <span className="ws-profile-perm-tag">Команда</span>}
-                        {hasPermission('dashboard.view') && <span className="ws-profile-perm-tag">Дашборд</span>}
-                      </>
-                    )}
-                  </div>
-                </div>
-
-                <div className="ws-profile-divider" />
-
-                {/* Quick links */}
-                <button className="ws-profile-action" onClick={() => { setShowProfile(false); navigate('/workspace/profile'); }}>
-                  <User size={16} />
-                  <span>Profile</span>
-                </button>
-                {hasAnyPermission('team.view', 'team.manage') && (
-                  <button className="ws-profile-action" onClick={() => { setShowProfile(false); navigate('/workspace/staff'); }}>
-                    <Users size={16} />
-                    <span>Сотрудники</span>
-                  </button>
-                )}
-                {hasAnyPermission('team.view', 'team.manage') && (
-                  <button className="ws-profile-action" onClick={() => { setShowProfile(false); navigate('/workspace/team'); }}>
-                    <Settings size={16} />
-                    <span>Управление командой</span>
-                  </button>
-                )}
-                <button className="ws-profile-action" onClick={() => { setShowProfile(false); setSettingsOpen(true); }}>
-                  <Activity size={16} />
-                  <span>Моя активность</span>
-                </button>
-
-                <div className="ws-profile-divider" />
-
-                <button className="ws-profile-action ws-profile-action--danger" onClick={() => { setShowProfile(false); logout(); }}>
-                  <LogOut size={16} />
-                  <span>Выйти</span>
-                </button>
-              </div>
+        <div className="flex items-center gap-3">
+          <button
+            className="flex items-center gap-1.5 text-xs text-muted-foreground bg-muted px-3 py-1.5 rounded-full border border-border hover:border-muted-foreground/40 transition-colors cursor-pointer"
+            onClick={() => setSettingsOpen(true)}
+            title="Моя активность"
+          >
+            {isActive ? (
+              <>
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500" />
+                </span>
+                {formatDuration(currentSessionTimeMs)}
+              </>
+            ) : (
+              <>
+                <Clock size={14} />
+                Сегодня: {formatDuration(todayStats.totalTimeMs)}
+              </>
             )}
-          </div>
+          </button>
+
+
+
+          {/* Profile dropdown */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button className="relative rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                <Avatar className="h-9 w-9 shadow-sm">
+                  {avatarUrl && <AvatarImage src={avatarUrl} alt="avatar" />}
+                  <AvatarFallback className="bg-gradient-to-br from-primary to-primary/80 text-primary-foreground font-bold text-sm">
+                    {user?.first_name ? user.first_name.charAt(0).toUpperCase() : <User size={16} />}
+                  </AvatarFallback>
+                </Avatar>
+                {hasFixedFile === false && isRole('admin', 'owner', 'head_manager') && (
+                  <span className="absolute -top-0.5 -right-0.5 flex h-3 w-3">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-zone-yellow opacity-75" />
+                    <span className="relative inline-flex rounded-full h-3 w-3 bg-zone-yellow border-2 border-background" />
+                  </span>
+                )}
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-[280px] p-1.5 rounded-xl">
+              {user && (
+                <>
+                  {/* User card */}
+                  <div className="flex items-center gap-3 px-3.5 py-3 mb-1">
+                    <Avatar className="h-10 w-10 ring-2 ring-border">
+                      {avatarUrl && <AvatarImage src={avatarUrl} alt="avatar" />}
+                      <AvatarFallback className="bg-gradient-to-br from-primary to-primary/80 text-primary-foreground font-bold text-base">
+                        {user.first_name ? user.first_name.charAt(0).toUpperCase() : <User size={18} />}
+                      </AvatarFallback>
+                    </Avatar>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-semibold text-foreground truncate">
+                        {user.first_name || 'Пользователь'} {user.last_name || ''}
+                      </div>
+                      <div className="text-xs text-muted-foreground truncate">{user.email}</div>
+                    </div>
+                    <Badge variant="secondary" className="gap-1 text-[11px] h-6 flex-shrink-0">
+                      {roleIcons[user.role] || <User size={12} />}
+                      {roleLabels[user.role] || user.role}
+                    </Badge>
+                  </div>
+
+                  <DropdownMenuSeparator className="mx-1.5" />
+
+                  <DropdownMenuItem onClick={() => navigate('/workspace/profile')} className="gap-2.5 px-3.5 py-2.5 rounded-lg mx-0.5 cursor-pointer">
+                    <User size={16} className="text-muted-foreground" /> Профиль
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setSettingsOpen(true)} className="gap-2.5 px-3.5 py-2.5 rounded-lg mx-0.5 cursor-pointer">
+                    <Activity size={16} className="text-muted-foreground" /> Моя активность
+                  </DropdownMenuItem>
+                  {hasAnyPermission('team.view', 'team.manage') && (
+                    <DropdownMenuItem onClick={() => navigate('/management')} className="gap-2.5 px-3.5 py-2.5 rounded-lg mx-0.5 cursor-pointer">
+                      <Users size={16} className="text-muted-foreground" /> Управление
+                    </DropdownMenuItem>
+                  )}
+                  {isRole('admin', 'owner', 'head_manager') && (
+                    <DropdownMenuItem onClick={() => navigate('/workspace/fixed-file')} className="gap-2.5 px-3.5 py-2.5 rounded-lg mx-0.5 cursor-pointer">
+                      <FileCheck size={16} className={hasFixedFile === false ? 'text-zone-yellow' : 'text-muted-foreground'} />
+                      <span className="flex-1">Эталонные значения</span>
+                      {hasFixedFile === false && (
+                        <Badge variant="outline" className="ml-auto text-[10px] h-5 px-1.5 border-zone-yellow/30 bg-zone-yellow/10 text-zone-yellow font-medium">
+                          <AlertTriangle size={10} className="mr-1" />
+                          Не загружен
+                        </Badge>
+                      )}
+                    </DropdownMenuItem>
+                  )}
+
+                  <DropdownMenuSeparator className="mx-1.5" />
+
+                  <DropdownMenuItem onClick={() => logout()} className="gap-2.5 px-3.5 py-2.5 rounded-lg mx-0.5 text-destructive focus:text-destructive cursor-pointer">
+                    <LogOut size={16} /> Выйти
+                  </DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </header>
 
       {/* ═══════════ Content ═══════════ */}
-      <main className="ws-main">
-        {/* Section title */}
-        <div className="ws-section-title">
-          <ClipboardList size={22} />
-          <h1>Ваши задачи на сегодня</h1>
+      <main className="max-w-[1100px] mx-auto px-6 py-7">
+
+
+
+        {/* ═══════════ Tasks ═══════════ */}
+        <div className="flex items-center gap-2.5 mb-1.5">
+          <ClipboardList size={22} className="text-foreground" />
+          <h1 className="text-xl font-bold text-foreground">Ваши задачи на сегодня</h1>
         </div>
-        <p className="ws-section-sub">Выберите категорию для начала работы</p>
+        <p className="text-sm text-muted-foreground mb-6">Выберите категорию для начала работы</p>
 
-        {/* ═══════════ Task Cards ═══════════ */}
-        <div className="ws-tasks">
-          {/* Critical */}
-          <div className="ws-task-card ws-task-card--critical">
-            <div className="ws-task-top">
-              <div className="ws-task-icon ws-task-icon--critical">
-                <Circle size={20} />
-              </div>
-              <div className="ws-task-nums">
-                <div className="ws-task-num">
-                  <span className="ws-task-val ws-task-val--critical">{dashboard.critical.issues_count}</span>
-                  <span className="ws-task-label">проблем</span>
-                </div>
-                <div className="ws-task-num">
-                  <span className="ws-task-val">{dashboard.critical.cards_count}</span>
-                  <span className="ws-task-label">карточек</span>
-                </div>
-              </div>
-            </div>
-            <h3 className="ws-task-title">Критичные</h3>
-            <p className="ws-task-desc">Блокируют показы или продажи</p>
-            <button className="ws-btn ws-btn-danger" onClick={() => openModeModal('critical')}>
-              Начать
-            </button>
-          </div>
-
-          {/* Incoming */}
-          <div className="ws-task-card ws-task-card--incoming">
-            <div className="ws-task-top">
-              <div className="ws-task-icon ws-task-icon--incoming">
-                <CheckSquare size={20} />
-              </div>
-              <div className="ws-task-nums">
-                <div className="ws-task-num">
-                  <span className="ws-task-val ws-task-val--incoming">{dashboard.incoming.issues_count}</span>
-                  <span className="ws-task-label">проблем</span>
-                </div>
-                <div className="ws-task-num">
-                  <span className="ws-task-val">{dashboard.incoming.cards_count}</span>
-                  <span className="ws-task-label">карточек</span>
-                </div>
-              </div>
-            </div>
-            <h3 className="ws-task-title">Входящие</h3>
-            <p className="ws-task-desc">Новые задачи на проверку</p>
-            <button className="ws-btn ws-btn-primary" onClick={() => openModeModal('incoming')}>
-              Начать
-            </button>
-          </div>
-
-          {/* By cards */}
-          <div className="ws-task-card ws-task-card--cards">
-            <div className="ws-task-top">
-              <div className="ws-task-icon ws-task-icon--cards">
-                <LayoutGrid size={20} />
-              </div>
-              <div className="ws-task-nums">
-                <div className="ws-task-num">
-                  <span className="ws-task-val">{dashboard.by_cards.cards_count}</span>
-                  <span className="ws-task-label">карточек</span>
-                </div>
-              </div>
-            </div>
-            <h3 className="ws-task-title">По карточкам</h3>
-            <p className="ws-task-desc">Улучшения для каждой карточки</p>
-            <button className="ws-btn ws-btn-purple" onClick={() => openModeModal('cards')}>
-              Начать
-            </button>
-          </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+          <TaskCard
+            borderHover="hover:border-destructive"
+            iconBg="bg-destructive"
+            icon={<Circle size={20} />}
+            stats={[
+              { value: dashboard.critical.issues_count, label: 'проблем', color: 'text-destructive' },
+              { value: dashboard.critical.cards_count, label: 'карточек' },
+            ]}
+            title="Критичные"
+            desc="Блокируют показы или продажи"
+            btnVariant="destructive"
+            onStart={() => openModeModal('critical')}
+          />
+          <TaskCard
+            borderHover="hover:border-primary"
+            iconBg="bg-primary"
+            icon={<CheckSquare size={20} />}
+            stats={[
+              { value: dashboard.incoming.issues_count, label: 'проблем', color: 'text-primary' },
+              { value: dashboard.incoming.cards_count, label: 'карточек' },
+            ]}
+            title="Входящие"
+            desc="Новые задачи на проверку"
+            btnVariant="default"
+            onStart={() => openModeModal('incoming')}
+          />
+          <TaskCard
+            borderHover="hover:border-[#8b5cf6]"
+            iconBg="bg-[#8b5cf6]"
+            icon={<LayoutGrid size={20} />}
+            stats={[
+              { value: dashboard.by_cards.cards_count, label: 'карточек' },
+            ]}
+            title="По карточкам"
+            desc="Улучшения для каждой карточки"
+            btnVariant="default"
+            btnClassName="bg-gradient-to-r from-[#8b5cf6] to-[#7c3aed] hover:shadow-lg"
+            onStart={() => openModeModal('cards')}
+          />
         </div>
 
         {/* ═══════════ Tools ═══════════ */}
-        <div className="ws-tools-label">ИНСТРУМЕНТЫ</div>
-        <div className="ws-tools">
-          <div className="ws-tool" onClick={() => navigate('/ab-tests')}>
-            <div className="ws-tool-icon">
-              <FlaskConical size={20} />
-            </div>
-            <div className="ws-tool-body">
-              <div className="ws-tool-row">
-                <span className="ws-tool-name">A/B тесты</span>
-                {dashboard.active_tests > 0 && (
-                  <span className="ws-tool-badge">{dashboard.active_tests} активных</span>
-                )}
-              </div>
-              <span className="ws-tool-desc">Эксперименты с контентом</span>
-            </div>
-            <ChevronRight size={18} className="ws-tool-arrow" />
-          </div>
+        <div className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-3">
+          ИНСТРУМЕНТЫ
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-7">
+          <ToolItem icon={<FlaskConical size={20} />} name="A/B тесты" desc="Эксперименты с контентом"
+            badge={dashboard.active_tests > 0 ? `${dashboard.active_tests} активных` : undefined}
+            onClick={() => navigate('/ab-tests')} />
+          <ToolItem icon={<Camera size={20} />} name="Фотостудия" desc="Генерация и улучшение фото"
+            onClick={() => navigate('/photo-studio')} />
+          <ToolItem icon={<MessageCircle size={20} />} name="Отзывы и вопросы" desc="Работа с обратной связью"
+            badge={`${Math.max(warningsCount, 4)} новых`} />
+          <ToolItem icon={<TrendingUp size={20} />} name="Анализ рекламы" desc="Оценка эффективности РК"
+            onClick={() => navigate('/workspace/ad-analysis')} />
+        </div>
 
-          <div className="ws-tool" onClick={() => navigate('/photo-studio')}>
-            <div className="ws-tool-icon">
-              <Camera size={20} />
+        {/* ═══════════ Team Summary (compact) ═══════════ */}
+        {teamActivity && hasAnyPermission('team.view', 'team.manage') && (
+          <div
+            className="flex items-center gap-3 bg-card border border-border rounded-xl px-5 py-3.5 cursor-pointer transition-all hover:shadow-sm hover:border-muted-foreground/30"
+            onClick={() => navigate('/management')}
+          >
+            <div className="w-9 h-9 rounded-xl bg-primary/10 text-primary flex items-center justify-center flex-shrink-0">
+              <Users size={18} />
             </div>
-            <div className="ws-tool-body">
-              <span className="ws-tool-name">Фотостудия</span>
-              <span className="ws-tool-desc">Генерация и улучшение фото</span>
-            </div>
-            <ChevronRight size={18} className="ws-tool-arrow" />
-          </div>
-
-          <div className="ws-tool">
-            <div className="ws-tool-icon">
-              <MessageCircle size={20} />
-            </div>
-            <div className="ws-tool-body">
-              <div className="ws-tool-row">
-                <span className="ws-tool-name">Отзывы и вопросы</span>
-                <span className="ws-tool-badge">{Math.max(warningsCount, 4)} новых</span>
-              </div>
-              <span className="ws-tool-desc">Работа с обратной связью</span>
-            </div>
-            <ChevronRight size={18} className="ws-tool-arrow" />
-          </div>
-
-          {hasAnyPermission('team.view', 'team.manage') && (
-            <div className="ws-tool" onClick={() => navigate('/workspace/staff')}>
-              <div className="ws-tool-icon" style={{ background: 'rgba(99,102,241,.12)' }}>
-                <Activity size={20} style={{ color: '#6366f1' }} />
-              </div>
-              <div className="ws-tool-body">
-                <span className="ws-tool-name">Сотрудники</span>
-                <span className="ws-tool-desc">Активность команды и прогресс магазина</span>
-              </div>
-              <ChevronRight size={18} className="ws-tool-arrow" />
-            </div>
-          )}
-
-          {hasAnyPermission('team.view', 'team.manage') && (
-            <div className="ws-tool" onClick={() => navigate('/workspace/team')}>
-              <div className="ws-tool-icon">
-                <Users size={20} />
-              </div>
-              <div className="ws-tool-body">
-                <span className="ws-tool-name">Команда</span>
-                <span className="ws-tool-desc">Управление ролями и сотрудниками</span>
-              </div>
-              <ChevronRight size={18} className="ws-tool-arrow" />
-            </div>
-          )}
-
-          <div className="ws-tool" onClick={() => navigate('/workspace/fixed-file')}>
-            <div className="ws-tool-icon" style={{ background: 'rgba(5,150,105,.12)' }}>
-              <FileCheck size={20} style={{ color: '#059669' }} />
-            </div>
-            <div className="ws-tool-body">
-              <span className="ws-tool-name">Эталонные значения</span>
-              <span className="ws-tool-desc">Excel-файл с правильными составами, сертификатами и декларациями</span>
-            </div>
-            <ChevronRight size={18} className="ws-tool-arrow" />
-          </div>
-
-          <div className="ws-tool" onClick={() => navigate('/workspace/approvals')}>
-            <div className="ws-tool-icon">
-              <ClipboardCheck size={20} />
-            </div>
-            <div className="ws-tool-body">
-              <div className="ws-tool-row">
-                <span className="ws-tool-name">Проверка карточек</span>
-                {myPendingCount > 0 && (
-                  <span className="ws-tool-badge" style={{ background: '#fef3c7', color: '#d97706' }}>{myPendingCount} на проверке</span>
-                )}
-              </div>
-              <span className="ws-tool-desc">
-                {hasPermission('cards.approve')
-                  ? 'Одобрение и отклонение подготовленных карточек'
-                  : myPendingCount > 0
-                    ? `${myPendingCount} карт. ожидают проверки старшего менеджера`
-                    : 'Статус отправленных карточек'}
+            <div className="flex-1 min-w-0">
+              <span className="text-sm font-semibold text-foreground">Команда</span>
+              <span className="text-[13px] text-muted-foreground ml-2">
+                {teamActivity.members.filter(m => m.is_online).length} онлайн из {teamActivity.total_members}
+                {' · '}
+                {teamActivity.issues_summary.fixed || 0} исправлений сегодня
+                {teamActivity.pending_approvals > 0 && ` · ${teamActivity.pending_approvals} на проверке`}
               </span>
             </div>
-            <ChevronRight size={18} className="ws-tool-arrow" />
-          </div>
-        </div>
-
-        {/* ═══════════ Team Activity Widget ═══════════ */}
-        {teamActivity && hasAnyPermission('team.view', 'team.manage') && (
-          <div className="ws-team-activity">
-            <div className="ws-team-activity-header">
-              <div className="ws-team-activity-title">
-                <Users size={18} />
-                <h3>Команда</h3>
-                <span className="ws-team-activity-count">
-                  {teamActivity.members.filter(m => m.is_online).length} онлайн / {teamActivity.total_members}
-                </span>
-              </div>
-              <button className="ws-team-activity-link" onClick={() => navigate('/workspace/team')}>
-                Управление <ChevronRight size={14} />
-              </button>
-            </div>
-
-            <div className="ws-team-summary">
-              <div className="ws-team-summary-card">
-                <Wrench size={16} className="ws-tsc-icon--blue" />
-                <div>
-                  <div className="ws-tsc-val">{Object.values(teamActivity.issues_summary).reduce((a, b) => a + b, 0)}</div>
-                  <div className="ws-tsc-label">Всего проблем</div>
-                </div>
-              </div>
-              <div className="ws-team-summary-card">
-                <CheckCircle2 size={16} className="ws-tsc-icon--green" />
-                <div>
-                  <div className="ws-tsc-val">{teamActivity.issues_summary.fixed || 0}</div>
-                  <div className="ws-tsc-label">Исправлено</div>
-                </div>
-              </div>
-              <div className="ws-team-summary-card">
-                <Clock size={16} className="ws-tsc-icon--orange" />
-                <div>
-                  <div className="ws-tsc-val">{teamActivity.pending_approvals}</div>
-                  <div className="ws-tsc-label">На проверке</div>
-                </div>
-              </div>
-              <div className="ws-team-summary-card">
-                <Zap size={16} className="ws-tsc-icon--purple" />
-                <div>
-                  <div className="ws-tsc-val">{teamActivity.members.filter(m => m.is_online).length}</div>
-                  <div className="ws-tsc-label">Онлайн сейчас</div>
-                </div>
-              </div>
-            </div>
-
-            <div className="ws-team-members-list">
-              {teamActivity.members.map((m, idx) => {
-                const roleLabel = m.role === 'owner' ? 'Владелец' : m.role === 'head_manager' ? 'Ст. менеджер' : m.role === 'manager' ? 'Менеджер' : m.role === 'viewer' ? 'Наблюдатель' : 'Пользователь';
-                const lastSeen = m.last_active_at || m.last_login;
-                const lastSeenLabel = (() => {
-                  if (!lastSeen) return 'Не заходил';
-                  const diff = Math.floor((Date.now() - new Date(lastSeen).getTime()) / 1000);
-                  if (diff < 120) return 'только что';
-                  if (diff < 3600) return `${Math.floor(diff / 60)} мин. назад`;
-                  if (diff < 86400) return `${Math.floor(diff / 3600)} ч. назад`;
-                  return `${Math.floor(diff / 86400)} д. назад`;
-                })();
-                return (
-                  <div key={m.id} className="ws-team-member-row">
-                    <div className="ws-team-member-rank">{idx + 1}</div>
-                    <div className="ws-team-member-avatar">
-                      {(m.name || '?')[0].toUpperCase()}
-                      <span className={`ws-team-online-dot ${m.is_online ? 'ws-team-online-dot--on' : 'ws-team-online-dot--off'}`} />
-                    </div>
-                    <div className="ws-team-member-info">
-                      <div className="ws-team-member-name">{m.name}</div>
-                      <div className="ws-team-member-role">
-                        {roleLabel}
-                        <span className={`ws-team-status-badge ${m.is_online ? 'ws-team-status-badge--on' : 'ws-team-status-badge--off'}`}>
-                          {m.is_online ? '● онлайн' : `● ${lastSeenLabel}`}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="ws-team-member-stats">
-                      <div className="ws-team-member-stat">
-                        <span className="ws-tms-val">{m.fixes_week}</span>
-                        <span className="ws-tms-label">за неделю</span>
-                      </div>
-                      <div className="ws-team-member-stat">
-                        <span className={`ws-tms-val ${m.fixes_today > 0 ? 'ws-tms-val--today' : ''}`}>{m.fixes_today}</span>
-                        <span className="ws-tms-label">сегодня</span>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-              {teamActivity.members.length === 0 && (
-                <div className="ws-team-empty">Нет данных об активности</div>
-              )}
-            </div>
+            <Button variant="ghost" size="sm" className="gap-1 text-xs flex-shrink-0">
+              Подробнее <ChevronRight size={14} />
+            </Button>
           </div>
         )}
-
-        {/* ═══════════ Bottom Stats ═══════════ */}
-        <div className="ws-stats">
-          {/* Growth potential */}
-          <div className="ws-stat-card">
-            <div className="ws-stat-head">
-              <TrendingUp size={18} className="ws-stat-icon--green" />
-              <span>Потенциал роста</span>
-            </div>
-            <div className="ws-stat-big">{dashboard.potential_revenue}</div>
-            <div className="ws-stat-row">
-              <div className="ws-stat-item">
-                <CheckCircle2 size={14} className="ws-stat-dot--green" />
-                <span>Исправлено сегодня</span>
-              </div>
-              <span className="ws-stat-val">{dashboard.fixed_today}</span>
-            </div>
-            <div className="ws-stat-row">
-              <div className="ws-stat-item">
-                <TrendingUp size={14} className="ws-stat-dot--blue" />
-                <span>Активных A/B тестов</span>
-              </div>
-              <span className="ws-stat-val">{dashboard.active_tests}</span>
-            </div>
-          </div>
-
-          {/* Recent activity */}
-          <div className="ws-stat-card">
-            <div className="ws-stat-head">
-              <Activity size={18} className="ws-stat-icon--purple" />
-              <span>Недавняя активность</span>
-            </div>
-            <div className="ws-activity-list">
-              <div className="ws-activity-item">
-                <AlertTriangle size={14} className="ws-act-red" />
-                <span>Новых критических ошибок: {criticalCount}</span>
-              </div>
-              <div className="ws-activity-item">
-                <CheckCircle2 size={14} className="ws-act-green" />
-                <span>Исправлено {dashboard.fixed_today} карточек сегодня</span>
-              </div>
-              <div className="ws-activity-item">
-                <Info size={14} className="ws-act-blue" />
-                <span>A/B тест завершён (+12% CTR)</span>
-              </div>
-            </div>
-          </div>
-        </div>
       </main>
 
-      {modeModalOpen ? (
-        <div className="ws-mode-overlay" onClick={() => setModeModalOpen(false)}>
-          <div className="ws-mode-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="ws-mode-head">
-              <div>
-                <h3>Выберите режим работы</h3>
-                <p>Как вам удобнее прорабатывать карточки товаров</p>
-              </div>
-              <button type="button" className="ws-mode-close" onClick={() => setModeModalOpen(false)}>
-                <X size={16} />
-              </button>
-            </div>
+      {/* ═══════════ Mode Modal ═══════════ */}
+      <Dialog open={modeModalOpen} onOpenChange={setModeModalOpen}>
+        <DialogContent className="max-w-[580px] p-6">
+          <DialogHeader>
+            <DialogTitle className="text-xl">Выберите режим работы</DialogTitle>
+            <DialogDescription>Как вам удобнее прорабатывать карточки товаров</DialogDescription>
+          </DialogHeader>
 
+          <div className="space-y-2.5 mt-2">
             <button
-              className={`ws-mode-option ${workMode === 'guided' ? 'active' : ''}`}
+              className={`w-full flex items-start gap-3 p-4 rounded-xl border transition-all text-left ${
+                workMode === 'guided'
+                  ? 'border-primary shadow-[0_0_0_2px] shadow-primary/20 bg-primary/5'
+                  : 'border-border hover:border-muted-foreground/40'
+              }`}
               onClick={() => setWorkMode('guided')}
             >
-              <div className="ws-mode-icon">
+              <div className="w-10 h-10 rounded-xl bg-primary/10 text-primary flex items-center justify-center flex-shrink-0">
                 <Sparkles size={18} />
               </div>
-              <div className="ws-mode-body">
-                <div className="ws-mode-title">
-                  <span>Пошаговый режим</span>
-                  <span className="ws-mode-tag">Рекомендуется</span>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 font-semibold text-[15px]">
+                  Пошаговый режим
+                  <Badge className="text-[10px] h-5">Рекомендуется</Badge>
                 </div>
-                <div className="ws-mode-desc">
+                <p className="text-sm text-muted-foreground mt-1">
                   Система проведёт вас по карточкам в оптимальном порядке.
-                </div>
-                <div className="ws-mode-features">
-                  <span>Поэтапно</span>
-                  <span>Без лишних решений</span>
-                  <span>Фокус на результате</span>
+                </p>
+                <div className="flex gap-2 mt-2.5">
+                  {['Поэтапно', 'Без лишних решений', 'Фокус на результате'].map(f => (
+                    <span key={f} className="text-[11px] text-muted-foreground bg-muted px-2 py-0.5 rounded">{f}</span>
+                  ))}
                 </div>
               </div>
-              {workMode === 'guided' ? <Check size={16} className="ws-mode-check" /> : null}
+              {workMode === 'guided' && <Check size={16} className="text-primary mt-1 flex-shrink-0" />}
             </button>
 
             <button
-              className={`ws-mode-option ${workMode === 'advanced' ? 'active' : ''}`}
+              className={`w-full flex items-start gap-3 p-4 rounded-xl border transition-all text-left ${
+                workMode === 'advanced'
+                  ? 'border-primary shadow-[0_0_0_2px] shadow-primary/20 bg-primary/5'
+                  : 'border-border hover:border-muted-foreground/40'
+              }`}
               onClick={() => setWorkMode('advanced')}
             >
-              <div className="ws-mode-icon ws-mode-icon--advanced">
+              <div className="w-10 h-10 rounded-xl bg-muted text-muted-foreground flex items-center justify-center flex-shrink-0">
                 <SlidersHorizontal size={18} />
               </div>
-              <div className="ws-mode-body">
-                <div className="ws-mode-title">
-                  <span>Расширенный режим</span>
-                </div>
-                <div className="ws-mode-desc">
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-[15px]">Расширенный режим</div>
+                <p className="text-sm text-muted-foreground mt-1">
                   Полный контроль: все карточки, навигация, ручной выбор действий.
-                </div>
-                <div className="ws-mode-features">
-                  <span>Все проблемы</span>
-                  <span>Навигация</span>
-                  <span>Ручной ввод</span>
+                </p>
+                <div className="flex gap-2 mt-2.5">
+                  {['Все проблемы', 'Навигация', 'Ручной ввод'].map(f => (
+                    <span key={f} className="text-[11px] text-muted-foreground bg-muted px-2 py-0.5 rounded">{f}</span>
+                  ))}
                 </div>
               </div>
-              {workMode === 'advanced' ? <Check size={16} className="ws-mode-check" /> : null}
+              {workMode === 'advanced' && <Check size={16} className="text-primary mt-1 flex-shrink-0" />}
             </button>
-
-            <div className="ws-mode-actions">
-              <button className="btn btn-ghost" onClick={() => setModeModalOpen(false)}>Отмена</button>
-              <button className="btn btn-primary" onClick={startByMode}>Начать работу</button>
-            </div>
-            <div className="ws-mode-note">Вы сможете изменить режим позже</div>
           </div>
-        </div>
-      ) : null}
+
+          <DialogFooter className="mt-4 gap-2">
+            <Button variant="ghost" onClick={() => setModeModalOpen(false)}>Отмена</Button>
+            <Button onClick={startByMode}>Начать работу</Button>
+          </DialogFooter>
+          <p className="text-center text-xs text-muted-foreground mt-1">Вы сможете изменить режим позже</p>
+        </DialogContent>
+      </Dialog>
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+    </div>
+  );
+}
+
+/* ── Sub-components ── */
+
+function TaskCard({ borderHover, iconBg, icon, stats, title, desc, btnVariant, btnClassName, onStart }: {
+  borderHover: string;
+  iconBg: string;
+  icon: React.ReactNode;
+  stats: Array<{ value: number; label: string; color?: string }>;
+  title: string;
+  desc: string;
+  btnVariant: 'default' | 'destructive';
+  btnClassName?: string;
+  onStart: () => void;
+}) {
+  return (
+    <div className={`bg-card border border-border rounded-xl p-5 flex flex-col transition-all hover:shadow-md ${borderHover}`}>
+      <div className="flex items-start justify-between mb-3.5">
+        <div className={`w-10 h-10 rounded-xl ${iconBg} text-white flex items-center justify-center`}>
+          {icon}
+        </div>
+        <div className="flex gap-4">
+          {stats.map((s, i) => (
+            <div key={i} className="text-right">
+              <span className={`block text-xl font-bold leading-tight ${s.color || 'text-foreground'}`}>{s.value}</span>
+              <span className="text-[11px] text-muted-foreground">{s.label}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <h3 className="text-base font-semibold mb-1">{title}</h3>
+      <p className="text-[13px] text-muted-foreground mb-4 flex-1">{desc}</p>
+      <Button variant={btnVariant} className={`w-full ${btnClassName || ''}`} onClick={onStart}>
+        Начать
+      </Button>
+    </div>
+  );
+}
+
+function ToolItem({ icon, iconClassName, name, desc, badge, badgeClassName, onClick }: {
+  icon: React.ReactNode;
+  iconClassName?: string;
+  name: string;
+  desc: string;
+  badge?: string;
+  badgeClassName?: string;
+  onClick?: () => void;
+}) {
+  return (
+    <div
+      className="flex items-center gap-3.5 bg-card border border-border rounded-xl px-5 py-4 cursor-pointer transition-all hover:shadow-sm hover:border-muted-foreground/30"
+      onClick={onClick}
+    >
+      <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${iconClassName || 'bg-muted text-muted-foreground'}`}>
+        {icon}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold text-foreground">{name}</span>
+          {badge && (
+            <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-lg ${badgeClassName || 'bg-primary/10 text-primary'}`}>
+              {badge}
+            </span>
+          )}
+        </div>
+        <span className="text-[13px] text-muted-foreground mt-0.5 block truncate">{desc}</span>
+      </div>
+      <ChevronRight size={18} className="text-muted-foreground/50 flex-shrink-0" />
     </div>
   );
 }

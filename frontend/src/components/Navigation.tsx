@@ -1,25 +1,29 @@
 import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Package, Inbox, Camera, FlaskConical } from 'lucide-react';
+import { LayoutDashboard, Package, Inbox, Camera, FlaskConical, Users } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 import '../styles/index.css';
 
 interface NavItem {
   path: string;
   label: string;
   icon: React.ReactNode;
+  permission?: string;
 }
 
 const navItems: NavItem[] = [
   { path: '/workspace', label: 'Главная', icon: <LayoutDashboard size={16} /> },
   { path: '/workspace/cards', label: 'Карточки', icon: <Package size={16} /> },
   { path: '/workspace/incoming', label: 'Входящие', icon: <Inbox size={16} /> },
-  { path: '/photo-studio', label: 'Photo Studio', icon: <Camera size={16} /> },
+  { path: '/photo-studio', label: 'Photo Studio', icon: <Camera size={16} />, permission: 'photos.manage' },
   { path: '/ab-tests', label: 'A/B Тесты', icon: <FlaskConical size={16} /> },
+  { path: '/management', label: 'Управление', icon: <Users size={16} />, permission: 'team.view' },
 ];
 
 export const Navigation: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
+  const { hasAnyPermission } = useAuth();
 
   return (
     <nav style={{
@@ -29,15 +33,17 @@ export const Navigation: React.FC = () => {
       flexWrap: 'wrap',
       alignItems: 'center'
     }}>
-      {navItems.map((item) => (
+      {navItems
+        .filter(item => !item.permission || hasAnyPermission(item.permission, 'team.manage'))
+        .map((item) => (
         <button
           key={item.path}
           onClick={() => navigate(item.path)}
           style={{
             padding: '8px 12px',
-            backgroundColor: location.pathname === item.path ? 'var(--primary)' : 'transparent',
-            color: location.pathname === item.path ? 'white' : 'var(--text)',
-            border: location.pathname === item.path ? 'none' : '1px solid var(--border)',
+            backgroundColor: location.pathname === item.path || (item.path === '/management' && location.pathname.startsWith('/management')) ? 'var(--primary)' : 'transparent',
+            color: location.pathname === item.path || (item.path === '/management' && location.pathname.startsWith('/management')) ? 'white' : 'var(--text)',
+            border: location.pathname === item.path || (item.path === '/management' && location.pathname.startsWith('/management')) ? 'none' : '1px solid var(--border)',
             borderRadius: '6px',
             cursor: 'pointer',
             fontSize: '14px',

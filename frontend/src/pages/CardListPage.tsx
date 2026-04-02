@@ -4,23 +4,54 @@ import { useStore } from '../contexts/StoreContext';
 import api from '../api/client';
 import {
   AlertTriangle,
+  ArrowDown,
   ArrowLeft,
+  ArrowUp,
   Camera,
   CheckCircle2,
   ChevronDown,
+  CircleDot,
+  Clock3,
+  Copy,
+  ExternalLink,
   FlaskConical,
   Loader2,
+  MessageSquare,
   MoreVertical,
-  RotateCcw,
-  RefreshCw,
-  Search,
-  Sparkles,
-  Tag,
-  Video,
-  Clock3,
   Package,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  ShieldCheck,
+  Sparkles,
+  Video,
+  X,
 } from 'lucide-react';
 import type { Card, CardListResponse } from '../types';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { toast } from 'sonner';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Progress } from '@/components/ui/progress';
 
 type SeverityFilter = 'all' | 'has_issues' | 'no_issues' | 'postponed' | 'unconfirmed';
 type SortFilter = 'issues' | 'score';
@@ -32,12 +63,12 @@ interface QualityMetric {
 }
 
 const METRICS: QualityMetric[] = [
-  { label: 'FCS', key: 'fcs', max: 100 },
   { label: 'Хар-ки', key: 'characteristics_score', max: 20 },
   { label: 'Title', key: 'title_score', max: 20 },
   { label: 'Desc', key: 'description_score', max: 20 },
   { label: 'Фото', key: 'photos_score', max: 20 },
   { label: 'Видео', key: 'video_score', max: 10 },
+  { label: 'Ракурс', key: 'angles_score', max: 10 },
   { label: 'Cons', key: 'seo_score', max: 10 },
 ];
 
@@ -56,11 +87,12 @@ function clamp(value: number, min: number, max: number): number {
 
 function metricColor(score: number, max: number): string {
   const ratio = max > 0 ? score / max : 0;
-  if (ratio >= 0.75) return '#22C55E';
-  if (ratio >= 0.45) return '#F59E0B';
-  if (ratio > 0) return '#EF4444';
-  return '#D8DCE8';
+  if (ratio >= 0.75) return 'bg-zone-green';
+  if (ratio >= 0.45) return 'bg-zone-yellow';
+  if (ratio > 0) return 'bg-zone-red';
+  return 'bg-muted';
 }
+
 
 function metricScore(card: Card, metric: QualityMetric): number {
   const breakdown = (card.score_breakdown || {}) as Record<string, unknown>;
@@ -71,42 +103,71 @@ function metricScore(card: Card, metric: QualityMetric): number {
   return clamp(toNumber(breakdown[metric.key]), 0, metric.max);
 }
 
-function statusForCard(card: Card): {
-  mode: 'critical' | 'warning' | 'success';
-  label: string;
-  detail: string;
-} {
-  const totalIssues = (card.critical_issues_count ?? 0) + (card.warnings_count ?? 0) + (card.improvements_count ?? 0);
+function pluralErrors(n: number): string {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return `${n} ошибка`;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return `${n} ошибки`;
+  return `${n} ошибок`;
+}
 
-  if ((card.critical_issues_count ?? 0) > 0) {
-    return {
-      mode: 'critical',
-      label: 'Требует исправления',
-      detail: `${totalIssues} ошибок`,
-    };
-  }
+const DEFAULT_CONFIRMATION_TOTAL = 7;
 
-  if ((card.warnings_count ?? 0) > 0 || (card.improvements_count ?? 0) > 0) {
-    return {
-      mode: 'warning',
-      label: 'Есть отложенные',
-      detail: `${(card.warnings_count ?? 0) + (card.improvements_count ?? 0)} ошибки`,
-    };
-  }
-
+function getCardConfirmation(card: Card) {
+  const summary = card.confirmation_summary;
   return {
-    mode: 'success',
-    label: 'В норме',
-    detail: '0 ошибок',
+    confirmed: summary?.confirmed_count ?? 0,
+    total: summary?.total_sections ?? DEFAULT_CONFIRMATION_TOTAL,
+    reviewer: summary?.last_confirmed_by_name || null,
+    date: summary?.last_confirmed_at
+      ? new Date(summary.last_confirmed_at).toLocaleString('ru-RU', {
+          day: 'numeric',
+          month: 'short',
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+      : null,
   };
 }
 
-function scoreColor(score: number | null): string {
-  if (!score) return '#94A3B8';
-  if (score >= 75) return '#16A34A';
-  if (score >= 55) return '#F59E0B';
-  return '#EF4444';
+function getInitials(name: string): string {
+  return name.split(' ').map(w => w[0]).join('').toUpperCase();
 }
+
+function statusForCard(card: Card): {
+  mode: 'critical' | 'warning' | 'success';
+  label: string;
+} {
+  if ((card.critical_issues_count ?? 0) > 0) {
+    return { mode: 'critical', label: 'Требует исправления' };
+  }
+  if ((card.warnings_count ?? 0) > 0 || (card.improvements_count ?? 0) > 0) {
+    return { mode: 'warning', label: 'Есть отложенные' };
+  }
+  return { mode: 'success', label: 'Карточка корректна' };
+}
+
+function scoreColor(score: number | null): string {
+  if (!score) return 'text-muted-foreground';
+  if (score >= 75) return 'text-zone-green';
+  if (score >= 55) return 'text-zone-yellow';
+  return 'text-zone-red';
+}
+
+const STATUS_STYLES = {
+  critical: {
+    badge: 'bg-zone-red/10 text-zone-red',
+    icon: CircleDot,
+  },
+  warning: {
+    badge: 'bg-zone-yellow/10 text-zone-yellow',
+    icon: Clock3,
+  },
+  success: {
+    badge: 'bg-zone-green/10 text-zone-green',
+    icon: CheckCircle2,
+  },
+} as const;
 
 export default function CardListPage() {
   const navigate = useNavigate();
@@ -120,7 +181,7 @@ export default function CardListPage() {
   const [search, setSearch] = useState('');
   const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
   const [sortBy, setSortBy] = useState<SortFilter>('issues');
-  const [openMenuCardId, setOpenMenuCardId] = useState<number | null>(null);
+  const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc');
   const [analysisTask, setAnalysisTask] = useState<{ taskId: string; step: string; progress: number; status: string } | null>(null);
   const analysisPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [schedulerStatus, setSchedulerStatus] = useState<{ last_tick_at: string | null; next_tick_in_sec: number | null; is_running: boolean } | null>(null);
@@ -170,18 +231,11 @@ export default function CardListPage() {
   }, [searchParams]);
 
   useEffect(() => {
-    const closeMenu = () => setOpenMenuCardId(null);
-    document.addEventListener('click', closeMenu);
-    return () => document.removeEventListener('click', closeMenu);
-  }, []);
-
-  useEffect(() => {
     if (activeStore) {
       void loadCards();
     }
   }, [activeStore, page, severityFilter, sortBy]);
 
-  // Poll scheduler status every 30 seconds
   useEffect(() => {
     void loadSchedulerStatus();
     const interval = setInterval(loadSchedulerStatus, 30000);
@@ -190,18 +244,13 @@ export default function CardListPage() {
 
   const loadCards = async () => {
     if (!activeStore) return;
-
     setLoading(true);
     try {
       const filters: Record<string, unknown> = {};
-      if (severityFilter === 'has_issues') {
-        filters.has_issues = true;
-      } else if (severityFilter === 'no_issues') {
-        filters.no_issues = true;
-      }
-      if (search.trim()) {
-        filters.search = search.trim();
-      }
+      if (severityFilter === 'has_issues') filters.has_issues = true;
+      else if (severityFilter === 'no_issues') filters.no_issues = true;
+      else if (severityFilter === 'unconfirmed') filters.is_fully_confirmed = false;
+      if (search.trim()) filters.search = search.trim();
 
       const data: CardListResponse = await api.getCards(activeStore.id, page, 50, filters);
       setCards(data.items);
@@ -222,330 +271,566 @@ export default function CardListPage() {
   const handleSeverityChange = (next: SeverityFilter) => {
     setSeverityFilter(next);
     setPage(1);
-
     const nextParams = new URLSearchParams(searchParams);
-    if (next === 'all') {
-      nextParams.delete('severity');
-    } else {
-      nextParams.set('severity', next);
-    }
+    if (next === 'all') nextParams.delete('severity');
+    else nextParams.set('severity', next);
     setSearchParams(nextParams, { replace: true });
   };
 
   const visibleCards = useMemo(() => {
     let list = [...cards];
-
     if (severityFilter === 'has_issues') {
-      list = list.filter((card) => (card.critical_issues_count ?? 0) + (card.warnings_count ?? 0) + (card.improvements_count ?? 0) > 0);
+      list = list.filter((c) => (c.critical_issues_count ?? 0) + (c.warnings_count ?? 0) + (c.improvements_count ?? 0) > 0);
     } else if (severityFilter === 'no_issues') {
-      list = list.filter((card) => (card.critical_issues_count ?? 0) + (card.warnings_count ?? 0) + (card.improvements_count ?? 0) === 0);
+      list = list.filter((c) => (c.critical_issues_count ?? 0) + (c.warnings_count ?? 0) + (c.improvements_count ?? 0) === 0);
     } else if (severityFilter === 'postponed') {
-      list = list.filter((card) => (card.warnings_count ?? 0) > 0 || (card.improvements_count ?? 0) > 0);
+      list = list.filter((c) => (c.warnings_count ?? 0) > 0 || (c.improvements_count ?? 0) > 0);
     } else if (severityFilter === 'unconfirmed') {
-      list = list.filter((card) => (card.critical_issues_count ?? 0) > 0);
+      list = list.filter((c) => {
+        const summary = c.confirmation_summary;
+        const total = summary?.total_sections ?? DEFAULT_CONFIRMATION_TOTAL;
+        const confirmed = summary?.confirmed_count ?? 0;
+        return confirmed < total;
+      });
     }
-
     if (sortBy === 'issues') {
       list.sort((a, b) => {
-        const aIssues = (a.critical_issues_count ?? 0) + (a.warnings_count ?? 0) + (a.improvements_count ?? 0);
-        const bIssues = (b.critical_issues_count ?? 0) + (b.warnings_count ?? 0) + (b.improvements_count ?? 0);
-        return bIssues - aIssues;
+        const ai = (a.critical_issues_count ?? 0) + (a.warnings_count ?? 0) + (a.improvements_count ?? 0);
+        const bi = (b.critical_issues_count ?? 0) + (b.warnings_count ?? 0) + (b.improvements_count ?? 0);
+        return sortDir === 'desc' ? bi - ai : ai - bi;
       });
     } else {
-      list.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+      list.sort((a, b) => sortDir === 'desc' ? (b.score ?? 0) - (a.score ?? 0) : (a.score ?? 0) - (b.score ?? 0));
     }
-
     return list;
-  }, [cards, severityFilter, sortBy]);
+  }, [cards, severityFilter, sortBy, sortDir]);
 
   const cardsWithIssues = useMemo(
-    () => visibleCards.filter((card) => (card.critical_issues_count ?? 0) + (card.warnings_count ?? 0) + (card.improvements_count ?? 0) > 0).length,
+    () => visibleCards.filter((c) => (c.critical_issues_count ?? 0) + (c.warnings_count ?? 0) + (c.improvements_count ?? 0) > 0).length,
+    [visibleCards],
+  );
+  const criticalCards = useMemo(
+    () => visibleCards.filter((c) => (c.critical_issues_count ?? 0) > 0).length,
     [visibleCards],
   );
 
-  const criticalCards = useMemo(
-    () => visibleCards.filter((card) => (card.critical_issues_count ?? 0) > 0).length,
-    [visibleCards],
-  );
+  const isAnalysisRunning = analysisTask?.status === 'running' || analysisTask?.status === 'pending';
+  const hasActiveFilters = severityFilter !== 'all' || search.length > 0;
+
+  const handleReset = () => {
+    setSeverityFilter('all');
+    setSearch('');
+    setPage(1);
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete('severity');
+    setSearchParams(nextParams, { replace: true });
+  };
 
   return (
-    <>
-    <div className="card-list-page">
-      <div className="card-list-shell">
-        <div className="card-list-topline">
-          <button className="card-list-back" onClick={() => navigate('/workspace')}>
-            <ArrowLeft size={16} /> Рабочее пространство
-          </button>
-          <span className="card-list-mode-pill">Расширенный режим</span>
-        </div>
-
-        <div className="card-list-headline-row">
-          <div className="card-list-headline">Карточки товаров</div>
-          <div className="card-list-sync-area">
-            <button
-              className={`ws-sync-btn ws-sync-btn--reset ${analysisTask?.status === 'running' || analysisTask?.status === 'pending' ? 'ws-sync-btn--active' : ''}`}
-              onClick={handleResetAndAnalyze}
-              disabled={analysisTask?.status === 'running' || analysisTask?.status === 'pending'}
-              title="Очистить все анализы и запустить заново"
-            >
-              {analysisTask?.status === 'running' || analysisTask?.status === 'pending'
-                ? <Loader2 size={15} className="ws-spin" />
-                : <RotateCcw size={15} />}
-              Заново
-            </button>
-            {/* Auto-sync status — shows last sync time and next tick */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
-              <RefreshCw size={13} style={{ color: schedulerStatus?.is_running ? 'var(--success, #22c55e)' : 'var(--text-muted)' }} />
-              {schedulerStatus ? (
-                <span>
-                  {schedulerStatus.last_tick_at
-                    ? `Обновлено: ${new Date(schedulerStatus.last_tick_at + 'Z').toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`
-                    : 'Ожидание...'
-                  }
-                  {schedulerStatus.next_tick_in_sec != null && (
-                    <span style={{ marginLeft: 6, color: 'var(--text-muted)' }}>
-                      · след. через {schedulerStatus.next_tick_in_sec < 60
-                        ? `${schedulerStatus.next_tick_in_sec}с`
-                        : `${Math.round(schedulerStatus.next_tick_in_sec / 60)}м`}
-                    </span>
-                  )}
-                </span>
-              ) : (
-                <span>Авто-обновление каждые 10 мин</span>
-              )}
-            </div>
-          </div>
-        </div>
-
-        <div className="card-list-toolbar">
-          <form className="card-list-search" onSubmit={handleSearch}>
-            <Search size={16} />
-            <input
-              type="text"
-              placeholder="ID, артикул или название..."
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-            />
-          </form>
-
-          <div className="card-list-filters">
-            <label className="card-list-select-wrap">
-              <select
-                value={severityFilter}
-                onChange={(event) => handleSeverityChange(event.target.value as SeverityFilter)}
+    <TooltipProvider delayDuration={200}>
+      <>
+        <div className="min-h-screen bg-muted/40">
+          {/* ── 1. Nav ── */}
+          <nav className="sticky top-0 z-10 bg-background/95 backdrop-blur border-b border-border">
+            <div className="max-w-[1400px] mx-auto px-6 py-3 flex items-center justify-between">
+              <button
+                className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+                onClick={() => navigate('/workspace')}
               >
-                <option value="all">Все карточки</option>
-                <option value="has_issues">Есть проблемы</option>
-                <option value="no_issues">Нет проблем</option>
-                <option value="postponed">Отложенные</option>
-                <option value="unconfirmed">Не подтверждено</option>
-              </select>
-              <ChevronDown size={15} />
-            </label>
-
-            <label className="card-list-select-wrap">
-              <select value={sortBy} onChange={(event) => setSortBy(event.target.value as SortFilter)}>
-                <option value="issues">По кол-ву проблем</option>
-                <option value="score">По рейтингу</option>
-              </select>
-              <ChevronDown size={15} />
-            </label>
-          </div>
-
-          <div className="card-list-counters">
-            <span>Товаров {visibleCards.length}</span>
-            <span>С ошибками {cardsWithIssues}</span>
-            <span className="critical">Критичных {criticalCards}</span>
-          </div>
-        </div>
-
-        {loading ? (
-          <div className="loading-center" style={{ minHeight: 320 }}>
-            <div className="spinner" />
-            <div className="loading-text">Загрузка карточек...</div>
-          </div>
-        ) : visibleCards.length === 0 ? (
-          <div className="empty-state" style={{ padding: '56px 0' }}>
-            <div className="empty-icon"><Package size={30} /></div>
-            <h3>Карточки не найдены</h3>
-            <p>Измените фильтр или строку поиска</p>
-          </div>
-        ) : (
-          <>
-            <div className="card-list-shown">Показано {visibleCards.length} товаров</div>
-
-            <div className="card-list-rows">
-              {visibleCards.map((card) => {
-                const status = statusForCard(card);
-                const score = card.score ?? 0;
-                const potentialGain = Math.max(0, Math.round((100 - score) * 0.35));
-
-                return (
-                  <div key={card.id} className="card-list-row">
-                    <div className="card-row-main">
-                      <div className="card-row-ident">
-                        <span className={`card-row-dot card-row-dot--${status.mode}`} />
-                        <div className="card-row-thumb">
-                          {card.main_photo_url ? <img src={card.main_photo_url} alt="" /> : <Package size={18} />}
-                        </div>
-
-                        <div className="card-row-text">
-                          <div className="card-row-title">
-                            {card.title || `Карточка ${card.nm_id}`}
-                          </div>
-                          <div className="card-row-meta">
-                            <span>{card.nm_id}</span>
-                            {card.vendor_code ? <span>{card.vendor_code}</span> : null}
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="card-row-meters">
-                        {METRICS.map((metric) => {
-                          const mScore = metricScore(card, metric);
-                          const color = metricColor(mScore, metric.max);
-                          const ratio = metric.max > 0 ? mScore / metric.max : 0;
-                          const pct = Math.round(ratio * 100);
-                          const fillHeight = clamp(Math.round(10 + ratio * 24), 6, 34);
-
-                          return (
-                            <div key={`${card.id}-${metric.key}`} className="card-meter-col">
-                              <div className="card-meter-track" data-tip={`${mScore}/${metric.max}`}>
-                                <span style={{ height: `${fillHeight}px`, background: color }} />
-                                <div className="card-meter-tooltip" style={{ '--meter-color': color } as React.CSSProperties}>
-                                  <span className="card-meter-tooltip-pct">{pct}%</span>
-                                  <span className="card-meter-tooltip-raw">{mScore}/{metric.max}</span>
-                                </div>
-                              </div>
-                              <div className="card-meter-label">{metric.label}</div>
-                            </div>
-                          );
-                        })}
-                      </div>
-
-                      <div className="card-row-score" style={{ color: scoreColor(card.score) }}>
-                        <div className="score-main">{score}<span>/100</span></div>
-                        <div className="score-gain">+{Math.max(3, potentialGain)}</div>
-                      </div>
-
-                      <button className="card-row-flag-btn" title="Отметить">
-                        <Tag size={15} />
-                      </button>
-
-                      <div className={`card-row-status card-row-status--${status.mode}`}>
-                        <div className="status-pill">
-                          {status.mode === 'critical' ? <AlertTriangle size={14} /> : null}
-                          {status.mode === 'warning' ? <Clock3 size={14} /> : null}
-                          {status.mode === 'success' ? <CheckCircle2 size={14} /> : null}
-                          {status.label}
-                        </div>
-                        <div className="status-detail">{status.detail}</div>
-                      </div>
-
-                      <button className="card-open-btn" onClick={() => navigate(`/workspace/cards/${card.id}`)}>
-                        Открыть карточку
-                      </button>
-
-                      <div className="card-row-actions" onClick={(event) => event.stopPropagation()}>
-                        <button
-                          className="card-more-btn"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setOpenMenuCardId((prev) => (prev === card.id ? null : card.id));
-                          }}
-                        >
-                          <MoreVertical size={18} />
-                        </button>
-
-                        {openMenuCardId === card.id ? (
-                          <div className="card-row-menu" onClick={(event) => event.stopPropagation()}>
-                            <button
-                              onClick={() => {
-                                setOpenMenuCardId(null);
-                                navigate('/ab-tests');
-                              }}
-                            >
-                              <FlaskConical size={14} /> Запустить A/B тест
-                            </button>
-                            <button
-                              onClick={() => {
-                                setOpenMenuCardId(null);
-                                navigate('/photo-studio');
-                              }}
-                            >
-                              <Camera size={14} /> Сгенерировать фото
-                            </button>
-                            <button
-                              onClick={() => {
-                                setOpenMenuCardId(null);
-                                navigate('/photo-studio');
-                              }}
-                            >
-                              <Video size={14} /> Сгенерировать видео
-                            </button>
-                          </div>
-                        ) : null}
-                      </div>
-                    </div>
-
-                    <div className="card-row-foot">
-                      <div className="card-row-foot-note">
-                        <Sparkles size={13} /> Глубокий AI-анализ медиаконтента · Проверка фото и видео на соответствие требованиям WB
-                      </div>
-                      <button className="card-row-foot-run">
-                        <Sparkles size={13} /> Запустить · 1 кредит
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
+                <ArrowLeft className="h-4 w-4" />
+                Рабочее пространство
+              </button>
+              <Badge variant="secondary" className="text-xs font-normal px-2.5 py-0.5">
+                Расширенный режим
+              </Badge>
             </div>
+          </nav>
 
-            {total > 50 ? (
-              <div className="card-list-pagination">
-                <button className="btn btn-secondary btn-sm" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
-                  ← Назад
-                </button>
-                <span>Страница {page} из {Math.max(1, Math.ceil(total / 50))}</span>
-                <button
-                  className="btn btn-secondary btn-sm"
-                  disabled={page >= Math.ceil(total / 50)}
-                  onClick={() => setPage((p) => p + 1)}
-                >
-                  Далее →
-                </button>
+          {/* ── 2. Header ── */}
+          <div className="max-w-[1400px] mx-auto px-6 pt-4 pb-1 flex items-center justify-between">
+            <h1 className="text-lg font-semibold text-foreground">Карточки товаров</h1>
+            <div className="flex items-center gap-4">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleResetAndAnalyze}
+                disabled={!!isAnalysisRunning}
+                className="gap-1.5 h-8 text-sm"
+              >
+                {isAnalysisRunning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+                Заново
+              </Button>
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <RefreshCw
+                  className={`h-3.5 w-3.5 ${schedulerStatus?.is_running ? 'text-zone-green' : 'text-muted-foreground'}`}
+                />
+                {schedulerStatus ? (
+                  <span>
+                    {schedulerStatus.last_tick_at
+                      ? `Обновлено: ${new Date(schedulerStatus.last_tick_at + 'Z').toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`
+                      : 'Ожидание...'}
+                    {schedulerStatus.next_tick_in_sec != null && (
+                      <span className="ml-1.5 text-muted-foreground/60">
+                        · след. через {schedulerStatus.next_tick_in_sec < 60
+                          ? `${schedulerStatus.next_tick_in_sec}с`
+                          : `${Math.round(schedulerStatus.next_tick_in_sec / 60)}м`}
+                      </span>
+                    )}
+                  </span>
+                ) : (
+                  <span>Авто-обновление каждые 10 мин</span>
+                )}
               </div>
-            ) : null}
-          </>
-        )}
-      </div>
-    </div>
+            </div>
+          </div>
 
-    {/* Bottom analysis progress banner */}
-    {analysisTask && (
-      <div className="analysis-progress-banner">
-        <div className="analysis-progress-inner">
-          <div className="analysis-progress-left">
-            {analysisTask.status === 'completed'
-              ? <CheckCircle2 size={16} style={{ color: '#16A34A' }} />
-              : analysisTask.status === 'failed'
-              ? <AlertTriangle size={16} style={{ color: '#EF4444' }} />
-              : <Loader2 size={16} className="ws-spin" />}
-            <span className="analysis-progress-step">
-              {analysisTask.status === 'completed' ? '✅ ' : ''}
-              {analysisTask.step}
-            </span>
+          {/* ── 3. FilterPanel ── */}
+          <div className="bg-card border-b border-border px-6 py-3">
+            <div className="max-w-[1400px] mx-auto flex items-center gap-3">
+              <form className="relative w-[260px]" onSubmit={handleSearch}>
+                <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  type="text"
+                  placeholder="ID, артикул или название..."
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="w-full h-8 pl-8 pr-3 text-sm rounded-md border border-border/50 bg-secondary/40 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-colors"
+                />
+              </form>
+
+              <Select value={severityFilter} onValueChange={(v) => handleSeverityChange(v as SeverityFilter)}>
+                <SelectTrigger className="w-[160px] h-8 text-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Все карточки</SelectItem>
+                  <SelectItem value="has_issues">Есть проблемы</SelectItem>
+                  <SelectItem value="no_issues">Нет проблем</SelectItem>
+                  <SelectItem value="postponed">Отложенные</SelectItem>
+                  <SelectItem value="unconfirmed">Не подтверждено</SelectItem>
+                </SelectContent>
+              </Select>
+
+              <div className="flex items-center gap-0.5">
+                <Select value={sortBy} onValueChange={(v) => setSortBy(v as SortFilter)}>
+                  <SelectTrigger className="w-[170px] h-8 text-sm border-dashed">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="issues">По кол-ву проблем</SelectItem>
+                    <SelectItem value="score">По рейтингу</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  onClick={() => setSortDir(d => d === 'desc' ? 'asc' : 'desc')}
+                >
+                  {sortDir === 'desc' ? (
+                    <ArrowDown className="h-3.5 w-3.5 text-muted-foreground" />
+                  ) : (
+                    <ArrowUp className="h-3.5 w-3.5 text-muted-foreground" />
+                  )}
+                </Button>
+              </div>
+
+              {hasActiveFilters && (
+                <Button variant="ghost" size="sm" className="h-8 text-xs text-muted-foreground gap-1.5" onClick={handleReset}>
+                  <X className="h-3.5 w-3.5" />
+                  Сбросить
+                </Button>
+              )}
+
+              <div className="flex-1" />
+
+              <div className="text-xs text-muted-foreground/70 flex items-center gap-1.5 select-none">
+                <span>Товаров <span className="text-foreground/60 font-medium">{visibleCards.length}</span></span>
+                <span className="text-border">·</span>
+                <span>С ошибками <span className="text-destructive/70 font-medium">{cardsWithIssues}</span></span>
+                <span className="text-border">·</span>
+                <span>Критичных <span className="text-destructive/70 font-medium">{criticalCards}</span></span>
+              </div>
+            </div>
           </div>
-          <div className="analysis-progress-bar-wrap">
-            <div
-              className="analysis-progress-bar-fill"
-              style={{ width: `${analysisTask.progress}%`, background: analysisTask.status === 'failed' ? '#EF4444' : '#6366F1' }}
-            />
+
+          {/* ── 4. Content ── */}
+          <div className="max-w-[1400px] mx-auto px-6 py-4">
+            {loading ? (
+              <div className="flex flex-col items-center justify-center py-16 text-center">
+                <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center mb-4">
+                  <Loader2 className="h-8 w-8 text-muted-foreground animate-spin" />
+                </div>
+                <span className="text-sm text-muted-foreground">Загрузка карточек...</span>
+              </div>
+            ) : visibleCards.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-16 text-center">
+                <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center mb-4">
+                  <Package className="h-8 w-8 text-muted-foreground" />
+                </div>
+                <h3 className="text-lg font-medium text-foreground mb-1">Товары не найдены</h3>
+                <p className="text-sm text-muted-foreground">Попробуйте изменить фильтры или строку поиска</p>
+              </div>
+            ) : (
+              <>
+                <p className="text-xs text-muted-foreground mb-3">
+                  Показано <span className="font-medium">{visibleCards.length}</span> товаров
+                </p>
+
+                <div className="grid gap-4">
+                  {visibleCards.map((card) => {
+                    const status = statusForCard(card);
+                    const score = card.score ?? 0;
+                    const potentialGain = Math.max(3, Math.max(0, Math.round((100 - score) * 0.35)));
+                    const confirmation = getCardConfirmation(card);
+                    const isComplete = confirmation.confirmed === confirmation.total;
+                    const hasPartialConfirmation = confirmation.confirmed > 0 && !isComplete;
+                    const StatusIcon = STATUS_STYLES[status.mode].icon;
+
+                    return (
+                      <div key={card.id} className="group bg-card border border-border rounded-xl hover:shadow-md transition-all duration-200">
+                        {/* Main grid row */}
+                        <div className="grid items-center gap-4 p-4" style={{ gridTemplateColumns: '340px 1fr 100px 40px 200px auto' }}>
+                          {/* Col 1: Product */}
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="relative w-14 h-14 rounded-lg overflow-hidden bg-muted flex-shrink-0 flex items-center justify-center border border-border">
+                              {card.main_photo_url ? (
+                                <img src={card.main_photo_url} alt="" className="w-full h-full object-cover" />
+                              ) : (
+                                <Package size={18} className="text-muted-foreground" />
+                              )}
+                              <span
+                                className={`absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full border-2 border-card ${
+                                  status.mode === 'critical' ? 'bg-zone-red' :
+                                  status.mode === 'warning' ? 'bg-zone-yellow' : 'bg-zone-green'
+                                }`}
+                              />
+                            </div>
+                            <div className="flex flex-col gap-0.5 min-w-0">
+                              <a
+                                href={`https://www.wildberries.ru/catalog/${card.nm_id}/detail.aspx`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-sm font-medium text-foreground hover:text-primary hover:underline inline-flex items-start gap-1 max-w-full"
+                              >
+                                <span className="line-clamp-2 break-words">{card.title || `Карточка ${card.nm_id}`}</span>
+                                <ExternalLink className="h-3 w-3 flex-shrink-0 opacity-0 group-hover:opacity-60 transition-opacity mt-0.5" />
+                              </a>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  onClick={() => { navigator.clipboard.writeText(String(card.nm_id)); toast('Скопировано'); }}
+                                  className="inline-flex items-center gap-0.5 text-[11px] font-mono text-muted-foreground hover:text-foreground transition-colors"
+                                >
+                                  {card.nm_id}
+                                  <Copy size={10} className="opacity-0 group-hover:opacity-60" />
+                                </button>
+                                {card.vendor_code && (
+                                  <>
+                                    <span className="text-[11px] text-muted-foreground/40">·</span>
+                                    <button
+                                      onClick={() => { navigator.clipboard.writeText(String(card.vendor_code)); toast('Скопировано'); }}
+                                      className="inline-flex items-center gap-0.5 text-[11px] font-mono text-muted-foreground hover:text-foreground transition-colors"
+                                    >
+                                      {card.vendor_code}
+                                      <Copy size={10} className="opacity-0 group-hover:opacity-60" />
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Col 2: Metric bars */}
+                          <div className="flex items-center">
+                            <div className="flex items-end gap-2.5 justify-center w-full">
+                              {METRICS.map((metric) => {
+                                const mScore = metricScore(card, metric);
+                                const ratio = metric.max > 0 ? mScore / metric.max : 0;
+                                const pct = Math.round(ratio * 100);
+                                const fillHeight = clamp(Math.round(12 + ratio * 30), 6, 44);
+                                const colorClass = metricColor(mScore, metric.max);
+
+                                return (
+                                  <Tooltip key={`${card.id}-${metric.key}`}>
+                                    <TooltipTrigger asChild>
+                                      <div className="flex flex-col items-center gap-1 cursor-default">
+                                        <div className="relative w-[12px] h-[44px] rounded-[4px] bg-muted/50 flex items-end overflow-hidden">
+                                          <span
+                                            className={`block w-full rounded-[4px] transition-all ${colorClass}`}
+                                            style={{ height: `${fillHeight}px` }}
+                                          />
+                                        </div>
+                                        <span className="flex items-center gap-1 text-[10px] text-muted-foreground leading-none">
+                                          <span className={`inline-block w-1.5 h-1.5 rounded-full ${colorClass}`} />
+                                          {metric.label}
+                                        </span>
+                                      </div>
+                                    </TooltipTrigger>
+                                    <TooltipContent side="top" className="text-xs">
+                                      <div className="font-semibold">{pct}%</div>
+                                      <div className="text-muted-foreground">{mScore}/{metric.max}</div>
+                                    </TooltipContent>
+                                  </Tooltip>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          {/* Col 3: Score */}
+                          <div className="flex flex-col items-center gap-0.5 px-4 min-w-[100px]">
+                            <div className="flex items-baseline gap-1">
+                              <span className="text-2xl font-bold text-foreground">
+                                {score}
+                              </span>
+                              <span className="text-sm text-muted-foreground">/ 100</span>
+                            </div>
+                            {potentialGain > 0 && (
+                              <div className="text-xs text-zone-green font-medium">
+                                +{potentialGain}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Col 4: Micro-indicators */}
+                          <div className="flex items-center justify-center gap-1.5">
+                            {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                            {(card as any).has_ab_test ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button className="cursor-pointer hover:opacity-80 transition-opacity">
+                                    <FlaskConical className="h-3.5 w-3.5 text-zone-yellow" />
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="text-xs">
+                                  Активный A/B тест
+                                </TooltipContent>
+                              </Tooltip>
+                            ) /* eslint-disable-next-line @typescript-eslint/no-explicit-any */ : (card as any).has_unanswered_questions ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button className="cursor-pointer hover:opacity-80 transition-opacity">
+                                    <MessageSquare className="h-3.5 w-3.5 text-primary" />
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="text-xs">
+                                  Есть неотвеченные вопросы
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : status.mode === 'success' ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button className="cursor-pointer hover:opacity-80 transition-opacity">
+                                    <FlaskConical className="h-3.5 w-3.5 text-zone-yellow" />
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="text-xs">
+                                  Активный A/B тест
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : hasPartialConfirmation ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button className="cursor-pointer hover:opacity-80 transition-opacity">
+                                    <MessageSquare className="h-3.5 w-3.5 text-primary/70" />
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="text-xs">
+                                  Есть неотвеченные вопросы
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : (
+                              <div className="w-4 h-4" />
+                            )}
+                          </div>
+
+                          {/* Col 5: Status + confirmation */}
+                          {(() => {
+                            const totalIssues = (card.critical_issues_count ?? 0) + (card.warnings_count ?? 0) + (card.improvements_count ?? 0);
+                            const isCorrect = status.mode === 'success';
+
+                            const ConfirmationBar = () => (
+                              <div className="flex items-center gap-1.5 w-full">
+                                <ShieldCheck className={`h-3.5 w-3.5 ${isComplete ? 'text-zone-green' : 'text-muted-foreground/40'}`} />
+                                <div className="flex-1 flex gap-[2px]">
+                                  {Array.from({ length: confirmation.total }, (_, i) => (
+                                    <div
+                                      key={i}
+                                      className={`h-1.5 rounded-full flex-1 ${
+                                        i < confirmation.confirmed
+                                          ? (isComplete ? 'bg-zone-green' : 'bg-zone-yellow')
+                                          : 'bg-muted'
+                                      }`}
+                                    />
+                                  ))}
+                                </div>
+                                <span className={`text-[10px] font-medium tabular-nums ${isComplete ? 'text-zone-green' : 'text-muted-foreground'}`}>
+                                  {confirmation.confirmed}/{confirmation.total}
+                                </span>
+                              </div>
+                            );
+
+                            const Attribution = () => (
+                              <div className="flex items-center gap-1.5 justify-center whitespace-nowrap">
+                                {(() => {
+                                  const reviewerName = confirmation.reviewer || '—';
+                                  return (
+                                    <>
+                                      <Avatar className="h-4 w-4">
+                                        <AvatarFallback className="text-[7px] font-medium bg-muted">{getInitials(reviewerName)}</AvatarFallback>
+                                      </Avatar>
+                                      <span className="text-[10px] text-muted-foreground">{reviewerName}</span>
+                                    </>
+                                  );
+                                })()}
+                                {confirmation.date && (
+                                  <>
+                                    <span className="text-[10px] text-muted-foreground/40">·</span>
+                                    <span className="text-[10px] text-muted-foreground">{confirmation.date}</span>
+                                  </>
+                                )}
+                              </div>
+                            );
+
+                            return (
+                              <div className="flex flex-col items-center gap-1.5 min-w-[140px]">
+                                {/* Badge */}
+                                <div className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap ${STATUS_STYLES[status.mode].badge}`}>
+                                  <StatusIcon className="h-3.5 w-3.5" />
+                                  {status.label}
+                                </div>
+
+                                {/* Error count */}
+                                {totalIssues > 0 && (
+                                  <span className="text-[12px] text-muted-foreground font-medium">
+                                    {pluralErrors(totalIssues)}
+                                  </span>
+                                )}
+
+                                {/* Confirmation section */}
+                                {isCorrect && isComplete ? (
+                                  <>
+                                    <span className="text-[11px] text-foreground font-medium flex items-center gap-1">
+                                      <ShieldCheck className="h-3 w-3 text-zone-green" />
+                                      Подтверждено
+                                    </span>
+                                    {confirmation.reviewer && <Attribution />}
+                                  </>
+                                ) : isCorrect && !isComplete && confirmation.confirmed > 0 ? (
+                                  <div className="w-full px-1 pt-1.5 border-t border-border">
+                                    <div className="flex items-center gap-1 mb-1">
+                                      <AlertTriangle className="h-3 w-3 text-zone-yellow" />
+                                      <span className="text-[11px] text-foreground font-medium">Частично</span>
+                                    </div>
+                                    <ConfirmationBar />
+                                    {confirmation.reviewer && <div className="mt-1"><Attribution /></div>}
+                                  </div>
+                                ) : confirmation.confirmed > 0 ? (
+                                  <div className="w-full px-1 pt-1.5 border-t border-border">
+                                    <ConfirmationBar />
+                                    {confirmation.reviewer && <div className="mt-1"><Attribution /></div>}
+                                  </div>
+                                ) : null}
+                              </div>
+                            );
+                          })()}
+
+                          {/* Col 6: Actions */}
+                          <div className="flex items-center gap-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="gap-1.5 whitespace-nowrap"
+                              onClick={() => navigate(`/workspace/cards/${card.id}`)}
+                            >
+                              Открыть карточку
+                            </Button>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button variant="ghost" size="icon" className="h-8 w-8">
+                                  <MoreVertical className="h-4 w-4" />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end" className="w-56">
+                                <DropdownMenuItem className="gap-2" onClick={() => navigate('/ab-tests')}>
+                                  <FlaskConical className="h-4 w-4" />
+                                  Запустить A/B тест
+                                </DropdownMenuItem>
+                                <DropdownMenuItem className="gap-2" onClick={() => navigate('/photo-studio')}>
+                                  <Camera className="h-4 w-4" />
+                                  Сгенерировать фото
+                                </DropdownMenuItem>
+                                <DropdownMenuItem className="gap-2" onClick={() => navigate('/photo-studio')}>
+                                  <Video className="h-4 w-4" />
+                                  Сгенерировать видео
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </div>
+                        </div>
+
+                        {/* Footer */}
+                        <div className="border-t border-dashed border-border/30 px-4 py-1.5 flex items-center justify-between opacity-60 hover:opacity-90 transition-opacity">
+                          <div className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                            <Sparkles className="h-3 w-3" />
+                            Глубокий AI-анализ медиаконтента · Проверка фото и видео на соответствие требованиям WB
+                          </div>
+                          <Button variant="ghost" size="sm" className="h-6 text-[11px] gap-1 text-muted-foreground hover:text-foreground">
+                            <Sparkles className="h-2.5 w-2.5" />
+                            Запустить · 1 кредит
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Pagination */}
+                {total > 50 && (
+                  <div className="flex items-center justify-center gap-4 mt-6">
+                    <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
+                      ← Назад
+                    </Button>
+                    <span className="text-sm text-muted-foreground">
+                      Страница {page} из {Math.max(1, Math.ceil(total / 50))}
+                    </span>
+                    <Button variant="outline" size="sm" disabled={page >= Math.ceil(total / 50)} onClick={() => setPage((p) => p + 1)}>
+                      Далее →
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
           </div>
-          <span className="analysis-progress-pct">{analysisTask.progress}%</span>
         </div>
-      </div>
-    )}
-    </>
+
+        {/* Bottom analysis progress banner */}
+        {analysisTask && (
+          <div className="fixed bottom-0 left-0 right-0 z-50 bg-foreground/95 backdrop-blur-sm border-t border-border shadow-[0_-4px_24px_rgba(0,0,0,0.3)]">
+            <div className="max-w-[900px] mx-auto flex items-center gap-3 px-6 py-3">
+              <div className="flex items-center gap-2 flex-1 min-w-0">
+                {analysisTask.status === 'completed' ? (
+                  <CheckCircle2 size={16} className="text-zone-green flex-shrink-0" />
+                ) : analysisTask.status === 'failed' ? (
+                  <AlertTriangle size={16} className="text-zone-red flex-shrink-0" />
+                ) : (
+                  <Loader2 size={16} className="animate-spin text-primary flex-shrink-0" />
+                )}
+                <span className="text-sm text-background truncate">
+                  {analysisTask.status === 'completed' ? '✅ ' : ''}
+                  {analysisTask.step}
+                </span>
+              </div>
+              <div className="w-[200px] flex-shrink-0">
+                <Progress
+                  value={analysisTask.progress}
+                  className="h-1.5"
+                />
+              </div>
+              <span className="text-xs text-muted-foreground flex-shrink-0">{analysisTask.progress}%</span>
+            </div>
+          </div>
+        )}
+      </>
+    </TooltipProvider>
   );
 }

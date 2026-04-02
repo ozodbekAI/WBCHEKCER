@@ -477,7 +477,15 @@ async def _run_reset_and_analyze(task_id: str, store_id: int):
                 await db.execute(
                     sa_update(Card)
                     .where(Card.id.in_(card_ids))
-                    .values(score=0, score_breakdown={})
+                    .values(
+                        score=0,
+                        score_breakdown={},
+                        critical_issues_count=0,
+                        warnings_count=0,
+                        improvements_count=0,
+                        growth_points_count=0,
+                        last_analysis_at=None,
+                    )
                 )
                 await db.commit()
 

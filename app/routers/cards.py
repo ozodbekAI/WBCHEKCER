@@ -1,20 +1,43 @@
+import asyncio
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import settings
 from ..core.database import get_db
-from ..core.security import get_current_user
-from ..models import User, Store, Card, StoreStatus, IssueStatus
-from ..schemas import CardOut, CardDetail, CardListOut
-from ..services import get_store_by_id, get_card_by_id, get_store_cards, analyze_card
+from ..core.security import get_current_user, require_permission
+from ..models import User, Store, Card, CardIssue, StoreStatus, IssueStatus
+from ..schemas import CardDraftOut, CardDraftPayload, CardOut, CardDetail, CardListOut
+from ..services import get_store_by_id, get_card_by_id, get_store_cards, analyze_card, update_store_stats
+from ..services.card_service import (
+    ensure_card_issue_consistency,
+    build_description_editor_keywords,
+    generate_card_description_suggestion,
+)
+from ..services.approval_service import (
+    apply_card_raw_snapshot,
+    build_card_approval_changes,
+    build_card_update_payload,
+)
+from ..services.issue_service import mark_applied_to_wb
 from ..services.wb_api import WildberriesAPI
+from ..services.workflow_service import (
+    CARD_WORKFLOW_SECTIONS,
+    confirm_card_section,
+    delete_card_draft,
+    get_card_confirmation_summaries,
+    get_preferred_card_draft,
+    list_confirmed_sections,
+    save_card_draft,
+    unconfirm_card_section,
+)
 
 router = APIRouter(prefix="/stores/{store_id}/cards", tags=["Cards"])
 
@@ -30,6 +53,34 @@ ALLOWED_REMOTE_HOST_SUFFIXES = (
 class ReplaceWbPhotoRequest(BaseModel):
     source_url: str
     slot: int = Field(1, ge=1, le=30)
+
+
+class SyncCardPhotosRequest(BaseModel):
+    photos: List[str] = Field(..., min_length=1, max_length=30)
+
+
+class DescriptionEditorDraftRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    characteristics: Dict[str, Any] = Field(default_factory=dict)
+
+
+class DescriptionEditorContextRequest(BaseModel):
+    draft: Optional[DescriptionEditorDraftRequest] = None
+
+
+class DescriptionEditorContextOut(BaseModel):
+    field: str = "description"
+    keywords: List[str] = Field(default_factory=list)
+
+
+class DescriptionGenerateRequest(DescriptionEditorContextRequest):
+    instructions: Optional[str] = Field(None, max_length=1200)
+
+
+class DescriptionGenerateOut(DescriptionEditorContextOut):
+    value: str
+    reason: Optional[str] = None
 
 
 def _is_allowed_remote_host(host: str) -> bool:
@@ -154,6 +205,108 @@ def _extract_wb_photo_urls(raw_photos: Any) -> List[str]:
     return urls
 
 
+def _extract_wb_video_urls(raw_videos: Any) -> List[str]:
+    urls: List[str] = []
+    seen: set[str] = set()
+    if not isinstance(raw_videos, list):
+        return urls
+
+    for item in raw_videos:
+        url: Optional[str] = None
+        if isinstance(item, str):
+            url = item
+        elif isinstance(item, dict):
+            url = (
+                item.get("url")
+                or item.get("src")
+                or item.get("fileUrl")
+                or item.get("file_url")
+                or item.get("link")
+            )
+        if not url:
+            continue
+        s = str(url).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        urls.append(s)
+    return urls
+
+
+def _extract_wb_characteristics(raw_characteristics: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if not isinstance(raw_characteristics, list):
+        return out
+
+    for item in raw_characteristics:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        value = item.get("value", item.get("values"))
+        if isinstance(value, list):
+            out[name] = ", ".join(str(v) for v in value if str(v).strip())
+        else:
+            out[name] = value
+    return out
+
+
+def _extract_wb_dimensions(raw_dimensions: Any) -> Dict[str, Any]:
+    dims = raw_dimensions if isinstance(raw_dimensions, dict) else {}
+    return {
+        "length": dims.get("length"),
+        "width": dims.get("width"),
+        "height": dims.get("height"),
+        "weight": dims.get("weightBrutto", dims.get("weight")),
+    }
+
+
+def _apply_wb_card_snapshot(card: Card, raw: Dict[str, Any]) -> None:
+    photos = _extract_wb_photo_urls(raw.get("photos"))
+    videos = _extract_wb_video_urls(raw.get("videos"))
+
+    card.imt_id = raw.get("imtID")
+    card.vendor_code = raw.get("vendorCode")
+    card.title = raw.get("title")
+    card.brand = raw.get("brand")
+    card.description = raw.get("description")
+    card.subject_id = raw.get("subjectID")
+    card.subject_name = raw.get("subjectName")
+    card.category_name = raw.get("object")
+    card.photos = photos
+    card.videos = videos
+    card.photos_count = len(photos)
+    card.videos_count = len(videos)
+    card.characteristics = _extract_wb_characteristics(raw.get("characteristics"))
+    card.dimensions = _extract_wb_dimensions(raw.get("dimensions"))
+    card.raw_data = raw
+
+
+async def _refresh_local_card_from_wb(
+    db: AsyncSession,
+    *,
+    store_id: int,
+    nm_id: int,
+    wb_api: WildberriesAPI,
+) -> Optional[Card]:
+    card_r = await db.execute(
+        select(Card).where(Card.store_id == store_id, Card.nm_id == nm_id)
+    )
+    card = card_r.scalar_one_or_none()
+    if not card:
+        return None
+
+    detail = await wb_api.get_card_detail(nm_id)
+    raw = detail.get("card") if detail.get("success") else None
+    if isinstance(raw, dict):
+        _apply_wb_card_snapshot(card, raw)
+        await db.commit()
+        await db.refresh(card)
+
+    return card
+
+
 def _map_wb_card_to_front(raw: Dict[str, Any]) -> Dict[str, Any]:
     photos = _extract_wb_photo_urls(raw.get("photos"))
     return {
@@ -190,6 +343,16 @@ async def get_user_store(
     return store
 
 
+async def _get_store_card(db: AsyncSession, store_id: int, card_id: int) -> Card:
+    card = await get_card_by_id(db, card_id)
+    if not card or card.store_id != store_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Card not found",
+        )
+    return card
+
+
 @router.get("", response_model=CardListOut)
 async def list_cards(
     store: Store = Depends(get_user_store),
@@ -200,6 +363,9 @@ async def list_cards(
     min_score: Optional[int] = Query(None, ge=0, le=100),
     max_score: Optional[int] = Query(None, ge=0, le=100),
     has_critical: Optional[bool] = None,
+    has_issues: Optional[bool] = None,
+    no_issues: Optional[bool] = None,
+    is_fully_confirmed: Optional[bool] = None,
 ):
     """Get cards for a store with filters"""
     skip = (page - 1) * limit
@@ -212,10 +378,22 @@ async def list_cards(
         min_score=min_score,
         max_score=max_score,
         has_critical=has_critical,
+        has_issues=has_issues,
+        no_issues=no_issues,
+        is_fully_confirmed=is_fully_confirmed,
     )
+    summaries = await get_card_confirmation_summaries(db, [card.id for card in cards])
+
+    items = []
+    for card in cards:
+        payload = CardOut.model_validate(card).model_dump()
+        summary = summaries.get(card.id)
+        if summary:
+            payload["confirmation_summary"] = summary.model_dump()
+        items.append(CardOut.model_validate(payload))
     
     return CardListOut(
-        items=[CardOut.model_validate(c) for c in cards],
+        items=items,
         total=total,
         page=page,
         limit=limit,
@@ -274,6 +452,8 @@ async def replace_wb_card_photo(
     nm_id: int,
     payload: ReplaceWbPhotoRequest,
     store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("cards.sync")),
 ):
     """
     Replace WB card photo slot from a source image URL.
@@ -309,7 +489,8 @@ async def replace_wb_card_photo(
             detail=f"WB photo replace failed: {result.get('error', 'Unknown error')}",
         )
 
-    photos = result.get("photos") or []
+    local_card = await _refresh_local_card_from_wb(db, store_id=store.id, nm_id=int(nm_id), wb_api=wb_api)
+    photos = local_card.photos if local_card else (result.get("photos") or [])
     return {
         "ok": True,
         "nm_id": int(nm_id),
@@ -390,6 +571,317 @@ async def get_cards_queue(
     return output
 
 
+@router.get("/{card_id}/confirmed-sections", response_model=List[str])
+async def get_confirmed_sections(
+    card_id: int,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_store_card(db, store.id, card_id)
+    return await list_confirmed_sections(db, card_id)
+
+
+@router.post("/{card_id}/confirmed-sections/{section}", status_code=204)
+async def confirm_section_endpoint(
+    card_id: int,
+    section: str,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _get_store_card(db, store.id, card_id)
+    normalized = (section or "").strip().lower()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Section is required")
+    await confirm_card_section(db, card_id, normalized, current_user.id)
+    return Response(status_code=204)
+
+
+@router.delete("/{card_id}/confirmed-sections/{section}", status_code=204)
+async def unconfirm_section_endpoint(
+    card_id: int,
+    section: str,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_store_card(db, store.id, card_id)
+    normalized = (section or "").strip().lower()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Section is required")
+    await unconfirm_card_section(db, card_id, normalized)
+    return Response(status_code=204)
+
+
+@router.get("/{card_id}/draft", response_model=Optional[CardDraftOut])
+async def get_card_draft_endpoint(
+    card_id: int,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _get_store_card(db, store.id, card_id)
+    return await get_preferred_card_draft(db, card_id, current_user.id)
+
+
+@router.put("/{card_id}/draft", response_model=CardDraftOut)
+async def save_card_draft_endpoint(
+    card_id: int,
+    payload: CardDraftPayload,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _get_store_card(db, store.id, card_id)
+    return await save_card_draft(
+        db,
+        card_id=card_id,
+        author_id=current_user.id,
+        data=payload.model_dump(exclude_none=True),
+    )
+
+
+@router.delete("/{card_id}/draft", status_code=204)
+async def delete_card_draft_endpoint(
+    card_id: int,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _get_store_card(db, store.id, card_id)
+    await delete_card_draft(db, card_id, current_user.id)
+    return Response(status_code=204)
+
+
+@router.post("/{card_id}/apply", response_model=CardDetail)
+async def apply_card_changes_endpoint(
+    card_id: int,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("cards.sync")),
+):
+    card = await _get_store_card(db, store.id, card_id)
+
+    confirmed_sections = set(await list_confirmed_sections(db, card.id))
+    missing_sections = [section for section in CARD_WORKFLOW_SECTIONS if section not in confirmed_sections]
+    if missing_sections:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Confirm all sections before applying: {', '.join(missing_sections)}",
+        )
+
+    try:
+        changes = await build_card_approval_changes(db, card.id, current_user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not changes:
+        raise HTTPException(status_code=400, detail="No card changes found to apply")
+
+    update_payload, next_raw_data = build_card_update_payload(card, changes)
+
+    wb_api = WildberriesAPI(store.api_key)
+    wb_result = await wb_api.update_card(update_payload)
+    if not wb_result.get("success"):
+        error_msg = wb_result.get("error", "Unknown WB error")
+        raise HTTPException(status_code=502, detail=f"WB API error: {error_msg}")
+
+    issue_ids = [int(change["issue_id"]) for change in changes if change.get("issue_id")]
+    if issue_ids:
+        await mark_applied_to_wb(db, issue_ids)
+
+    apply_card_raw_snapshot(card, next_raw_data)
+    card.skip_next_reanalyze = True
+    await db.commit()
+
+    try:
+        await analyze_card(db, card)
+    except Exception:
+        pending_by_severity = await db.execute(
+            select(CardIssue.severity, func.count())
+            .where(
+                CardIssue.card_id == card.id,
+                CardIssue.status == IssueStatus.PENDING,
+            )
+            .group_by(CardIssue.severity)
+        )
+        counts = {
+            str(severity.value if hasattr(severity, "value") else severity): count
+            for severity, count in pending_by_severity.all()
+        }
+        card.critical_issues_count = int(counts.get("critical", 0) or 0)
+        card.warnings_count = int(counts.get("warning", 0) or 0)
+        card.improvements_count = int(counts.get("improvement", 0) or 0)
+        await db.commit()
+
+    await delete_card_draft(db, card.id, current_user.id)
+    await update_store_stats(db, store.id)
+    await db.refresh(card)
+    return CardDetail.model_validate(card)
+
+
+@router.post("/{card_id}/photos/sync", response_model=CardDetail)
+async def sync_card_photos_endpoint(
+    card_id: int,
+    payload: SyncCardPhotosRequest,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("cards.sync")),
+):
+    card = await _get_store_card(db, store.id, card_id)
+
+    desired_sources: List[str] = []
+    seen_sources: set[str] = set()
+    for raw_url in payload.photos:
+        source_url = str(raw_url or "").strip()
+        if not source_url:
+            raise HTTPException(status_code=400, detail="Photo URLs must be non-empty")
+        normalized = WildberriesAPI.strip_url_query(source_url)
+        if normalized in seen_sources:
+            raise HTTPException(status_code=400, detail="Duplicate photo URLs are not allowed")
+        seen_sources.add(normalized)
+        desired_sources.append(source_url)
+
+    wb_api = WildberriesAPI(store.api_key)
+    current_urls = await wb_api.get_card_photo_urls(card.nm_id)
+
+    uploaded_by_index: Dict[int, str] = {}
+    for idx, source_url in enumerate(desired_sources):
+        if wb_api.is_wb_media_url(source_url):
+            continue
+
+        try:
+            content, content_type, ext = await _load_image_bytes_from_source(source_url)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Cannot load source image: {exc}")
+
+        upload_result = await wb_api.upload_card_photo(
+            nm_id=card.nm_id,
+            content=content,
+            content_type=content_type,
+            filename=f"card_{card.nm_id}_{idx + 1}{ext}",
+        )
+        if not upload_result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"WB photo upload failed: {upload_result.get('error', 'Unknown error')}",
+            )
+        uploaded_url = str(upload_result.get("photo_url") or "").strip()
+        if not uploaded_url:
+            raise HTTPException(status_code=502, detail="WB photo upload did not return a photo URL")
+        uploaded_by_index[idx] = uploaded_url
+
+    latest_urls = await wb_api.get_card_photo_urls(card.nm_id)
+    if not latest_urls:
+        latest_urls = current_urls
+
+    final_urls: List[str] = []
+    seen_final: set[str] = set()
+    for idx, source_url in enumerate(desired_sources):
+        candidate = uploaded_by_index.get(idx) or source_url
+        resolved = wb_api.resolve_card_photo_url(candidate, latest_urls)
+        if not resolved:
+            resolved = uploaded_by_index.get(idx)
+        if not resolved:
+            raise HTTPException(status_code=400, detail=f"Photo not found on WB card: {source_url}")
+
+        normalized = WildberriesAPI.strip_url_query(resolved)
+        if normalized in seen_final:
+            raise HTTPException(status_code=400, detail="Resolved photo list contains duplicates")
+        seen_final.add(normalized)
+        final_urls.append(resolved)
+
+    save_result = await wb_api.save_card_media_state(nm_id=card.nm_id, urls=final_urls)
+    if not save_result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"WB media save failed: {save_result.get('error', 'Unknown error')}",
+        )
+
+    refreshed_card = await _refresh_local_card_from_wb(db, store_id=store.id, nm_id=card.nm_id, wb_api=wb_api)
+    if refreshed_card:
+        card = refreshed_card
+    else:
+        card.photos = final_urls
+        card.photos_count = len(final_urls)
+        raw_data = dict(card.raw_data or {})
+        raw_data["photos"] = [{"big": url} for url in final_urls]
+        card.raw_data = raw_data
+        await db.commit()
+        await db.refresh(card)
+
+    card.skip_next_reanalyze = True
+    await db.commit()
+
+    try:
+        await analyze_card(db, card)
+    except Exception:
+        pending_by_severity = await db.execute(
+            select(CardIssue.severity, func.count())
+            .where(
+                CardIssue.card_id == card.id,
+                CardIssue.status == IssueStatus.PENDING,
+            )
+            .group_by(CardIssue.severity)
+        )
+        counts = {
+            str(severity.value if hasattr(severity, "value") else severity): count
+            for severity, count in pending_by_severity.all()
+        }
+        card.critical_issues_count = int(counts.get("critical", 0) or 0)
+        card.warnings_count = int(counts.get("warning", 0) or 0)
+        card.improvements_count = int(counts.get("improvement", 0) or 0)
+        await db.commit()
+
+    await update_store_stats(db, store.id)
+    await db.refresh(card)
+    return CardDetail.model_validate(card)
+
+
+@router.post("/{card_id}/description-editor/context", response_model=DescriptionEditorContextOut)
+async def get_description_editor_context(
+    card_id: int,
+    payload: DescriptionEditorContextRequest,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+):
+    card = await _get_store_card(db, store.id, card_id)
+    draft_payload = payload.draft.model_dump(exclude_none=True) if payload.draft else None
+    keywords = build_description_editor_keywords(card, draft_payload)
+    return DescriptionEditorContextOut(keywords=keywords)
+
+
+@router.post("/{card_id}/description-editor/generate", response_model=DescriptionGenerateOut)
+async def generate_description_editor_value(
+    card_id: int,
+    payload: DescriptionGenerateRequest,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+):
+    card = await _get_store_card(db, store.id, card_id)
+    draft_payload = payload.draft.model_dump(exclude_none=True) if payload.draft else None
+
+    try:
+        result = await asyncio.wait_for(
+            generate_card_description_suggestion(
+                card,
+                draft=draft_payload,
+                instructions=payload.instructions,
+            ),
+            timeout=90,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Description generation timed out")
+    except RuntimeError as exc:
+        detail = str(exc) or "Description generation failed"
+        if "disabled" in detail.lower():
+            raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(status_code=422, detail=detail)
+    except Exception:
+        raise HTTPException(status_code=502, detail="Description generation failed")
+
+    return DescriptionGenerateOut(**result)
+
+
 @router.get("/{card_id}", response_model=CardDetail)
 async def get_card(
     card_id: int,
@@ -397,14 +889,9 @@ async def get_card(
     db: AsyncSession = Depends(get_db),
 ):
     """Get detailed card info"""
-    card = await get_card_by_id(db, card_id)
-    
-    if not card or card.store_id != store.id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Card not found"
-        )
-    
+    card = await _get_store_card(db, store.id, card_id)
+    card = await ensure_card_issue_consistency(db, card, reanalyze_if_missing=True)
+
     return CardDetail.model_validate(card)
 
 
@@ -415,14 +902,8 @@ async def analyze_single_card(
     db: AsyncSession = Depends(get_db),
 ):
     """Re-analyze a single card"""
-    card = await get_card_by_id(db, card_id)
-    
-    if not card or card.store_id != store.id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Card not found"
-        )
-    
+    card = await _get_store_card(db, store.id, card_id)
+
     issues, _tokens = await analyze_card(db, card)
     
     return {

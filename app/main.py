@@ -24,6 +24,7 @@ from .routers import (
     sync_router,
     fixed_files_router,
     scheduler_router,
+    sku_economics_router,
 )
 
 
@@ -73,6 +74,7 @@ app.include_router(team_router)
 app.include_router(sync_router)
 app.include_router(fixed_files_router)
 app.include_router(scheduler_router)
+app.include_router(sku_economics_router)
 
 # Serve frontend static files (built React app)
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"

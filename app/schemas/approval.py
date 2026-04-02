@@ -35,6 +35,7 @@ class ApprovalOut(BaseModel):
 class ApprovalSubmitRequest(BaseModel):
     card_id: int
     note: Optional[str] = None
+    reviewer_ids: Optional[list[int]] = None
 
 
 class ApprovalReviewRequest(BaseModel):

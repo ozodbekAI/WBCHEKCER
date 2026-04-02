@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useStore } from '../contexts/StoreContext';
 import api, { API_ORIGIN } from '../api/client';
 import {
@@ -148,6 +148,8 @@ function extractCardPreview(card: WbCardOption): string {
 
 export const ABTestsPage: React.FC = () => {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const returnTo = searchParams.get('returnTo');
   const { activeStore, loadStores } = useStore();
 
   const [view, setView] = useState<'home' | 'wizard'>('home');
@@ -1079,7 +1081,7 @@ export const ABTestsPage: React.FC = () => {
   return (
     <div className="abt-page">
       <div className="abt-shell">
-        <div className="abt-home-top-link" onClick={() => navigate('/workspace')}>‹ Рабочее пространство</div>
+        <div className="abt-home-top-link" onClick={() => navigate(returnTo || '/workspace')}>{returnTo ? '‹ К карточке' : '‹ Рабочее пространство'}</div>
 
         <section className="abt-hero">
           <div className="abt-hero-main">

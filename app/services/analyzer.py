@@ -83,8 +83,8 @@ class CardAnalyzer:
                 "severity": IssueSeverity.WARNING,
                 "category": IssueCategory.PHOTOS,
                 "check": self._check_few_photos,
-                "title": "Мало фотографий",
-                "description": f"Рекомендуется минимум {settings.MIN_PHOTOS_COUNT} фото, оптимально {settings.RECOMMENDED_PHOTOS_COUNT}",
+                "title": "Недостаточно фотографий",
+                "description": f"Если в карточке меньше {settings.MEDIA_WARNING_PHOTOS_COUNT} фото, она попадает в блок медиа-задач и теряет конверсию",
                 "score_impact": 10,
             },
             {
@@ -299,21 +299,24 @@ class CardAnalyzer:
         return {"has_issue": False}
     
     def _check_few_photos(self, card: Card) -> Dict[str, Any]:
-        if 0 < card.photos_count < settings.MIN_PHOTOS_COUNT:
+        threshold = max(1, int(getattr(settings, "MEDIA_WARNING_PHOTOS_COUNT", 30) or 30))
+        if 0 < card.photos_count < threshold:
             return {
                 "has_issue": True,
                 "current_value": f"{card.photos_count} фото",
-                "suggested_value": f"Добавьте ещё {settings.MIN_PHOTOS_COUNT - card.photos_count} фото",
+                "suggested_value": f"Добавьте ещё {threshold - card.photos_count} фото, чтобы довести карточку до {threshold}",
                 "field_path": "photos",
             }
         return {"has_issue": False}
-    
+
     def _check_can_add_photos(self, card: Card) -> Dict[str, Any]:
-        if settings.MIN_PHOTOS_COUNT <= card.photos_count < settings.RECOMMENDED_PHOTOS_COUNT:
+        media_threshold = max(1, int(getattr(settings, "MEDIA_WARNING_PHOTOS_COUNT", 30) or 30))
+        recommended_threshold = max(media_threshold, int(getattr(settings, "RECOMMENDED_PHOTOS_COUNT", media_threshold) or media_threshold))
+        if media_threshold <= card.photos_count < recommended_threshold:
             return {
                 "has_issue": True,
                 "current_value": f"{card.photos_count} фото",
-                "suggested_value": f"Рекомендуем {settings.RECOMMENDED_PHOTOS_COUNT} фото",
+                "suggested_value": f"Рекомендуем {recommended_threshold} фото",
                 "field_path": "photos",
             }
         return {"has_issue": False}

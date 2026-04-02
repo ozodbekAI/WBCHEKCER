@@ -227,8 +227,10 @@ export default function PhotoStudioPage() {
   const navigate = useNavigate();
   const cardNmId = searchParams.get('nmId');
   const cardIdParam = searchParams.get('cardId');
+  const returnTab = searchParams.get('returnTab');
   const requestedMode = searchParams.get('mode');
   const requestedGenTab = searchParams.get('genTab');
+  const cardReturnUrl = cardIdParam ? `/workspace/cards/${cardIdParam}${returnTab ? `?tab=${returnTab}` : ''}` : null;
   const initialMode: 'chat' | 'generator' = requestedMode === 'generator' ? 'generator' : 'chat';
   const initialGenTab: GeneratorTab =
     requestedGenTab && GEN_TABS.some((tab) => tab.id === requestedGenTab)
@@ -478,6 +480,13 @@ export default function PhotoStudioPage() {
       setCardPhotosOriginal([]);
     }
   };
+
+  const resolveLocalCardId = useCallback(async (nmId: number): Promise<number | null> => {
+    if (!activeStore) return null;
+    const cards = await api.getCards(activeStore.id, 1, 10, { search: String(nmId) });
+    const match = (cards?.items || []).find((item: any) => Number(item?.nm_id) === Number(nmId));
+    return match?.id ? Number(match.id) : null;
+  }, [activeStore]);
 
   const loadGalleryAssets = async (type: 'scene' | 'model' = galleryType) => {
     setGalleryLoading(true);
@@ -998,9 +1007,6 @@ export default function PhotoStudioPage() {
     setAddedToCard((prev) => new Set(prev).add(photo.id));
   };
 
-  const msgCount = useMemo(() => messages.filter((m) => m.type !== 'welcome' && m.dbId).length, [messages]);
-  const isLocked = msgCount >= 100;
-
   const filteredProducts = useMemo(() => {
     if (!productsQuery.trim()) return products;
     const q = productsQuery.trim().toLowerCase();
@@ -1152,6 +1158,10 @@ export default function PhotoStudioPage() {
 
   // Card photo management
   const handleCardPhotoDelete = (index: number) => {
+    if (selectedProductPhotos.length <= 1) {
+      alert('Нельзя удалить последнее фото карточки');
+      return;
+    }
     setSelectedProductPhotos((prev) => {
       const next = [...prev];
       next.splice(index, 1);
@@ -1176,22 +1186,15 @@ export default function PhotoStudioPage() {
     if (!file || !file.type.startsWith('image/')) return;
     e.target.value = '';
 
-    if (!activeStore || !selectedProduct) return;
-    const nextSlot = selectedProductPhotos.length + 1;
+    if (!selectedProduct) return;
 
     try {
       const uploaded = await uploadFile(file);
       if (!uploaded.url) return;
-      // Upload to WB immediately
-      const res = await api.replaceWbCardPhoto(activeStore.id, selectedProduct.nm_id, nextSlot, uploaded.url);
-      const nextPhotos = (Array.isArray(res?.photos) ? res.photos : [])
-        .map((u: any) => toAbsoluteMediaUrl(String(u || '')))
-        .filter(Boolean);
-      if (nextPhotos.length > 0) {
-        setSelectedProductPhotos(nextPhotos);
-        setCardPhotosOriginal(nextPhotos);
-      }
-      await loadProducts();
+      const nextUrl = toAbsoluteMediaUrl(String(uploaded.url || ''));
+      if (!nextUrl) return;
+      setSelectedProductPhotos((prev) => [...prev, nextUrl]);
+      setCardPhotosDirty(true);
     } catch (err) {
       console.error('Card photo upload error:', err);
       alert('Не удалось загрузить фото');
@@ -1202,12 +1205,16 @@ export default function PhotoStudioPage() {
     if (!activeStore || !selectedProduct || cardPhotosSaving) return;
     setCardPhotosSaving(true);
     try {
-      // Re-upload each photo to its correct slot position
-      for (let i = 0; i < selectedProductPhotos.length; i++) {
-        const url = selectedProductPhotos[i];
-        await api.replaceWbCardPhoto(activeStore.id, selectedProduct.nm_id, i + 1, url);
-      }
-      setCardPhotosOriginal([...selectedProductPhotos]);
+      const localCardId = await resolveLocalCardId(selectedProduct.nm_id);
+      if (!localCardId) throw new Error('Карточка не найдена в локальной базе');
+
+      const updated = await api.syncCardPhotos(activeStore.id, localCardId, selectedProductPhotos);
+      const nextPhotos = (Array.isArray(updated?.photos) ? updated.photos : [])
+        .map((u: any) => toAbsoluteMediaUrl(String(u || '')))
+        .filter(Boolean);
+
+      setSelectedProductPhotos(nextPhotos);
+      setCardPhotosOriginal(nextPhotos);
       setCardPhotosDirty(false);
       await loadProducts();
     } catch (err) {
@@ -1444,7 +1451,7 @@ export default function PhotoStudioPage() {
     <div className="ps-root ps-root--v2">
       <div className="ps-nav-header">
         {cardIdParam ? (
-          <button className="ps-nav-back" onClick={() => navigate(`/workspace/cards/${cardIdParam}`)}>
+          <button className="ps-nav-back" onClick={() => navigate(cardReturnUrl!)}>
             <ChevronLeft size={16} />
             К карточке
           </button>
@@ -1488,7 +1495,7 @@ export default function PhotoStudioPage() {
                   <span>Фото карточки</span>
                 </button>
               ) : cardIdParam ? (
-                <button className="ps-side-back" onClick={() => navigate(`/workspace/cards/${cardIdParam}`)}>
+                <button className="ps-side-back" onClick={() => navigate(cardReturnUrl!)}>
                   <ArrowLeft size={14} />
                   <span>К карточке</span>
                 </button>
@@ -1874,7 +1881,7 @@ export default function PhotoStudioPage() {
               )}
 
               <form className="ps-input" onSubmit={(e) => { e.preventDefault(); void handleSend(); }}>
-                <button type="button" className="ps-icon-btn" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || isLocked || !canAttachMore}>
+                <button type="button" className="ps-icon-btn" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || !canAttachMore}>
                   <Paperclip size={18} />
                 </button>
                 <input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={handleFileSelect} />
@@ -1885,14 +1892,14 @@ export default function PhotoStudioPage() {
                   onChange={(e) => setInputText(e.target.value)}
                   onKeyDown={onKeyDown}
                   placeholder={attachedPhotos.length ? 'Что сделать с фото?' : 'Напишите, что хотите сделать...'}
-                  disabled={isStreaming || isLocked}
+                  disabled={isStreaming}
                   className="ps-text-input"
                 />
 
                 <button
                   type="submit"
                   className={`ps-send-btn ps-send-btn--pill ${(inputText.trim() || attachedPhotos.length) && !isStreaming ? 'ps-send-btn--active' : ''}`}
-                  disabled={(!inputText.trim() && !attachedPhotos.length) || isStreaming || isLocked}
+                  disabled={(!inputText.trim() && !attachedPhotos.length) || isStreaming}
                 >
                   <Send size={18} />
                 </button>

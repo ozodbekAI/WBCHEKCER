@@ -114,6 +114,7 @@ async def get_card_issues(
 async def get_store_issues(
     db: AsyncSession,
     store_id: int,
+    card_id: Optional[int] = None,
     status: Optional[IssueStatus] = None,
     severity: Optional[IssueSeverity] = None,
     category: Optional[str] = None,
@@ -131,6 +132,10 @@ async def get_store_issues(
         .join(Card)
         .where(Card.store_id == store_id)
     )
+
+    if card_id is not None:
+        base_filter = base_filter.where(CardIssue.card_id == card_id)
+        count_filter = count_filter.where(CardIssue.card_id == card_id)
     
     if status:
         base_filter = base_filter.where(CardIssue.status == status)

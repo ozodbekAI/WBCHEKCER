@@ -1,7 +1,9 @@
 import asyncio
+import re
 from typing import Optional, Dict, Any, List
 import httpx
 from datetime import datetime
+from urllib.parse import urlparse, urlunparse
 
 from ..core.config import settings
 
@@ -67,6 +69,62 @@ class WildberriesAPI:
         if ct == "image/jpeg" or ct == "image/jpg":
             return ".jpg"
         return ".jpg"
+
+    @staticmethod
+    def strip_url_query(url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return raw
+        try:
+            parsed = urlparse(raw)
+            if not parsed.scheme:
+                return raw.split("?", 1)[0].split("#", 1)[0]
+            return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        except Exception:
+            return raw.split("?", 1)[0].split("#", 1)[0]
+
+    @staticmethod
+    def extract_photo_number(url: str) -> Optional[int]:
+        raw = str(url or "")
+        match = re.search(r"/(?:big|c\d+x\d+)/(\d+)\.", raw)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    @staticmethod
+    def is_wb_media_url(url: str) -> bool:
+        raw = str(url or "").strip()
+        if not raw:
+            return False
+        try:
+            host = (urlparse(raw).hostname or "").lower()
+        except Exception:
+            host = ""
+        return any(
+            token in host
+            for token in ("wbbasket.ru", "wildberries.ru", "wb.ru", "wbstatic.net")
+        )
+
+    def resolve_card_photo_url(self, candidate: str, card_urls: List[str]) -> Optional[str]:
+        cand = self.strip_url_query(candidate)
+        if not cand:
+            return None
+
+        cleaned_urls = [self.strip_url_query(url) for url in card_urls]
+        if cand in cleaned_urls:
+            return card_urls[cleaned_urls.index(cand)]
+
+        photo_number = self.extract_photo_number(cand)
+        if photo_number is None:
+            return None
+
+        for url in card_urls:
+            if self.extract_photo_number(url) == photo_number:
+                return url
+        return None
     
     async def ping(self, api_type: str = "common") -> Dict[str, Any]:
         """Check connection to WB API
@@ -435,6 +493,80 @@ class WildberriesAPI:
                 "success": False,
                 "error": "Uploaded, but could not resolve updated photo URL",
                 "photos": last_urls,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    async def save_card_media_state(
+        self,
+        *,
+        nm_id: int,
+        urls: List[str],
+        poll_attempts: int = 12,
+        poll_sleep_sec: float = 1.5,
+    ) -> Dict[str, Any]:
+        """
+        Persist the full WB photo order using /content/v3/media/save.
+        The payload replaces the current media list, so `urls` must contain the
+        exact final order that should remain on the card.
+        """
+        desired_urls = [str(url).strip() for url in (urls or []) if str(url).strip()]
+        if not desired_urls:
+            return {
+                "success": False,
+                "error": "At least one photo URL is required",
+            }
+
+        payload = {"nmId": int(nm_id), "data": desired_urls}
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+                response = await client.post(
+                    f"{settings.WB_CONTENT_API_URL}/content/v3/media/save",
+                    headers=self.headers,
+                    json=payload,
+                )
+                if response.status_code >= 400:
+                    return {
+                        "success": False,
+                        "error": f"WB media save failed: {response.status_code}",
+                        "details": response.text,
+                    }
+
+            last_urls = desired_urls
+            last_clean: Optional[List[str]] = None
+            stable_hits = 0
+            attempts = max(int(poll_attempts or 1), 1)
+            sleep_sec = max(float(poll_sleep_sec or 0.5), 0.2)
+
+            for _ in range(attempts):
+                await asyncio.sleep(sleep_sec)
+                current_urls = await self.get_card_photo_urls(nm_id)
+                if current_urls:
+                    last_urls = current_urls
+                current_clean = [self.strip_url_query(url) for url in current_urls]
+
+                if len(current_clean) == len(desired_urls):
+                    if current_clean == last_clean:
+                        stable_hits += 1
+                    else:
+                        stable_hits = 1
+                        last_clean = current_clean
+
+                    if stable_hits >= 2:
+                        return {
+                            "success": True,
+                            "photos": current_urls,
+                            "stabilized": True,
+                        }
+
+            return {
+                "success": True,
+                "photos": last_urls,
+                "stabilized": False,
             }
         except Exception as e:
             return {

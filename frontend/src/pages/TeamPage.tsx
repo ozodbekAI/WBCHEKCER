@@ -2,12 +2,26 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, Users, Shield, UserPlus, ChevronDown,
-  Check, X, MoreVertical, Eye, Edit3, Crown, Star, Settings, ToggleLeft, ToggleRight
+  Check, X, MoreVertical, Eye, Edit3, Crown, Star, Settings
 } from 'lucide-react';
 import api from '../api/client';
 import { useAuth } from '../contexts/AuthContext';
 import { useStore } from '../contexts/StoreContext';
 import type { TeamMember, RoleInfo, PermissionInfo, PermissionsListOut } from '../types';
+
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Badge } from '@/components/ui/badge';
+import { Switch } from '@/components/ui/switch';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 const ROLE_LABELS: Record<string, string> = {
   admin: 'Администратор',
@@ -19,12 +33,21 @@ const ROLE_LABELS: Record<string, string> = {
 };
 
 const ROLE_COLORS: Record<string, string> = {
-  admin: '#dc2626',
-  owner: '#7c3aed',
-  head_manager: '#2563eb',
-  manager: '#059669',
-  viewer: '#6b7280',
-  user: '#6b7280',
+  admin: 'bg-red-100 text-red-700 border-red-200',
+  owner: 'bg-violet-100 text-violet-700 border-violet-200',
+  head_manager: 'bg-blue-100 text-blue-700 border-blue-200',
+  manager: 'bg-emerald-100 text-emerald-700 border-emerald-200',
+  viewer: 'bg-muted text-muted-foreground border-border',
+  user: 'bg-muted text-muted-foreground border-border',
+};
+
+const ROLE_AVATAR_COLORS: Record<string, string> = {
+  admin: 'bg-red-600',
+  owner: 'bg-violet-600',
+  head_manager: 'bg-blue-600',
+  manager: 'bg-emerald-600',
+  viewer: 'bg-muted-foreground',
+  user: 'bg-muted-foreground',
 };
 
 const ROLE_ICONS: Record<string, React.ReactNode> = {
@@ -36,7 +59,7 @@ const ROLE_ICONS: Record<string, React.ReactNode> = {
   user: <Eye size={14} />,
 };
 
-export default function TeamPage() {
+export function TeamContent() {
   const navigate = useNavigate();
   const { user, hasPermission } = useAuth();
   const { activeStore, loading: storeLoading, loadStores } = useStore();
@@ -55,10 +78,6 @@ export default function TeamPage() {
   const [inviteSuccess, setInviteSuccess] = useState<string | null>(null);
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [inviting, setInviting] = useState(false);
-
-  // Role edit state
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editRole, setEditRole] = useState('');
 
   // Permission editor modal state
   const [permTarget, setPermTarget] = useState<TeamMember | null>(null);
@@ -83,7 +102,6 @@ export default function TeamPage() {
       ]);
       setMembers(m);
       setRoles(r);
-      // Load permissions list for editor
       if (canManage) {
         try {
           const p = await api.getPermissionsList(storeId);
@@ -134,7 +152,6 @@ export default function TeamPage() {
     if (!storeId) return;
     try {
       await api.updateTeamMember(storeId, userId, { role: newRole });
-      setEditingId(null);
       await loadData();
     } catch (e: any) {
       alert(e.message || 'Ошибка при обновлении');
@@ -159,7 +176,6 @@ export default function TeamPage() {
     if (hasCustom) {
       setSelectedPerms([...member.custom_permissions!]);
     } else {
-      // Load role default permissions
       const roleInfo = roles.find(r => r.id === member.role);
       setSelectedPerms(roleInfo ? [...roleInfo.permissions] : [...(member.permissions || [])]);
     }
@@ -180,7 +196,7 @@ export default function TeamPage() {
       if (useCustom) {
         data.custom_permissions = selectedPerms;
       } else {
-        data.custom_permissions = []; // empty array = reset to role defaults
+        data.custom_permissions = [];
       }
       await api.updateTeamMember(storeId, permTarget.id, data);
       setPermTarget(null);
@@ -192,7 +208,6 @@ export default function TeamPage() {
     }
   };
 
-  // When role changes in perm editor, update default perms
   const handlePermRoleChange = (newRole: string) => {
     setPermRole(newRole);
     if (!useCustom) {
@@ -201,9 +216,10 @@ export default function TeamPage() {
     }
   };
 
-  const formatDate = (d: string | null) => {
-    if (!d) return '—';
-    return new Date(d).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short', year: 'numeric' });
+  const resetInviteForm = () => {
+    setInviteEmail(''); setInviteName('');
+    setInviteRole('manager'); setInviteCustomPerms([]);
+    setInviteError(null); setInviteSuccess(null);
   };
 
   const formatTime = (d: string | null) => {
@@ -219,385 +235,408 @@ export default function TeamPage() {
 
   if (loading) {
     return (
-      <div className="loading-page"><div className="loading-center"><div className="spinner" /></div></div>
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="animate-spin h-8 w-8 border-4 border-primary border-t-transparent rounded-full" />
+      </div>
     );
   }
 
   return (
-    <div className="team-page">
-      {/* Header */}
-      <div className="team-header">
-        <button className="btn-back" onClick={() => navigate('/workspace')}>
-          <ArrowLeft size={18} />
-        </button>
-        <div className="team-header-info">
-          <h1><Users size={22} /> Команда</h1>
-          <span className="team-count">{members.length} участников</span>
+    <div className="space-y-6">
+      {/* Header row */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-bold flex items-center gap-2">
+            <Users size={20} /> Команда
+          </h2>
+          <span className="text-sm text-muted-foreground">{members.length} участников</span>
         </div>
         {canManage && (
-          <button className="btn-primary" onClick={() => setShowInvite(true)}>
+          <Button onClick={() => setShowInvite(true)}>
             <UserPlus size={16} /> Пригласить
-          </button>
+          </Button>
         )}
       </div>
 
       {/* Roles overview */}
-      <div className="team-roles-grid">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3 mb-6">
         {roles.map((role) => (
-          <div key={role.id} className="team-role-card" style={{ borderColor: ROLE_COLORS[role.id] || '#d1d5db' }}>
-            <div className="team-role-card-icon" style={{ color: ROLE_COLORS[role.id] }}>
+          <div
+            key={role.id}
+            className={`flex items-center gap-3 rounded-xl border p-3 bg-card ${ROLE_COLORS[role.id]?.split(' ').find(c => c.startsWith('border-')) || 'border-border'}`}
+          >
+            <div className="flex items-center justify-center">
               {ROLE_ICONS[role.id]}
             </div>
-            <div className="team-role-card-info">
-              <div className="team-role-card-name">{role.name}</div>
-              <div className="team-role-card-desc">{role.description}</div>
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-medium truncate">{role.name}</div>
+              <div className="text-xs text-muted-foreground truncate">{role.description}</div>
             </div>
-            <div className="team-role-card-count">{role.user_count}</div>
+            <span className="text-lg font-bold text-foreground">{role.user_count}</span>
           </div>
         ))}
       </div>
 
       {/* Members table */}
-      <div className="team-table-wrap">
-        <table className="team-table">
-          <thead>
-            <tr>
-              <th>Пользователь</th>
-              <th>Роль</th>
-              <th>Исправлений</th>
-              <th>На проверке</th>
-              <th>Одобрено</th>
-              <th>Последний вход</th>
-              {canManage && <th></th>}
-            </tr>
-          </thead>
-          <tbody>
+      <div className="rounded-xl border border-border bg-card overflow-hidden">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Пользователь</TableHead>
+              <TableHead>Роль</TableHead>
+              <TableHead>Исправлений</TableHead>
+              <TableHead>На проверке</TableHead>
+              <TableHead>Одобрено</TableHead>
+              <TableHead>Последний вход</TableHead>
+              {canManage && <TableHead className="w-12" />}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {members.map((m) => (
-              <tr key={m.id} className={!m.is_active ? 'team-row-disabled' : ''}>
-                <td>
-                  <div className="team-member-info">
-                    <div className="team-avatar" style={{ background: ROLE_COLORS[m.role] || '#6b7280' }}>
-                      {(m.first_name?.[0] || m.email[0]).toUpperCase()}
-                    </div>
+              <TableRow key={m.id} className={!m.is_active ? 'opacity-50' : ''}>
+                <TableCell>
+                  <div className="flex items-center gap-3">
+                    <Avatar className="h-8 w-8">
+                      <AvatarFallback className={`${ROLE_AVATAR_COLORS[m.role] || 'bg-muted-foreground'} text-white text-xs`}>
+                        {(m.first_name?.[0] || m.email[0]).toUpperCase()}
+                      </AvatarFallback>
+                    </Avatar>
                     <div>
-                      <div className="team-member-name">
+                      <div className="font-medium text-sm flex items-center gap-1.5">
                         {m.first_name || m.email.split('@')[0]}
-                        {m.id === user?.id && <span className="team-you-badge">Вы</span>}
+                        {m.id === user?.id && (
+                          <Badge variant="secondary" className="text-[10px] px-1.5 py-0">Вы</Badge>
+                        )}
                       </div>
-                      <div className="team-member-email">{m.email}</div>
+                      <div className="text-xs text-muted-foreground">{m.email}</div>
                     </div>
                   </div>
-                </td>
-                <td>
-                  {editingId === m.id ? (
-                    <div className="team-role-edit">
-                      <select
-                        value={editRole}
-                        onChange={(e) => setEditRole(e.target.value)}
-                        className="team-role-select"
-                      >
-                        <option value="owner">Владелец</option>
-                        <option value="head_manager">Старший менеджер</option>
-                        <option value="manager">Менеджер</option>
-                        <option value="viewer">Наблюдатель</option>
-                      </select>
-                      <button className="team-role-save" onClick={() => handleRoleChange(m.id, editRole)}>
-                        <Check size={14} />
-                      </button>
-                      <button className="team-role-cancel" onClick={() => setEditingId(null)}>
-                        <X size={14} />
-                      </button>
-                    </div>
-                  ) : (
-                    <span
-                      className={`team-role-badge ${canManage && m.id !== user?.id ? 'team-role-badge--editable' : ''}`}
-                      style={{ background: `${ROLE_COLORS[m.role] || '#6b7280'}15`, color: ROLE_COLORS[m.role] }}
-                      onClick={() => { if (canManage && m.id !== user?.id) openPermEditor(m); }}
-                    >
-                      {ROLE_ICONS[m.role]} {ROLE_LABELS[m.role] || m.role}
-                      {m.custom_permissions && m.custom_permissions.length > 0 && (
-                        <span className="team-custom-badge" title="Кастомные права">✦</span>
-                      )}
-                      {canManage && m.id !== user?.id && <ChevronDown size={12} style={{ marginLeft: 2, opacity: 0.5 }} />}
-                    </span>
-                  )}
-                </td>
-                <td>
-                  <div className="team-stat">
-                    <span className="team-stat-big">{m.fixes_total}</span>
-                    {m.fixes_today > 0 && <span className="team-stat-today">+{m.fixes_today} сегодня</span>}
-                  </div>
-                </td>
-                <td>
-                  {m.approvals_pending > 0 ? (
-                    <span className="team-pending-badge">{m.approvals_pending}</span>
-                  ) : (
-                    <span className="team-stat-zero">0</span>
-                  )}
-                </td>
-                <td>
-                  <span className="team-approved-count">{m.approvals_approved}</span>
-                </td>
-                <td>
-                  <span className="team-last-login">{formatTime(m.last_login)}</span>
-                </td>
-                {canManage && (
-                  <td>
-                    {m.id !== user?.id && (
-                      <div className="team-actions">
-                        <button
-                          className="team-action-btn"
-                          title="Настройки доступа"
-                          onClick={() => openPermEditor(m)}
-                        >
-                          <Settings size={14} />
-                        </button>
-                        <button
-                          className="team-action-btn"
-                          title={m.is_active ? 'Деактивировать' : 'Активировать'}
-                          onClick={() => handleToggleActive(m.id, m.is_active)}
-                        >
-                          {m.is_active ? <X size={14} /> : <Check size={14} />}
-                        </button>
-                      </div>
+                </TableCell>
+                <TableCell>
+                  <button
+                    className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${ROLE_COLORS[m.role] || 'bg-muted text-muted-foreground border-border'} ${canManage && m.id !== user?.id ? 'cursor-pointer hover:opacity-80' : ''}`}
+                    onClick={() => { if (canManage && m.id !== user?.id) openPermEditor(m); }}
+                    disabled={!canManage || m.id === user?.id}
+                  >
+                    {ROLE_ICONS[m.role]} {ROLE_LABELS[m.role] || m.role}
+                    {m.custom_permissions && m.custom_permissions.length > 0 && (
+                      <span title="Кастомные права">✦</span>
                     )}
-                  </td>
+                    {canManage && m.id !== user?.id && <ChevronDown size={12} className="opacity-50" />}
+                  </button>
+                </TableCell>
+                <TableCell>
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-semibold">{m.fixes_total}</span>
+                    {m.fixes_today > 0 && (
+                      <span className="text-xs text-emerald-600">+{m.fixes_today}</span>
+                    )}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  {m.approvals_pending > 0 ? (
+                    <Badge variant="destructive" className="text-xs">{m.approvals_pending}</Badge>
+                  ) : (
+                    <span className="text-muted-foreground">0</span>
+                  )}
+                </TableCell>
+                <TableCell>
+                  <span className="text-foreground">{m.approvals_approved}</span>
+                </TableCell>
+                <TableCell>
+                  <span className="text-sm text-muted-foreground">{formatTime(m.last_login)}</span>
+                </TableCell>
+                {canManage && (
+                  <TableCell>
+                    {m.id !== user?.id && (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="icon" className="h-8 w-8">
+                            <MoreVertical size={14} />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onClick={() => openPermEditor(m)}>
+                            <Settings size={14} className="mr-2" /> Настройки доступа
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => handleToggleActive(m.id, m.is_active)}>
+                            {m.is_active ? (
+                              <><X size={14} className="mr-2" /> Деактивировать</>
+                            ) : (
+                              <><Check size={14} className="mr-2" /> Активировать</>
+                            )}
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
+                  </TableCell>
                 )}
-              </tr>
+              </TableRow>
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </div>
 
-      {showInvite && (
-        <div className="team-modal-overlay" onClick={() => { setShowInvite(false); setInviteError(null); setInviteSuccess(null); }}>
-          <div className="invite-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="invite-modal-header">
-              <div className="invite-modal-title">
-                <div className="invite-modal-icon"><UserPlus size={20} /></div>
-                <div>
-                  <h2>Пригласить участника</h2>
-                  <p>Ссылка придёт на почту, пользователь сам установит пароль</p>
-                </div>
+      {/* ═══ Invite Modal ═══ */}
+      <Dialog open={showInvite} onOpenChange={(open) => { if (!open) { setShowInvite(false); resetInviteForm(); } }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <div className="flex items-center justify-center h-9 w-9 rounded-lg bg-primary/10">
+                <UserPlus size={18} className="text-primary" />
               </div>
-              <button className="invite-modal-close" onClick={() => { setShowInvite(false); setInviteError(null); setInviteSuccess(null); }}><X size={18} /></button>
+              Пригласить участника
+            </DialogTitle>
+            <DialogDescription>
+              Ссылка придёт на почту, пользователь сам установит пароль
+            </DialogDescription>
+          </DialogHeader>
+
+          {inviteSuccess ? (
+            <div className="flex flex-col items-center gap-3 py-6 text-center">
+              <div className="text-4xl">✉️</div>
+              <h3 className="text-lg font-semibold">Приглашение отправлено!</h3>
+              <p className="text-sm text-muted-foreground">Письмо со ссылкой отправлено на</p>
+              <span className="font-medium text-primary">{inviteSuccess}</span>
+              <p className="text-xs text-muted-foreground">Ссылка действительна 72 часа</p>
+              <div className="flex gap-2 mt-2">
+                <Button variant="outline" onClick={() => { setInviteSuccess(null); resetInviteForm(); }}>
+                  Пригласить ещё
+                </Button>
+                <Button onClick={() => { setShowInvite(false); resetInviteForm(); }}>
+                  Готово
+                </Button>
+              </div>
             </div>
+          ) : (
+            <>
+              <div className="space-y-4">
+                {/* Email */}
+                <div className="space-y-2">
+                  <Label>Email *</Label>
+                  <Input
+                    type="email"
+                    value={inviteEmail}
+                    onChange={(e) => setInviteEmail(e.target.value)}
+                    placeholder="user@example.com"
+                    autoFocus
+                  />
+                </div>
 
-            <div className="invite-modal-body">
-              {inviteSuccess ? (
-                <div className="invite-success">
-                  <div className="invite-success-icon">✉️</div>
-                  <h3>Приглашение отправлено!</h3>
-                  <p>Письмо со ссылкой отправлено на</p>
-                  <div className="invite-success-email">{inviteSuccess}</div>
-                  <p className="invite-success-note">Ссылка действительна 72 часа</p>
-                  <div className="invite-success-actions">
-                    <button className="btn-secondary" onClick={() => {
-                      setInviteSuccess(null);
-                      setInviteEmail(''); setInviteName('');
-                      setInviteRole('manager'); setInviteCustomPerms([]);
-                    }}>
-                      Пригласить ещё
-                    </button>
-                    <button className="btn-primary" onClick={() => {
-                      setShowInvite(false); setInviteSuccess(null);
-                      setInviteEmail(''); setInviteName('');
-                      setInviteRole('manager'); setInviteCustomPerms([]);
-                    }}>
-                      Готово
-                    </button>
+                {/* Name */}
+                <div className="space-y-2">
+                  <Label>
+                    Имя <span className="text-muted-foreground text-xs">(необязательно)</span>
+                  </Label>
+                  <Input
+                    type="text"
+                    value={inviteName}
+                    onChange={(e) => setInviteName(e.target.value)}
+                    placeholder="Имя участника"
+                  />
+                </div>
+
+                {/* Role */}
+                <div className="space-y-2">
+                  <Label>Роль</Label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { value: 'manager', label: 'Менеджер', desc: 'Исправляет ошибки' },
+                      { value: 'head_manager', label: 'Ст. менеджер', desc: 'Утверждает правки' },
+                      { value: 'viewer', label: 'Наблюдатель', desc: 'Только просмотр' },
+                      { value: 'custom', label: '✦ Кастомные', desc: 'Выбрать вручную' },
+                    ].map(opt => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        className={`flex flex-col items-start rounded-lg border p-3 text-left transition-colors ${
+                          inviteRole === opt.value
+                            ? 'border-primary bg-primary/5 ring-1 ring-primary'
+                            : 'border-border hover:border-primary/40'
+                        }`}
+                        onClick={() => { setInviteRole(opt.value); setInviteCustomPerms([]); }}
+                      >
+                        <span className="text-sm font-medium">{opt.label}</span>
+                        <span className="text-xs text-muted-foreground">{opt.desc}</span>
+                      </button>
+                    ))}
                   </div>
                 </div>
-              ) : (
-                <>
-              {/* Email */}
-              <div className="invite-field">
-                <label>Email *</label>
-                <input
-                  type="email"
-                  value={inviteEmail}
-                  onChange={(e) => setInviteEmail(e.target.value)}
-                  placeholder="user@example.com"
-                  autoFocus
-                />
-              </div>
 
-              {/* Name */}
-              <div className="invite-field">
-                <label>Имя <span className="invite-optional">(необязательно)</span></label>
-                <input
-                  type="text"
-                  value={inviteName}
-                  onChange={(e) => setInviteName(e.target.value)}
-                  placeholder="Имя участника"
-                />
-              </div>
-
-              {/* Role */}
-              <div className="invite-field">
-                <label>Роль</label>
-                <div className="invite-roles">
-                  {[
-                    { value: 'manager',      label: 'Менеджер',      desc: 'Исправляет ошибки' },
-                    { value: 'head_manager', label: 'Ст. менеджер',  desc: 'Утверждает правки' },
-                    { value: 'viewer',       label: 'Наблюдатель',   desc: 'Только просмотр' },
-                    { value: 'custom',       label: '✦ Кастомные',   desc: 'Выбрать вручную' },
-                  ].map(opt => (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      className={`invite-role-card ${inviteRole === opt.value ? 'invite-role-card--active' : ''}`}
-                      onClick={() => { setInviteRole(opt.value); setInviteCustomPerms([]); }}
-                    >
-                      <span className="invite-role-card-name">{opt.label}</span>
-                      <span className="invite-role-card-desc">{opt.desc}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Custom permissions */}
-              {inviteRole === 'custom' && permsList && (
-                <div className="invite-perms">
-                  <div className="invite-perms-header">
-                    <Shield size={14} />
-                    Выберите права доступа
-                    {inviteCustomPerms.length > 0 && (
-                      <span className="invite-perms-count">{inviteCustomPerms.length} выбрано</span>
-                    )}
-                  </div>
-                  {Object.entries(permsList.groups).map(([groupName, permIds]) => (
-                    <div key={groupName} className="invite-perm-section">
-                      <div className="invite-perm-section-title">{groupName}</div>
-                      <div className="invite-perm-chips">
-                        {permIds.map(pid => {
-                          const info = permsList.permissions.find(p => p.id === pid);
-                          const checked = inviteCustomPerms.includes(pid);
-                          return (
-                            <button
-                              key={pid}
-                              type="button"
-                              className={`invite-perm-chip ${checked ? 'invite-perm-chip--on' : ''}`}
-                              onClick={() => toggleInviteCustomPerm(pid)}
-                            >
-                              {checked && <Check size={11} />}
-                              {info?.label || pid}
-                            </button>
-                          );
-                        })}
-                      </div>
+                {/* Custom permissions */}
+                {inviteRole === 'custom' && permsList && (
+                  <div className="space-y-3 rounded-lg border border-border p-4 bg-muted/30">
+                    <div className="flex items-center gap-2 text-sm font-medium">
+                      <Shield size={14} />
+                      Выберите права доступа
+                      {inviteCustomPerms.length > 0 && (
+                        <Badge variant="secondary" className="text-xs">{inviteCustomPerms.length} выбрано</Badge>
+                      )}
                     </div>
-                  ))}
-                </div>
-              )}
-                </>
-              )}
-            </div>
+                    {Object.entries(permsList.groups).map(([groupName, permIds]) => (
+                      <div key={groupName} className="space-y-2">
+                        <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">{groupName}</div>
+                        <div className="space-y-1">
+                          {permIds.map(pid => {
+                            const info = permsList.permissions.find(p => p.id === pid);
+                            const checked = inviteCustomPerms.includes(pid);
+                            return (
+                              <label
+                                key={pid}
+                                className="flex items-center gap-2.5 rounded-md border border-border bg-card px-3 py-2 cursor-pointer hover:bg-accent/50 transition-colors"
+                              >
+                                <Checkbox
+                                  checked={checked}
+                                  onCheckedChange={() => toggleInviteCustomPerm(pid)}
+                                />
+                                <span className="text-sm text-foreground">{info?.label || pid}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
 
-            {!inviteSuccess && (
-            <div className="invite-modal-footer">
               {inviteError && (
-                <div className="invite-error-bar">
+                <div className="flex items-center gap-2 rounded-md bg-destructive/10 border border-destructive/20 px-3 py-2 text-sm text-destructive">
                   <X size={14} /> {inviteError}
                 </div>
               )}
-              <div className="invite-footer-btns">
-                <button className="btn-secondary" onClick={() => { setShowInvite(false); setInviteError(null); setInviteSuccess(null); }}>Отмена</button>
-                <button
-                  className="btn-primary"
+
+              <DialogFooter>
+                <Button variant="outline" onClick={() => { setShowInvite(false); resetInviteForm(); }}>
+                  Отмена
+                </Button>
+                <Button
                   onClick={handleInvite}
                   disabled={!inviteEmail || (inviteRole === 'custom' && inviteCustomPerms.length === 0) || inviting}
                 >
-                  {inviting ? 'Отправляем...' : <>Отправить приглашение</>}
-                </button>
-              </div>
-            </div>
-            )}
-          </div>
-        </div>
-      )}
+                  {inviting ? 'Отправляем...' : 'Отправить приглашение'}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
 
-      {/* Permission Editor Modal */}
-      {permTarget && permsList && (
-        <div className="team-modal-overlay" onClick={() => setPermTarget(null)}>
-          <div className="team-modal perm-editor-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="team-modal-header">
-              <h2><Shield size={18} /> Настройки доступа</h2>
-              <button onClick={() => setPermTarget(null)}><X size={18} /></button>
-            </div>
-            <div className="perm-editor-user">
-              <div className="team-avatar" style={{ background: ROLE_COLORS[permTarget.role] || '#6b7280' }}>
-                {(permTarget.first_name?.[0] || permTarget.email[0]).toUpperCase()}
-              </div>
-              <div>
-                <div className="perm-editor-name">{permTarget.first_name || permTarget.email.split('@')[0]}</div>
-                <div className="perm-editor-email">{permTarget.email}</div>
-              </div>
-            </div>
+      {/* ═══ Permission Editor Modal ═══ */}
+      <Dialog open={!!permTarget && !!permsList} onOpenChange={(open) => { if (!open) setPermTarget(null); }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Shield size={18} /> Настройки доступа
+            </DialogTitle>
+            <DialogDescription>Настройте роль и права пользователя</DialogDescription>
+          </DialogHeader>
 
-            <div className="team-modal-body">
-              {/* Role selector */}
-              <label className="perm-editor-label">
-                Роль
-                <select value={permRole} onChange={(e) => handlePermRoleChange(e.target.value)} className="perm-editor-select">
-                  <option value="owner">Владелец</option>
-                  <option value="head_manager">Старший менеджер</option>
-                  <option value="manager">Менеджер</option>
-                  <option value="viewer">Наблюдатель</option>
-                </select>
-              </label>
-
-              {/* Custom toggle */}
-              <div className="perm-custom-toggle" onClick={() => {
-                const next = !useCustom;
-                setUseCustom(next);
-                if (!next) {
-                  const roleInfo = roles.find(r => r.id === permRole);
-                  setSelectedPerms(roleInfo ? [...roleInfo.permissions] : []);
-                }
-              }}>
-                {useCustom ? <ToggleRight size={22} className="perm-toggle-on" /> : <ToggleLeft size={22} className="perm-toggle-off" />}
-                <span>Кастомные права</span>
-                {useCustom && <span className="perm-custom-hint">Права не зависят от роли</span>}
+          {permTarget && (
+            <>
+              {/* User info */}
+              <div className="flex items-center gap-3 rounded-lg border border-border bg-muted/30 p-3">
+                <Avatar className="h-9 w-9">
+                  <AvatarFallback className={`${ROLE_AVATAR_COLORS[permTarget.role] || 'bg-muted-foreground'} text-white text-xs`}>
+                    {(permTarget.first_name?.[0] || permTarget.email[0]).toUpperCase()}
+                  </AvatarFallback>
+                </Avatar>
+                <div>
+                  <div className="text-sm font-medium">{permTarget.first_name || permTarget.email.split('@')[0]}</div>
+                  <div className="text-xs text-muted-foreground">{permTarget.email}</div>
+                </div>
               </div>
 
-              {/* Permission groups */}
-              <div className={`perm-groups ${!useCustom ? 'perm-groups--disabled' : ''}`}>
-                {Object.entries(permsList.groups).map(([groupName, permIds]) => (
-                  <div key={groupName} className="perm-group">
-                    <div className="perm-group-title">{groupName}</div>
-                    <div className="perm-group-items">
-                      {permIds.map(pid => {
-                        const info = permsList.permissions.find(p => p.id === pid);
-                        const checked = selectedPerms.includes(pid);
-                        return (
-                          <label key={pid} className={`perm-item ${checked ? 'perm-item--checked' : ''}`}>
-                            <input
-                              type="checkbox"
-                              checked={checked}
-                              disabled={!useCustom}
-                              onChange={() => handlePermToggle(pid)}
-                            />
-                            <span className="perm-item-check">{checked ? <Check size={12} /> : null}</span>
-                            <span className="perm-item-label">{info?.label || pid}</span>
-                          </label>
-                        );
-                      })}
-                    </div>
+              <div className="space-y-4">
+                {/* Role selector */}
+                <div className="space-y-2">
+                  <Label>Роль</Label>
+                  <Select value={permRole} onValueChange={handlePermRoleChange}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="owner">Владелец</SelectItem>
+                      <SelectItem value="head_manager">Старший менеджер</SelectItem>
+                      <SelectItem value="manager">Менеджер</SelectItem>
+                      <SelectItem value="viewer">Наблюдатель</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {/* Custom toggle */}
+                <div className="flex items-center justify-between rounded-lg border border-border p-3">
+                  <div className="space-y-0.5">
+                    <Label className="text-sm">Кастомные права</Label>
+                    {useCustom && (
+                      <p className="text-xs text-muted-foreground">Права не зависят от роли</p>
+                    )}
                   </div>
-                ))}
-              </div>
-            </div>
+                  <Switch
+                    checked={useCustom}
+                    onCheckedChange={(checked) => {
+                      setUseCustom(checked);
+                      if (!checked) {
+                        const roleInfo = roles.find(r => r.id === permRole);
+                        setSelectedPerms(roleInfo ? [...roleInfo.permissions] : []);
+                      }
+                    }}
+                  />
+                </div>
 
-            <div className="team-modal-footer">
-              <button className="btn-secondary" onClick={() => setPermTarget(null)}>Отмена</button>
-              <button className="btn-primary" onClick={handlePermSave} disabled={savingPerms}>
-                {savingPerms ? 'Сохраняем...' : 'Сохранить'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+                {/* Permission groups */}
+                {permsList && (
+                  <div className={`space-y-4 ${!useCustom ? 'opacity-50 pointer-events-none' : ''}`}>
+                    {Object.entries(permsList.groups).map(([groupName, permIds]) => (
+                      <div key={groupName} className="space-y-2">
+                        <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                          {groupName}
+                        </div>
+                        <div className="space-y-1">
+                          {permIds.map(pid => {
+                            const info = permsList.permissions.find(p => p.id === pid);
+                            const checked = selectedPerms.includes(pid);
+                            return (
+                              <label
+                                key={pid}
+                                className="flex items-center gap-2.5 rounded-md border border-border bg-card px-3 py-2 cursor-pointer hover:bg-accent/50 transition-colors"
+                              >
+                                <Checkbox
+                                  checked={checked}
+                                  disabled={!useCustom}
+                                  onCheckedChange={() => handlePermToggle(pid)}
+                                />
+                                <span className="text-sm text-foreground">{info?.label || pid}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setPermTarget(null)}>Отмена</Button>
+                <Button onClick={handlePermSave} disabled={savingPerms}>
+                  {savingPerms ? 'Сохраняем...' : 'Сохранить'}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+export default function TeamPage() {
+  return (
+    <div className="min-h-screen bg-background">
+      <div className="max-w-[1100px] mx-auto px-6 py-6">
+        <TeamContent />
+      </div>
     </div>
   );
 }

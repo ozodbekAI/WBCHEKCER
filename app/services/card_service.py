@@ -1,13 +1,15 @@
 import asyncio
 import copy
+import json
+import logging
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from sqlalchemy import select, update, delete, func, and_, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import settings
-from ..models import Card, CardIssue, IssueSeverity, IssueCategory, IssueStatus
+from ..models import Card, CardConfirmedSection, CardIssue, IssueSeverity, IssueCategory, IssueStatus
 from ..services.analyzer import card_analyzer
 from ..services.wb_validator import validate_card_characteristics, get_catalog, find_best_match, calculate_card_fcs
 from ..services.gemini_service import get_gemini_service, get_ai_service
@@ -16,9 +18,12 @@ from ..services.title_policy import validate_title
 from ..services.text_policy import validate_description
 from ..services.super_validator import super_validator_service
 from ..services import fixed_file_service as ffs
+from ..services.workflow_service import CARD_WORKFLOW_SECTIONS
 
 # Max retries for AI fix validation loop
 MAX_FIX_RETRIES = 2
+STALE_CARD_REANALYZE_TIMEOUT_SEC = 45
+logger = logging.getLogger(__name__)
 
 _TITLE_CODES = {"title_too_short", "no_title", "title_too_long", "title_policy_violation"}
 _TITLE_FIELD_PATHS = {"title"}
@@ -31,6 +36,39 @@ _DATE_CONTEXT_WORDS = {
     "declaration", "issue date", "valid until", "validity",
 }
 _DATE_FIELD_HINTS = {"date", "дата", "certificate", "сертификат", "декларац"}
+
+_DESCRIPTION_EDITOR_STOPWORDS = {
+    "и", "в", "во", "на", "с", "со", "по", "для", "из", "под", "над", "при", "или",
+    "это", "этот", "эта", "эти", "как", "что", "без", "не", "от", "до", "к", "ко",
+    "а", "но", "же", "ли", "так", "также", "модель", "товар", "вариант",
+}
+
+_NON_VISUAL_AI_FIELDS = {
+    "состав",
+    "страна производства",
+    "материал подкладки",
+}
+
+_WEAK_AI_MARKERS = (
+    "необходимо проверить",
+    "рекомендуется",
+    "должно быть одно",
+    "должны быть указаны в единственном числе",
+    "единственным значением",
+    "оставить только одно значение",
+)
+
+_STRONG_AI_EVIDENCE_MARKERS = (
+    "на фото",
+    "видно",
+    "не видно",
+    "отсутств",
+    "не подтвержд",
+    "противореч",
+    "состоит из",
+    "однако",
+    "а не ",
+)
 
 
 def _clip(value: object, max_len: int) -> str:
@@ -175,6 +213,368 @@ def _split_issue_values(raw_value: Optional[str]) -> List[str]:
         if v:
             out.append(v)
     return out
+
+
+def _normalized_issue_parts(raw_value: Optional[str]) -> List[str]:
+    parts = _split_issue_values(raw_value)
+    if not parts:
+        normalized = _norm_text(str(raw_value or ""))
+        return [normalized] if normalized else []
+
+    seen: set[str] = set()
+    out: List[str] = []
+    for part in parts:
+        normalized = _norm_text(part)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def _issue_values_equivalent(current_value: Optional[str], suggested_value: Optional[str]) -> bool:
+    current = _norm_text(str(current_value or ""))
+    suggested = _norm_text(str(suggested_value or ""))
+    if not current or not suggested:
+        return False
+    if current == suggested:
+        return True
+
+    current_parts = _normalized_issue_parts(current_value)
+    suggested_parts = _normalized_issue_parts(suggested_value)
+    return bool(current_parts and suggested_parts and current_parts == suggested_parts)
+
+
+def _issue_value_search_roots(value: str) -> List[str]:
+    normalized = _norm_text(value)
+    if not normalized:
+        return []
+
+    roots: List[str] = [normalized]
+    seen = {normalized}
+    for token in re.split(r"[^0-9a-zа-яё]+", normalized):
+        if len(token) < 4:
+            continue
+        for variant in (token, token[: min(len(token), 6)]):
+            if variant and variant not in seen:
+                seen.add(variant)
+                roots.append(variant)
+    return roots
+
+
+def _issue_text_signal(text: Optional[str], value: str) -> int:
+    normalized_text = _norm_text(str(text or ""))
+    if not normalized_text:
+        return 0
+
+    matched = False
+    for root in _issue_value_search_roots(value):
+        cursor = normalized_text.find(root)
+        while cursor != -1:
+            matched = True
+            window_start = max(0, cursor - 48)
+            window_end = min(len(normalized_text), cursor + len(root) + 48)
+            window = normalized_text[window_start:window_end]
+            if any(marker in window for marker in ("не видно", "отсутств", "не подтвержд", " нет ")):
+                return -1
+            cursor = normalized_text.find(root, cursor + len(root))
+
+    if matched:
+        return 1
+    return 0
+
+
+def _suggestion_supported_by_text(text: str, value: str) -> bool:
+    if _issue_text_signal(text, value) > 0:
+        return True
+
+    normalized_value = _norm_text(value)
+    if normalized_value.startswith("без "):
+        base_value = normalized_value[4:].strip()
+        return _issue_text_signal(text, base_value) < 0
+
+    return False
+
+
+def _infer_subset_fix_from_issue(issue: CardIssue):
+    current_parts = _split_issue_values(issue.current_value)
+    if len(current_parts) <= 1:
+        return None
+
+    evidence_text = " ".join(
+        part for part in [
+            str(issue.title or "").strip(),
+            str(issue.description or "").strip(),
+            str(issue.ai_reason or "").strip(),
+        ]
+        if part
+    )
+    if not evidence_text:
+        return None
+
+    positives: List[str] = []
+    negatives: List[str] = []
+    for part in current_parts:
+        signal = _issue_text_signal(evidence_text, part)
+        if signal > 0:
+            positives.append(part)
+        elif signal < 0:
+            negatives.append(part)
+
+    candidate: Any = None
+    if positives and len(positives) < len(current_parts):
+        candidate = positives
+    elif negatives and len(negatives) < len(current_parts):
+        candidate = [part for part in current_parts if part not in negatives]
+
+    if not candidate:
+        return None
+    if isinstance(candidate, list):
+        candidate = [part for part in candidate if str(part).strip()]
+        if not candidate:
+            return None
+        candidate = candidate if len(candidate) > 1 else candidate[0]
+
+    return candidate
+
+
+def _remove_fix_action_markers(error_details: list | None) -> list:
+    cleaned: List[Any] = []
+    for item in (error_details or []):
+        if not isinstance(item, dict):
+            cleaned.append(item)
+            continue
+        marker = str(item.get("fix_action") or item.get("type") or "").strip().lower()
+        if marker in {"swap", "clear"}:
+            continue
+        cleaned.append(item)
+    return cleaned
+
+
+def _extract_issue_example_values(error_details: list | None, limit: int = 12) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in (error_details or []):
+        if not isinstance(item, dict):
+            continue
+        for raw in (item.get("exampleValues") or []):
+            value = str(raw or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _salvage_issue_fix_candidate(issue: CardIssue, product_dna: str = ""):
+    candidate = _infer_subset_fix_from_issue(issue)
+    if candidate in (None, "", []):
+        return None
+
+    valid, _, corrected = _validate_fix_against_constraints(
+        candidate,
+        issue.allowed_values,
+        issue.error_details,
+        char_name=issue.field_path or issue.title,
+        current_value=issue.current_value,
+        product_dna=product_dna,
+    )
+    if not valid:
+        return None
+    return corrected if corrected is not None else candidate
+
+
+def _issue_field_name(issue: CardIssue) -> str:
+    path = str(issue.field_path or "").strip()
+    if path.lower().startswith("characteristics."):
+        return path.split("characteristics.", 1)[1].strip()
+    return path
+
+
+def _issue_evidence_text(issue: CardIssue) -> str:
+    parts: List[str] = [
+        str(issue.title or "").strip(),
+        str(issue.description or "").strip(),
+        str(issue.ai_reason or "").strip(),
+    ]
+    for item in (issue.error_details or []):
+        if isinstance(item, dict):
+            parts.append(str(item.get("message") or "").strip())
+    return _norm_text(" ".join(part for part in parts if part))
+
+
+def _issue_has_strong_evidence(issue: CardIssue) -> bool:
+    text = _issue_evidence_text(issue)
+    if not text:
+        return False
+    return any(marker in text for marker in _STRONG_AI_EVIDENCE_MARKERS)
+
+
+def _issue_has_reduction_evidence(issue: CardIssue) -> bool:
+    text = _issue_evidence_text(issue)
+    if not text:
+        return False
+
+    current_parts = _split_issue_values(issue.current_value)
+    suggested_parts = _split_issue_values(issue.suggested_value or issue.ai_suggested_value)
+    if not current_parts or not suggested_parts:
+        return False
+
+    current_norm = set(_normalized_issue_parts(issue.current_value))
+    negatives = [part for part in current_parts if _issue_text_signal(text, part) < 0]
+    if negatives:
+        return True
+
+    introduced_parts = [
+        part for part in suggested_parts
+        if _norm_text(part) not in current_norm
+    ]
+    if introduced_parts and any(_suggestion_supported_by_text(text, part) for part in introduced_parts):
+        return True
+
+    field_name = _issue_field_name(issue)
+    limits = get_catalog().get_limits(field_name) or _extract_limits(issue.error_details)
+    max_l = limits.get("max") if limits else None
+    if (
+        isinstance(max_l, int)
+        and max_l > 0
+        and max_l <= 2
+        and "только" in text
+        and any(_issue_text_signal(text, part) > 0 for part in suggested_parts)
+    ):
+        return True
+
+    return False
+
+
+def _issue_within_catalog_limits(issue: CardIssue) -> bool:
+    field_name = _issue_field_name(issue)
+    if not field_name:
+        return True
+
+    limits = get_catalog().get_limits(field_name) or _extract_limits(issue.error_details)
+    if not limits:
+        return True
+
+    values_count = len(_split_issue_values(issue.current_value))
+    if values_count == 0 and issue.current_value:
+        values_count = 1
+
+    min_l = limits.get("min")
+    max_l = limits.get("max")
+    if isinstance(min_l, int) and min_l > 0 and values_count < min_l:
+        return False
+    if isinstance(max_l, int) and max_l > 0 and values_count > max_l:
+        return False
+    return True
+
+
+def _issue_has_error_type(issue: CardIssue, error_type: str) -> bool:
+    target = str(error_type or "").strip().lower()
+    if not target:
+        return False
+    for item in (issue.error_details or []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "").strip().lower() == target:
+            return True
+    return False
+
+
+def _issue_context_supports_suggestion(issue: CardIssue, context_text: str) -> bool:
+    suggested_raw = issue.ai_suggested_value or issue.suggested_value
+    suggested_parts = _split_issue_values(suggested_raw)
+    normalized_context = _norm_text(context_text)
+    if not suggested_parts or not normalized_context:
+        return False
+    return all(_suggestion_supported_by_text(normalized_context, part) for part in suggested_parts)
+
+
+def _strip_unverified_catalog_suggestions(issues: List[CardIssue], context_text: str) -> None:
+    normalized_context = _norm_text(context_text)
+    for issue in issues:
+        code = str(issue.code or "").strip().lower()
+        if not code.startswith("wb_"):
+            continue
+        if not _issue_has_error_type(issue, "allowed_values"):
+            continue
+
+        if not issue.alternatives:
+            issue.alternatives = _extract_issue_example_values(issue.error_details)
+
+        if str(issue.source or "").strip().lower() == "auto_fix":
+            continue
+
+        suggestion = str(issue.ai_suggested_value or issue.suggested_value or "").strip()
+        if not suggestion:
+            continue
+
+        field_name = _issue_field_name(issue).lower()
+        if field_name in _NON_VISUAL_AI_FIELDS or not _issue_context_supports_suggestion(issue, normalized_context):
+            issue.ai_suggested_value = None
+            issue.suggested_value = None
+            issue.ai_reason = "Автозамена скрыта: недостаточно подтверждений для точного значения."
+            issue.ai_alternatives = []
+
+
+def _should_keep_ai_issue(issue: CardIssue) -> bool:
+    code = str(issue.code or "").strip().lower()
+    if code == "description_refresh_needed":
+        return True
+    if str(issue.source or "").strip().lower() != "ai":
+        return True
+    if _is_title_issue_obj(issue) or _is_description_issue_obj(issue):
+        return True
+
+    field_name = _issue_field_name(issue).lower()
+    if field_name in _NON_VISUAL_AI_FIELDS:
+        return False
+
+    suggested_parts = _split_issue_values(issue.suggested_value or issue.ai_suggested_value)
+    current_parts = _split_issue_values(issue.current_value)
+    evidence_text = _issue_evidence_text(issue)
+
+    if current_parts and suggested_parts and len(suggested_parts) < len(current_parts):
+        if _issue_within_catalog_limits(issue) and not _issue_has_reduction_evidence(issue):
+            return False
+
+    if not _issue_has_strong_evidence(issue) and any(marker in evidence_text for marker in _WEAK_AI_MARKERS):
+        return False
+
+    return True
+
+
+def _drop_unverified_ai_issues(issues: List[CardIssue]) -> List[CardIssue]:
+    filtered = [issue for issue in issues if _should_keep_ai_issue(issue)]
+
+    has_non_text_characteristic_issue = any(
+        (issue.category == IssueCategory.CHARACTERISTICS)
+        and issue.code != "description_refresh_needed"
+        and not _is_title_issue_obj(issue)
+        and not _is_description_issue_obj(issue)
+        for issue in filtered
+    )
+
+    return [
+        issue for issue in filtered
+        if issue.code != "description_refresh_needed" or has_non_text_characteristic_issue
+    ]
+
+
+def _is_manually_actionable_issue(issue: CardIssue) -> bool:
+    if issue.suggested_value is not None:
+        return True
+    if issue.source in {"fixed_file", "auto_fix"}:
+        return True
+    if _is_title_issue_obj(issue) or _is_description_issue_obj(issue):
+        return True
+    if bool(issue.allowed_values):
+        return True
+    if bool(issue.alternatives or issue.ai_alternatives):
+        return True
+    return bool((issue.field_path or "").strip().lower().startswith("characteristics."))
 
 
 def _fallback_value_from_constraints(issue: CardIssue):
@@ -558,6 +958,205 @@ def _get_subject_keywords(card: dict) -> list:
         return []
 
 
+def _normalize_editor_keyword(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _push_editor_keyword(target: List[str], seen: set[str], raw: Any) -> None:
+    normalized = _normalize_editor_keyword(raw)
+    if not normalized or len(normalized) < 3 or len(normalized) > 40:
+        return
+    if normalized in _DESCRIPTION_EDITOR_STOPWORDS:
+        return
+    if normalized in seen:
+        return
+    seen.add(normalized)
+    target.append(normalized)
+
+
+def _singularize_subject_keyword(raw: Any) -> str:
+    value = _normalize_editor_keyword(raw)
+    if not value:
+        return ""
+    if value.endswith("ы") or value.endswith("и"):
+        return value[:-1]
+    return value
+
+
+def _extract_title_keywords_for_editor(title: Any) -> List[str]:
+    words = re.split(r"[^0-9A-Za-zА-Яа-яЁё-]+", str(title or "").lower())
+    out: List[str] = []
+    for word in words:
+        w = word.strip()
+        if len(w) < 4:
+            continue
+        if w in _DESCRIPTION_EDITOR_STOPWORDS:
+            continue
+        out.append(w)
+    return out
+
+
+def _coerce_characteristics_dict(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return {str(key): value for key, value in raw.items()}
+
+    out: Dict[str, Any] = {}
+    if not isinstance(raw, list):
+        return out
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        value = item.get("value", item.get("values"))
+        if isinstance(value, list):
+            out[name] = ", ".join(str(v) for v in value if str(v).strip())
+        else:
+            out[name] = value
+    return out
+
+
+def _extract_editor_value_parts(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+    text = str(raw).strip()
+    if not text:
+        return []
+
+    parts = _split_issue_values(text)
+    if parts:
+        return parts
+    return [text]
+
+
+def _draft_override_value(draft: Dict[str, Any], key: str, fallback: Any) -> Any:
+    if key in draft and draft.get(key) is not None:
+        return draft.get(key)
+    return fallback
+
+
+def build_card_text_context(card: Card, draft: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    draft_data = dict(draft or {})
+
+    base_raw = copy.deepcopy(card.raw_data or {})
+    if not isinstance(base_raw, dict):
+        base_raw = {}
+
+    raw_chars = _coerce_characteristics_dict(base_raw.get("characteristics"))
+    card_chars = _coerce_characteristics_dict(card.characteristics)
+    merged_chars: Dict[str, Any] = {**raw_chars, **card_chars}
+
+    draft_chars = _coerce_characteristics_dict(draft_data.get("characteristics"))
+    for key, value in draft_chars.items():
+        if value is None:
+            continue
+        merged_chars[str(key)] = value
+
+    title_fallback = card.title if card.title is not None else base_raw.get("title")
+    description_fallback = card.description if card.description is not None else base_raw.get("description")
+
+    title = _draft_override_value(draft_data, "title", title_fallback) or ""
+    description = _draft_override_value(draft_data, "description", description_fallback) or ""
+
+    subject_name = (
+        card.subject_name
+        or base_raw.get("subjectName")
+        or base_raw.get("subject_name")
+        or ""
+    )
+    category_name = (
+        card.category_name
+        or base_raw.get("object")
+        or base_raw.get("category_name")
+        or ""
+    )
+    brand = card.brand or base_raw.get("brand") or ""
+    photos = list(card.photos or base_raw.get("photos") or [])
+
+    context = dict(base_raw)
+    context.update(
+        {
+            "title": str(title or ""),
+            "description": str(description or ""),
+            "subjectName": str(subject_name or ""),
+            "subject_name": str(subject_name or ""),
+            "object": str(category_name or ""),
+            "category_name": str(category_name or ""),
+            "brand": str(brand or ""),
+            "photos": photos,
+            "characteristics": merged_chars,
+            "tech_description": str(card.product_dna or base_raw.get("tech_description") or ""),
+            "product_dna": str(card.product_dna or ""),
+        }
+    )
+    return context
+
+
+def build_description_editor_keywords(
+    card_or_context: Card | Dict[str, Any],
+    draft: Optional[Dict[str, Any]] = None,
+    limit: int = 15,
+) -> List[str]:
+    context = (
+        build_card_text_context(card_or_context, draft)
+        if isinstance(card_or_context, Card)
+        else dict(card_or_context or {})
+    )
+
+    result: List[str] = []
+    seen: set[str] = set()
+
+    subject_name = str(context.get("subject_name") or context.get("subjectName") or "").strip()
+    _push_editor_keyword(result, seen, _singularize_subject_keyword(subject_name))
+    _push_editor_keyword(result, seen, subject_name)
+
+    for keyword in _extract_title_keywords_for_editor(context.get("title")):
+        _push_editor_keyword(result, seen, keyword)
+
+    for keyword in _get_subject_keywords(context):
+        _push_editor_keyword(result, seen, keyword)
+
+    chars = _coerce_characteristics_dict(context.get("characteristics"))
+
+    def push_char_values(key: str) -> None:
+        for value in _extract_editor_value_parts(chars.get(key)):
+            _push_editor_keyword(result, seen, value)
+
+    for key in (
+        "Пол",
+        "Назначение",
+        "Стиль",
+        "Тип верха",
+        "Тип низа",
+        "Модель костюма",
+        "Модель брюк",
+        "Комплектация",
+        "Тип карманов",
+        "Вид застежки",
+    ):
+        push_char_values(key)
+
+    for value in _extract_editor_value_parts(chars.get("Покрой")):
+        _push_editor_keyword(result, seen, value)
+        _push_editor_keyword(result, seen, f"{value} крой")
+
+    if chars.get("Материал подкладки"):
+        _push_editor_keyword(result, seen, "подкладка")
+    if chars.get("Комплектация"):
+        _push_editor_keyword(result, seen, "комплект")
+    if chars.get("Тип карманов"):
+        _push_editor_keyword(result, seen, "карманы")
+    if chars.get("Вид застежки"):
+        _push_editor_keyword(result, seen, "застежка")
+
+    return result[:limit]
+
+
 def _check_seo_keywords_in_text(text: str, keywords: list, min_count: int = 2) -> tuple:
     """
     Check that at least `min_count` SEO keywords appear in `text`.
@@ -663,6 +1262,102 @@ def _validate_title_fix(title: str, card: dict) -> tuple:
         return False, kw_reason
 
     return True, ""
+
+
+async def generate_card_description_suggestion(
+    card: Card,
+    *,
+    draft: Optional[Dict[str, Any]] = None,
+    instructions: Optional[str] = None,
+) -> Dict[str, Any]:
+    context = build_card_text_context(card, draft)
+    editor_keywords = build_description_editor_keywords(context)
+    seo_keywords = _get_subject_keywords(context) or editor_keywords
+    current_description = str(context.get("description") or "")
+
+    ai_svc = get_ai_service()
+    if not ai_svc.is_enabled():
+        raise RuntimeError("AI generation is disabled")
+
+    extra_instructions = str(instructions or "").strip()
+    product_dna = str(card.product_dna or context.get("product_dna") or "")
+
+    gen_result, _gen_tokens = await asyncio.to_thread(
+        ai_svc.generate_description,
+        card=context,
+        product_dna=product_dna,
+        seo_keywords=seo_keywords,
+        extra_instructions=extra_instructions or None,
+    )
+
+    candidate = _as_text(gen_result.get("recommended_value")) or current_description
+    reason = str(gen_result.get("reason") or "").strip()
+    last_ai_candidate: Optional[str] = candidate if candidate else None
+
+    min_keyword_count = min(2, len(seo_keywords)) if seo_keywords else 0
+
+    valid, fail_reason = validate_description(str(candidate), context)
+    if valid and min_keyword_count > 0:
+        kw_valid, kw_reason = _check_seo_keywords_in_text(
+            str(candidate),
+            seo_keywords,
+            min_count=min_keyword_count,
+        )
+        if not kw_valid:
+            valid, fail_reason = False, kw_reason
+
+    if not valid:
+        retry_reason = fail_reason
+        if extra_instructions:
+            retry_reason = f"{retry_reason}. Дополнительные инструкции пользователя: {extra_instructions}"
+
+        for _ in range(MAX_FIX_RETRIES):
+            refix_result, _refix_tokens = await asyncio.to_thread(
+                ai_svc.refix_description,
+                card=context,
+                current_description=str(candidate),
+                failed_reason=retry_reason,
+            )
+            if not refix_result:
+                continue
+
+            candidate = _as_text(refix_result.get("recommended_value")) or candidate
+            reason = str(refix_result.get("reason") or reason).strip()
+            if candidate:
+                last_ai_candidate = candidate
+
+            valid, fail_reason = validate_description(str(candidate), context)
+            if valid and min_keyword_count > 0:
+                kw_valid, kw_reason = _check_seo_keywords_in_text(
+                    str(candidate),
+                    seo_keywords,
+                    min_count=min_keyword_count,
+                )
+                if not kw_valid:
+                    valid, fail_reason = False, kw_reason
+            if valid:
+                break
+            retry_reason = fail_reason
+            if extra_instructions:
+                retry_reason = f"{retry_reason}. Дополнительные инструкции пользователя: {extra_instructions}"
+
+    rec_value: Optional[str] = None
+    if valid:
+        rec_value = candidate
+    elif last_ai_candidate and last_ai_candidate.strip().lower() != current_description.strip().lower():
+        if len(last_ai_candidate) >= 500:
+            rec_value = last_ai_candidate
+            reason = reason or "Черновой вариант от AI"
+
+    if not rec_value:
+        raise RuntimeError(fail_reason or "AI did not return a usable description")
+
+    return {
+        "field": "description",
+        "value": rec_value,
+        "reason": reason or None,
+        "keywords": editor_keywords,
+    }
 
 
 async def sync_cards_from_wb(
@@ -797,6 +1492,41 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     ai_context = copy.deepcopy(raw_data) if isinstance(raw_data, dict) else {}
     score_breakdown = {}  # No basic code analysis — AI handles everything
 
+    # ── STEP 0: Basic media validation ────────────────────────────────────
+    # We keep media quantity/video checks deterministic, so UI can surface
+    # them in a dedicated media flow while still treating 0-photo cards as critical.
+    basic_media_codes = {"no_photos", "few_photos", "add_more_photos", "no_video"}
+    for basic_issue in card_analyzer.analyze_card(card):
+        code = str(basic_issue.get("code") or "").strip().lower()
+        if code not in basic_media_codes:
+            continue
+
+        severity = basic_issue.get("severity", IssueSeverity.WARNING)
+        if not isinstance(severity, IssueSeverity):
+            severity = IssueSeverity(str(severity))
+
+        category = basic_issue.get("category", IssueCategory.OTHER)
+        if not isinstance(category, IssueCategory):
+            category = IssueCategory(str(category))
+
+        issues.append(
+            CardIssue(
+                card_id=card.id,
+                code=_clip(code, 100),
+                severity=severity,
+                category=category,
+                title=_clip(basic_issue.get("title", "Проблема с медиа"), 500),
+                description=basic_issue.get("description"),
+                current_value=basic_issue.get("current_value"),
+                suggested_value=basic_issue.get("suggested_value"),
+                alternatives=basic_issue.get("alternatives", []),
+                field_path=_clip(basic_issue.get("field_path"), 255) if basic_issue.get("field_path") else None,
+                score_impact=int(basic_issue.get("score_impact") or 0),
+                status=IssueStatus.PENDING,
+                source=_clip("code", 50),
+            )
+        )
+
     # ── STEP 1: WB catalog validation (allowed values + limits only) ──
     # Now includes auto-fix suggestions from catalog data
     wb_issues_data: List[dict] = []
@@ -834,6 +1564,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 ),
                 # Fixed field don't get suggestions
                 suggested_value=None if is_fixed else (_format_suggested(sv) if sv else None),
+                alternatives=_extract_issue_example_values(wb_issue.get("errors", [])),
                 field_path=_clip(f"characteristics.{wb_issue.get('name')}", 255),
                 charc_id=wb_issue.get("charc_id"),
                 allowed_values=wb_issue.get("allowed_values", []),
@@ -1081,7 +1812,7 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                 card_id=card.id,
                 code=_clip(f"ai_{ai_issue.get('category', 'mixed')}", 100),
                 severity=_map_severity(ai_issue.get("severity", "warning")),
-                category=_map_ai_category(ai_issue.get("category")),
+                category=_map_ai_category(ai_issue.get("category"), normalized_issue_path),
                 title=_clip(ai_issue.get("message", "AI обнаружил проблему"), 500),
                 description=_format_ai_description(ai_issue),
                 current_value=_resolve_current_value(
@@ -1337,6 +2068,13 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                             fix_action = "replace"
                             reason = reason or "Автоматически подобрано по allowed_values и лимитам"
 
+                    if rec_value in (None, "", []):
+                        salvaged_value = _salvage_issue_fix_candidate(iss, product_dna=product_dna)
+                        if salvaged_value not in (None, "", []):
+                            rec_value = salvaged_value
+                            fix_action = "replace"
+                            reason = reason or "Автоматически выделено подтвержденное значение по фото"
+
                 # Save the fix — skip empty AI results
                 # For swap actions: empty recommended_value is valid (means "clear this field")
                 destructive_allowed = _allow_destructive_fix(iss)
@@ -1354,18 +2092,18 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                     iss.ai_suggested_value = ""
                     iss.suggested_value = ""
                     # Store swap info in error_details
-                    swap_details = list(iss.error_details or [])
+                    swap_details = _remove_fix_action_markers(iss.error_details)
                     swap_entry = {"type": "swap" if is_swap else "clear", "fix_action": fix_action}
                     if is_swap:
                         swap_entry["swap_to_name"] = suggestion.get("swap_to_name", "")
                         swap_entry["swap_to_value"] = suggestion.get("swap_to_value", "")
-                    # Remove existing swap/clear entries to avoid duplicates
-                    swap_details = [d for d in swap_details if d.get("fix_action") not in ("swap", "clear")]
                     swap_details.append(swap_entry)
                     iss.error_details = swap_details
                 elif has_value:
+                    iss.error_details = _remove_fix_action_markers(iss.error_details)
                     iss.ai_suggested_value = _format_suggested(rec_value)
                 else:
+                    iss.error_details = _remove_fix_action_markers(iss.error_details)
                     iss.ai_suggested_value = None
                     
                 iss.ai_reason = reason
@@ -1440,8 +2178,16 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                                 if not valid:
                                     rec_value = _fallback_value_from_constraints(iss)
 
+                        if rec_value in (None, "", []):
+                            salvaged_value = _salvage_issue_fix_candidate(iss, product_dna=product_dna)
+                            if salvaged_value not in (None, "", []):
+                                rec_value = salvaged_value
+                                fix_action = "replace"
+                                reason = reason or "Автоматически выделено подтвержденное значение по фото"
+
                         has_value = rec_value is not None and rec_value != "" and rec_value != []
                         if has_value:
+                            iss.error_details = _remove_fix_action_markers(iss.error_details)
                             iss.ai_suggested_value = _format_suggested(rec_value)
                             iss.ai_reason = reason
                             iss.ai_alternatives = []
@@ -1452,6 +2198,8 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
                                     iss.field_path,
                                     rec_value,
                                 )
+                        else:
+                            iss.error_details = _remove_fix_action_markers(iss.error_details)
 
         # If characteristics need changes, force a description-refresh issue
         # so AI-generated new description is visible in the issues list.
@@ -1658,16 +2406,13 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
 
     # ── Ensure every issue has a suggested_value ─
     _ensure_all_suggested_values(issues)
+    _strip_unverified_catalog_suggestions(issues, product_dna)
+    issues = _drop_unverified_ai_issues(issues)
     issues = _drop_noop_issues(issues)
+    issues = _dedupe_identical_issues(issues)
 
-    # ── Drop issues where AI returned null suggested_value ──
-    # If AI couldn't determine a fix, the issue is not actionable.
-    issues = [
-        iss for iss in issues
-        if iss.suggested_value is not None
-        or iss.source == "fixed_file"  # Fixed file issues always shown
-        or iss.source == "auto_fix"    # Auto-fixed issues always shown
-    ]
+    # Keep issues that are still actionable manually even without auto-filled value.
+    issues = [iss for iss in issues if _is_manually_actionable_issue(iss)]
 
     # Persist final issue set (after collapse)
     for issue in issues:
@@ -1742,13 +2487,19 @@ def _ensure_all_suggested_values(issues: List[CardIssue]) -> None:
 
         # Photo/video issues — manual action needed, provide instructions
         if code in ("no_photos",):
-            iss.suggested_value = "Загрузите минимум 3 фотографии товара"
+            media_threshold = max(1, int(getattr(settings, "MEDIA_WARNING_PHOTOS_COUNT", 30) or 30))
+            iss.suggested_value = f"Загрузите фото товара. Без фото WB может заблокировать карточку. Цель — минимум {media_threshold} фото"
             continue
         if code in ("few_photos",):
-            iss.suggested_value = "Добавьте фотографии до рекомендуемого количества (5-7 фото)"
+            media_threshold = max(1, int(getattr(settings, "MEDIA_WARNING_PHOTOS_COUNT", 30) or 30))
+            iss.suggested_value = f"Добавьте фотографии: если их меньше {media_threshold}, карточка остаётся в блоке медиа-ошибок"
             continue
         if code in ("add_more_photos",):
-            iss.suggested_value = "Добавьте 7-10 фото: общий вид, детали, на модели"
+            recommended_threshold = max(
+                int(getattr(settings, "MEDIA_WARNING_PHOTOS_COUNT", 30) or 30),
+                int(getattr(settings, "RECOMMENDED_PHOTOS_COUNT", 30) or 30),
+            )
+            iss.suggested_value = f"Добавьте фото до {recommended_threshold}: общий вид, детали, фактура, посадка"
             continue
         if code in ("no_video",):
             iss.suggested_value = "Добавьте видео 15-30 секунд для повышения конверсии"
@@ -1784,9 +2535,7 @@ def _drop_noop_issues(issues: List[CardIssue]) -> List[CardIssue]:
         # Rule 1: no-op suggestion (current value already equals suggested value)
         # Skip only for AI/code-generated issues; keep fixed_file/auto_fix visible by design.
         if iss.source in {"ai", "code"}:
-            cur = _norm_issue_value(iss.current_value)
-            sug = _norm_issue_value(iss.suggested_value or iss.ai_suggested_value)
-            if cur and sug and cur == sug:
+            if _issue_values_equivalent(iss.current_value, iss.suggested_value or iss.ai_suggested_value):
                 continue
 
         # Rule 2: allowed_values is empty (no catalog constraints) AND no suggestion generated
@@ -1802,6 +2551,34 @@ def _drop_noop_issues(issues: List[CardIssue]) -> List[CardIssue]:
 
         out.append(iss)
     return out
+
+
+def _dedupe_identical_issues(issues: List[CardIssue]) -> List[CardIssue]:
+    """Drop exact duplicate issues generated from the same evidence/fix."""
+    deduped: List[CardIssue] = []
+    seen: set[tuple] = set()
+
+    for iss in issues:
+        severity = iss.severity.value if hasattr(iss.severity, "value") else str(iss.severity or "")
+        category = iss.category.value if hasattr(iss.category, "value") else str(iss.category or "")
+        status = iss.status.value if hasattr(iss.status, "value") else str(iss.status or "")
+        signature = (
+            str(iss.code or "").strip().lower(),
+            severity,
+            category,
+            status,
+            str(iss.field_path or "").strip().lower(),
+            _norm_issue_value(iss.current_value),
+            _norm_issue_value(iss.suggested_value),
+            _norm_issue_value(iss.ai_suggested_value),
+            json.dumps(iss.error_details or [], ensure_ascii=False, sort_keys=True),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(iss)
+
+    return deduped
 
 
 def _validate_fix_against_constraints(
@@ -1991,8 +2768,22 @@ def _map_severity(severity: str) -> IssueSeverity:
     return mapping.get(severity.lower(), IssueSeverity.WARNING)
 
 
-def _map_ai_category(category: str) -> IssueCategory:
-    """Map AI category to enum"""
+def _map_ai_category(category: str, field_path: Optional[str] = None) -> IssueCategory:
+    """Map AI category to enum with field-path override for photo-based characteristic issues."""
+    normalized_path = str(field_path or "").strip().lower()
+    normalized_category = str(category or "").strip().lower()
+
+    if normalized_path == "title":
+        return IssueCategory.TITLE
+    if normalized_path == "description":
+        return IssueCategory.DESCRIPTION
+    if normalized_path.startswith("characteristics."):
+        return IssueCategory.CHARACTERISTICS
+    if normalized_path.startswith("photos"):
+        return IssueCategory.PHOTOS
+    if normalized_path.startswith("videos"):
+        return IssueCategory.VIDEO
+
     mapping = {
         "photo": IssueCategory.PHOTOS,
         "text": IssueCategory.DESCRIPTION,
@@ -2000,7 +2791,7 @@ def _map_ai_category(category: str) -> IssueCategory:
         "qualification": IssueCategory.CHARACTERISTICS,
         "mixed": IssueCategory.OTHER,
     }
-    return mapping.get(category.lower(), IssueCategory.OTHER) if category else IssueCategory.OTHER
+    return mapping.get(normalized_category, IssueCategory.OTHER)
 
 
 def _format_error_description(wb_issue: dict) -> str:
@@ -2022,8 +2813,19 @@ def _format_ai_description(ai_issue: dict) -> str:
     """Format AI issue description"""
     parts = []
     for err in ai_issue.get("errors", []):
-        parts.append(f"{err.get('type', 'issue')}: {err.get('message', '')}")
-    return "; ".join(parts) if parts else ai_issue.get("message", "")
+        if not isinstance(err, dict):
+            continue
+        marker = str(err.get("fix_action") or err.get("type") or "").strip().lower()
+        if marker in {"swap", "clear", "compound"}:
+            continue
+        message = str(err.get("message") or "").strip()
+        if message:
+            parts.append(message)
+
+    if parts:
+        unique_parts = list(dict.fromkeys(parts))
+        return "; ".join(unique_parts)
+    return str(ai_issue.get("message") or "").strip()
 
 
 def _calculate_wb_score_impact(wb_issue: dict) -> int:
@@ -2128,6 +2930,110 @@ async def get_card_by_id(db: AsyncSession, card_id: int) -> Optional[Card]:
     return result.scalar_one_or_none()
 
 
+def _pending_issue_counts_from_card(card: Card) -> dict[str, int]:
+    counts = {
+        "critical": 0,
+        "warning": 0,
+        "improvement": 0,
+    }
+
+    for issue in getattr(card, "issues", None) or []:
+        status = issue.status.value if hasattr(issue.status, "value") else str(issue.status or "")
+        if status != IssueStatus.PENDING.value:
+            continue
+
+        severity = issue.severity.value if hasattr(issue.severity, "value") else str(issue.severity or "")
+        if severity in counts:
+            counts[severity] += 1
+
+    return counts
+
+
+async def ensure_card_issue_consistency(
+    db: AsyncSession,
+    card: Card,
+    *,
+    reanalyze_if_missing: bool = False,
+) -> Card:
+    """
+    Heal stale card issue state.
+
+    Some sync flows used to remove card_issues rows without resetting the cached
+    issue counters on cards. When that happens the frontend sees warning counts
+    but no actual issues. This helper optionally re-analyzes such cards once and
+    otherwise falls back to the real pending counts from DB/loaded relations.
+    """
+    if card is None:
+        return card
+
+    stored_counts = {
+        "critical": int(card.critical_issues_count or 0),
+        "warning": int(card.warnings_count or 0),
+        "improvement": int(card.improvements_count or 0),
+    }
+    loaded_issues = list(getattr(card, "issues", None) or [])
+    actual_counts = _pending_issue_counts_from_card(card)
+
+    stored_total = sum(stored_counts.values())
+    loaded_total = len(loaded_issues)
+
+    if reanalyze_if_missing and stored_total > 0 and loaded_total == 0 and card.raw_data:
+        try:
+            try:
+                await asyncio.wait_for(
+                    analyze_card(db, card, use_ai=True),
+                    timeout=STALE_CARD_REANALYZE_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out while re-analyzing stale card with AI, falling back to validator-only run | card_id=%s nm_id=%s",
+                    getattr(card, "id", None),
+                    getattr(card, "nm_id", None),
+                )
+                await db.rollback()
+                fallback_card = await get_card_by_id(db, card.id)
+                if fallback_card is not None:
+                    card = fallback_card
+                await analyze_card(db, card, use_ai=False)
+
+            refreshed = await get_card_by_id(db, card.id)
+            if refreshed is not None:
+                card = refreshed
+                stored_counts = {
+                    "critical": int(card.critical_issues_count or 0),
+                    "warning": int(card.warnings_count or 0),
+                    "improvement": int(card.improvements_count or 0),
+                }
+                actual_counts = _pending_issue_counts_from_card(card)
+        except Exception:
+            logger.exception(
+                "Failed to re-analyze stale card issue state | card_id=%s nm_id=%s",
+                getattr(card, "id", None),
+                getattr(card, "nm_id", None),
+            )
+            await db.rollback()
+            refreshed = await get_card_by_id(db, card.id)
+            if refreshed is not None:
+                card = refreshed
+                stored_counts = {
+                    "critical": int(card.critical_issues_count or 0),
+                    "warning": int(card.warnings_count or 0),
+                    "improvement": int(card.improvements_count or 0),
+                }
+                actual_counts = _pending_issue_counts_from_card(card)
+
+    if stored_counts == actual_counts:
+        return card
+
+    card.critical_issues_count = actual_counts["critical"]
+    card.warnings_count = actual_counts["warning"]
+    card.improvements_count = actual_counts["improvement"]
+    await db.commit()
+
+    refreshed = await get_card_by_id(db, card.id)
+    return refreshed or card
+
+
 async def get_store_cards(
     db: AsyncSession,
     store_id: int,
@@ -2137,6 +3043,9 @@ async def get_store_cards(
     min_score: Optional[int] = None,
     max_score: Optional[int] = None,
     has_critical: Optional[bool] = None,
+    has_issues: Optional[bool] = None,
+    no_issues: Optional[bool] = None,
+    is_fully_confirmed: Optional[bool] = None,
 ) -> tuple[List[Card], int]:
     """Get cards with filters"""
     query = select(Card).where(Card.store_id == store_id)
@@ -2151,7 +3060,8 @@ async def get_store_cards(
         )
         count_query = count_query.where(
             (Card.title.ilike(search_filter)) |
-            (Card.vendor_code.ilike(search_filter))
+            (Card.vendor_code.ilike(search_filter)) |
+            (func.cast(Card.nm_id, String).ilike(search_filter))
         )
     
     if min_score is not None:
@@ -2169,6 +3079,35 @@ async def get_store_cards(
         else:
             query = query.where(Card.critical_issues_count == 0)
             count_query = count_query.where(Card.critical_issues_count == 0)
+
+    total_issues_expr = (
+        func.coalesce(Card.critical_issues_count, 0)
+        + func.coalesce(Card.warnings_count, 0)
+        + func.coalesce(Card.improvements_count, 0)
+    )
+    confirmed_sections_expr = (
+        select(func.count(CardConfirmedSection.id))
+        .where(
+            CardConfirmedSection.card_id == Card.id,
+            CardConfirmedSection.section.in_(CARD_WORKFLOW_SECTIONS),
+        )
+        .correlate(Card)
+        .scalar_subquery()
+    )
+    if has_issues:
+        query = query.where(total_issues_expr > 0)
+        count_query = count_query.where(total_issues_expr > 0)
+    if no_issues:
+        query = query.where(total_issues_expr == 0)
+        count_query = count_query.where(total_issues_expr == 0)
+    if is_fully_confirmed is not None:
+        required_sections = len(CARD_WORKFLOW_SECTIONS)
+        if is_fully_confirmed:
+            query = query.where(confirmed_sections_expr >= required_sections)
+            count_query = count_query.where(confirmed_sections_expr >= required_sections)
+        else:
+            query = query.where(confirmed_sections_expr < required_sections)
+            count_query = count_query.where(confirmed_sections_expr < required_sections)
     
     # Get total count
     total_result = await db.execute(count_query)

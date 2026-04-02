@@ -1,38 +1,35 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useStore } from '../contexts/StoreContext';
 import {
-  Settings,
-  X,
-  Activity,
-  Clock,
-  MousePointerClick,
-  ChevronRight,
-  Trash2,
-  BarChart3,
+  Settings, Activity, Clock, MousePointerClick, ChevronRight, ChevronDown,
+  Trash2, BarChart3, X,
 } from 'lucide-react';
 import {
-  getSessions,
-  getDailyTotals,
-  getStats,
-  clearActivity,
+  useWorkTracker,
   formatDuration,
-  formatDurationSec,
-  type ActivitySession,
-} from '../hooks/useActivityTracker';
+  plural,
+  type WorkSession,
+  type WorkAction,
+} from '../hooks/useWorkTracker';
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Cell,
+} from 'recharts';
 
 interface SettingsPanelProps {
   open: boolean;
   onClose: () => void;
 }
 
-const WEEKDAYS_SHORT = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс'];
 const MONTHS_SHORT = ['янв.', 'февр.', 'мар.', 'апр.', 'мая', 'июня', 'июля', 'авг.', 'сент.', 'окт.', 'нояб.', 'дек.'];
 
 function formatSessionDate(iso: string): string {
   const d = new Date(iso);
-  const day = d.getDate();
-  const month = MONTHS_SHORT[d.getMonth()];
-  return `${day} ${month}`;
+  return `${d.getDate()} ${MONTHS_SHORT[d.getMonth()]}`;
 }
 
 function formatTime(iso: string): string {
@@ -40,194 +37,241 @@ function formatTime(iso: string): string {
   return d.toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
 }
 
-function getWeekdayLabel(iso: string): string {
-  const d = new Date(iso);
-  const day = d.getDay(); // 0=Sun
-  return WEEKDAYS_SHORT[day === 0 ? 6 : day - 1];
+const SYSTEM_TYPES = new Set(['session_started', 'session_ended']);
+
+function SessionCard({ session, onNavigate }: { session: WorkSession; onNavigate: (nmId: number) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const visibleActions = session.actions.filter(a => !SYSTEM_TYPES.has(a.type));
+
+  return (
+    <div className="rounded-lg border border-border bg-card hover:border-muted-foreground/30 transition-colors overflow-hidden">
+      <button
+        className="w-full flex items-center gap-3 px-3.5 py-2.5 text-left"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-bold text-foreground">
+            {formatSessionDate(session.startedAt)} · {formatTime(session.startedAt)} — {session.endedAt ? formatTime(session.endedAt) : 'сейчас'}
+          </div>
+          <div className="flex items-center gap-2 text-[11px] text-muted-foreground mt-0.5">
+            <span className="inline-flex items-center gap-1"><Clock size={12} /> {formatDuration(session.activeTimeMs)}</span>
+            <span>·</span>
+            <span className="inline-flex items-center gap-1"><MousePointerClick size={12} /> {visibleActions.length} {plural(visibleActions.length, 'действие', 'действия', 'действий')}</span>
+            {session.isManualEnd && (
+              <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 ml-1">вручную</Badge>
+            )}
+          </div>
+        </div>
+        {visibleActions.length > 0 && (
+          expanded
+            ? <ChevronDown size={16} className="text-muted-foreground/40 flex-shrink-0" />
+            : <ChevronRight size={16} className="text-muted-foreground/40 flex-shrink-0" />
+        )}
+      </button>
+
+      {expanded && visibleActions.length > 0 && (
+        <div className="border-t border-border px-3.5 py-2 space-y-1 bg-muted/30">
+          {visibleActions.map(action => {
+            const time = formatTime(action.timestamp);
+            const nmId = action.meta?.nmId;
+            const isClickable = !!nmId;
+            return (
+              <div
+                key={action.id}
+                className={`flex items-center gap-2 text-[12px] py-0.5 ${isClickable ? 'cursor-pointer hover:text-primary transition-colors group' : ''}`}
+                onClick={isClickable ? () => onNavigate(nmId) : undefined}
+              >
+                <span className="text-muted-foreground w-10 flex-shrink-0 font-mono">{time}</span>
+                <span className="text-foreground flex-1 truncate">{action.label}</span>
+                {nmId && (
+                  <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-4 font-mono flex-shrink-0 group-hover:bg-primary/10 group-hover:text-primary transition-colors">
+                    {nmId}
+                  </Badge>
+                )}
+                {isClickable && <ChevronRight size={12} className="text-muted-foreground/50 flex-shrink-0" />}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
-function plural(n: number, one: string, few: string, many: string) {
-  const mod10 = n % 10;
-  const mod100 = n % 100;
-  if (mod100 >= 11 && mod100 <= 14) return many;
-  if (mod10 === 1) return one;
-  if (mod10 >= 2 && mod10 <= 4) return few;
-  return many;
-}
-
-export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
+export function ActivityContent() {
   const { activeStore } = useStore();
-  const [period, setPeriod] = useState<'week' | 'month'>('week');
-  const [tick, setTick] = useState(0);
+  const navigate = useNavigate();
+  const {
+    sessions, todayStats, isActive, activeSession,
+    clearHistory, getDailyStats,
+  } = useWorkTracker();
 
-  // Refresh stats every 30s
-  useEffect(() => {
-    if (!open) return;
-    setTick(t => t + 1);
-    const iv = setInterval(() => setTick(t => t + 1), 30_000);
-    return () => clearInterval(iv);
-  }, [open]);
+  const [chartRange, setChartRange] = useState<7 | 30>(7);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
 
-  const days = period === 'week' ? 7 : 30;
-  const stats = useMemo(() => getStats(days), [tick, days]);
-  const dailyTotals = useMemo(() => getDailyTotals(days), [tick, days]);
-  const allSessions = useMemo(() => getSessions(), [tick]);
+  const dailyStats = useMemo(() => getDailyStats(chartRange), [getDailyStats, chartRange]);
 
-  const maxMinutes = useMemo(() => Math.max(...dailyTotals.map(d => d.minutes), 1), [dailyTotals]);
+  const totalHours = useMemo(() => {
+    const total = dailyStats.reduce((a, d) => a + d.timeHours, 0);
+    return Math.round(total * 10) / 10;
+  }, [dailyStats]);
 
-  const totalWeekMin = useMemo(() => dailyTotals.reduce((a, d) => a + d.minutes, 0), [dailyTotals]);
+  const totalActions = useMemo(() => dailyStats.reduce((a, d) => a + d.actions, 0), [dailyStats]);
 
-  const totalWeekActions = useMemo(() => {
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - days);
-    return allSessions
-      .filter(s => new Date(s.startedAt) >= cutoff)
-      .reduce((a, s) => a + s.actions, 0);
-  }, [allSessions, days]);
+  const allSessions = useMemo(() => {
+    const list = [...sessions];
+    if (activeSession) list.unshift(activeSession);
+    return list.sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
+  }, [sessions, activeSession]);
+
+  const filteredSessions = useMemo(() => {
+    if (!selectedDate) return allSessions;
+    return allSessions.filter(s => s.startedAt.slice(0, 10) === selectedDate);
+  }, [allSessions, selectedDate]);
 
   const handleClear = useCallback(() => {
     if (confirm('Очистить всю историю активности?')) {
-      clearActivity();
-      setTick(t => t + 1);
+      clearHistory();
     }
+  }, [clearHistory]);
+
+  const handleBarClick = useCallback((data: any) => {
+    if (!data?.date) return;
+    setSelectedDate(prev => prev === data.date ? null : data.date);
   }, []);
 
-  if (!open) return null;
+  const handleNavigate = useCallback((nmId: number) => {
+    navigate(`/editor-v2/${nmId}`);
+  }, [navigate]);
 
   return (
-    <div className="stg-overlay" onClick={onClose}>
-      <div className="stg-panel" onClick={e => e.stopPropagation()}>
-        {/* Header */}
-        <div className="stg-header">
-          <div className="stg-header-title">
-            <Settings size={18} />
-            <span>Настройки</span>
-          </div>
-          <button className="stg-close" onClick={onClose}><X size={18} /></button>
+    <div className="space-y-5">
+      {/* Stats row — 3 cards */}
+      <div className="grid grid-cols-3 gap-3">
+        <div className="text-center rounded-xl border border-border bg-muted/50 py-3">
+          <div className="text-xl font-extrabold text-foreground">{todayStats.sessionsCount}</div>
+          <div className="text-[11px] text-muted-foreground">{plural(todayStats.sessionsCount, 'сессия', 'сессии', 'сессий')}</div>
         </div>
-
-        <div className="stg-subtitle">
-          Персональные настройки для магазина "{activeStore?.name || '—'}"
+        <div className="text-center rounded-xl border border-border bg-muted/50 py-3">
+          <div className="text-xl font-extrabold text-foreground">{formatDuration(todayStats.totalTimeMs)}</div>
+          <div className="text-[11px] text-muted-foreground">рабочее время</div>
         </div>
-
-        <div className="stg-scroll">
-          {/* Activity header */}
-          <div className="stg-section-title">
-            <Activity size={16} />
-            <span>Рабочая активность</span>
-          </div>
-
-          {/* Stats row */}
-          <div className="stg-stats-row">
-            <div className="stg-stat">
-              <div className="stg-stat-value">{stats.sessionCount}</div>
-              <div className="stg-stat-label">{plural(stats.sessionCount, 'сессия', 'сессии', 'сессий')}</div>
-            </div>
-            <div className="stg-stat">
-              <div className="stg-stat-value">{formatDuration(stats.totalMinutes)}</div>
-              <div className="stg-stat-label">рабочее время</div>
-            </div>
-            <div className="stg-stat">
-              <div className="stg-stat-value">{stats.totalActions}</div>
-              <div className="stg-stat-label">{plural(stats.totalActions, 'действие', 'действия', 'действий')}</div>
-            </div>
-          </div>
-
-          {/* Chart */}
-          <div className="stg-chart-card">
-            <div className="stg-chart-header">
-              <div className="stg-chart-title">
-                <BarChart3 size={15} />
-                <span>Рабочее время</span>
-              </div>
-              <div className="stg-chart-tabs">
-                <button
-                  className={period === 'week' ? 'active' : ''}
-                  onClick={() => setPeriod('week')}
-                >Неделя</button>
-                <button
-                  className={period === 'month' ? 'active' : ''}
-                  onClick={() => setPeriod('month')}
-                >Месяц</button>
-              </div>
-            </div>
-
-            <div className="stg-chart-area">
-              {/* Y-axis labels */}
-              <div className="stg-chart-yaxis">
-                {[...Array(5)].map((_, i) => {
-                  const step = Math.ceil(maxMinutes / 60 / 4);
-                  const val = (4 - i) * step;
-                  return <span key={i}>{val}ч</span>;
-                })}
-                <span>0ч</span>
-              </div>
-
-              {/* Bars */}
-              <div className="stg-chart-bars">
-                {dailyTotals.map((d) => {
-                  const pct = maxMinutes > 0 ? (d.minutes / maxMinutes) * 100 : 0;
-                  return (
-                    <div key={d.date} className="stg-chart-bar-wrap" title={`${d.date}: ${formatDuration(d.minutes)}`}>
-                      <div className="stg-chart-bar-track">
-                        <div
-                          className="stg-chart-bar"
-                          style={{ height: `${Math.max(pct, 0)}%` }}
-                        />
-                      </div>
-                      <span className="stg-chart-bar-label">
-                        {period === 'week' ? getWeekdayLabel(d.date) : new Date(d.date).getDate().toString()}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="stg-chart-footer">
-              <span>Всего за {period === 'week' ? 'неделю' : 'месяц'}</span>
-              <span className="stg-chart-footer-val">
-                <strong>{formatDuration(totalWeekMin)}</strong>
-                &nbsp;&nbsp;{totalWeekActions} {plural(totalWeekActions, 'действие', 'действия', 'действий')}
-              </span>
-            </div>
-          </div>
-
-          {/* Sessions list */}
-          <div className="stg-section-title stg-section-title--mt">
-            Последние сессии
-          </div>
-
-          <div className="stg-sessions">
-            {allSessions.length === 0 && (
-              <div className="stg-empty">Нет записей активности</div>
-            )}
-            {allSessions.slice(0, 20).map(session => (
-              <div key={session.id} className="stg-session-card">
-                <div className="stg-session-main">
-                  <div className="stg-session-date">
-                    {formatSessionDate(session.startedAt)} · {formatTime(session.startedAt)} — {session.endedAt ? formatTime(session.endedAt) : 'сейчас'}
-                  </div>
-                  <div className="stg-session-meta">
-                    <span><Clock size={12} /> {formatDurationSec(session.durationSec)}</span>
-                    <span>·</span>
-                    <span><MousePointerClick size={12} /> {session.actions} {plural(session.actions, 'действие', 'действия', 'действий')}</span>
-                  </div>
-                </div>
-                <ChevronRight size={16} className="stg-session-arrow" />
-              </div>
-            ))}
-          </div>
-
-          {/* Clear */}
-          {allSessions.length > 0 && (
-            <button className="stg-clear-btn" onClick={handleClear}>
-              <Trash2 size={14} />
-              Очистить историю
-            </button>
-          )}
+        <div className="text-center rounded-xl border border-border bg-muted/50 py-3">
+          <div className="text-xl font-extrabold text-foreground">{todayStats.totalActions}</div>
+          <div className="text-[11px] text-muted-foreground">{plural(todayStats.totalActions, 'действие', 'действия', 'действий')}</div>
         </div>
       </div>
+
+      {/* Chart */}
+      <div className="rounded-xl border border-border bg-card p-3">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+            <BarChart3 size={15} className="text-muted-foreground" />
+            Рабочее время
+          </div>
+          <div className="flex bg-muted rounded-lg p-0.5">
+            <button
+              className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${chartRange === 7 ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => { setChartRange(7); setSelectedDate(null); }}
+            >Неделя</button>
+            <button
+              className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${chartRange === 30 ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => { setChartRange(30); setSelectedDate(null); }}
+            >Месяц</button>
+          </div>
+        </div>
+
+        <div className="h-[140px]">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={dailyStats} barCategoryGap="20%" onClick={(state) => {
+              if (state?.activePayload?.[0]?.payload) handleBarClick(state.activePayload[0].payload);
+            }}>
+              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
+              <XAxis
+                dataKey="label"
+                tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }}
+                axisLine={false}
+                tickLine={false}
+                interval={chartRange === 30 ? 4 : 0}
+              />
+              <YAxis
+                width={28}
+                tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }}
+                axisLine={false}
+                tickLine={false}
+                tickFormatter={(v) => `${v}ч`}
+              />
+              <Bar
+                dataKey="timeHours"
+                radius={[4, 4, 0, 0]}
+                maxBarSize={chartRange === 30 ? 12 : 24}
+                cursor="pointer"
+              >
+                {dailyStats.map((entry) => (
+                  <Cell
+                    key={entry.date}
+                    fill={selectedDate === entry.date ? 'hsl(var(--primary))' : 'hsl(var(--primary) / 0.6)'}
+                  />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="border-t border-border mt-2 pt-2 flex items-center justify-between text-xs text-muted-foreground">
+          <span>Всего за {chartRange === 7 ? 'неделю' : 'месяц'}</span>
+          <span className="text-foreground">
+            <strong className="font-extrabold">{totalHours}ч</strong>
+            &nbsp;&nbsp;{totalActions} {plural(totalActions, 'действие', 'действия', 'действий')}
+          </span>
+        </div>
+      </div>
+
+      {/* Sessions list */}
+      <div className="flex items-center justify-between mt-6">
+        <div className="text-sm font-semibold text-foreground">
+          {selectedDate ? `Сессии за ${formatSessionDate(selectedDate + 'T00:00:00')}` : 'Последние сессии'}
+        </div>
+        {selectedDate && (
+          <Button variant="ghost" size="sm" className="text-xs h-6 px-2" onClick={() => setSelectedDate(null)}>
+            Показать все
+          </Button>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-2">
+        {filteredSessions.length === 0 && (
+          <div className="text-center py-6 text-sm text-muted-foreground">Нет записей активности</div>
+        )}
+        {filteredSessions.slice(0, 20).map(session => (
+          <SessionCard key={session.id} session={session} onNavigate={handleNavigate} />
+        ))}
+      </div>
+
+      {allSessions.length > 0 && (
+        <Button variant="ghost" size="sm" className="mx-auto mt-4 text-muted-foreground hover:text-destructive gap-2" onClick={handleClear}>
+          <Trash2 size={14} />
+          Очистить историю
+        </Button>
+      )}
     </div>
+  );
+}
+
+export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
+  return (
+    <Sheet open={open} onOpenChange={(v) => !v && onClose()}>
+      <SheetContent className="w-[400px] sm:w-[540px] p-0 flex flex-col overflow-hidden">
+        <SheetHeader className="px-6 pt-5 pb-0">
+          <SheetTitle className="flex items-center gap-2 text-base font-semibold">
+            <Settings size={18} className="text-muted-foreground" />
+            Моя активность
+          </SheetTitle>
+        </SheetHeader>
+        <ScrollArea className="flex-1 px-6 py-5">
+          <ActivityContent />
+        </ScrollArea>
+      </SheetContent>
+    </Sheet>
   );
 }

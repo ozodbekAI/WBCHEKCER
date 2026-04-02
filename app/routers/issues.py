@@ -1,6 +1,8 @@
 from typing import List, Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.database import get_db
@@ -18,12 +20,35 @@ from ..services import (
     skip_issue, postpone_issue, get_issue_stats,
     WildberriesAPI, update_store_stats,
 )
+from ..services.card_service import ensure_card_issue_consistency
 from ..services.issue_service import (
     get_next_issue, get_card_pending_count, get_fixed_issues_for_store,
     get_queue_progress, mark_applied_to_wb,
 )
+from ..services.workflow_service import create_team_tickets
 
 router = APIRouter(prefix="/stores/{store_id}/issues", tags=["Issues"])
+
+
+class IssueAssignRequest(BaseModel):
+    assignee_id: Optional[int] = None
+    assignee_ids: List[int] = Field(default_factory=list)
+    note: Optional[str] = None
+
+
+def _normalize_assignee_ids(primary_id: Optional[int], extra_ids: List[int]) -> List[int]:
+    normalized: List[int] = []
+    seen: set[int] = set()
+    for raw in ([primary_id] if primary_id is not None else []) + list(extra_ids or []):
+        try:
+            user_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0 or user_id in seen:
+            continue
+        seen.add(user_id)
+        normalized.append(user_id)
+    return normalized
 
 
 async def get_user_store(
@@ -193,6 +218,7 @@ async def list_issues(
     db: AsyncSession = Depends(get_db),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=100),
+    card_id: Optional[int] = Query(None, ge=1),
     status_filter: Optional[str] = Query(None, alias="status"),
     severity: Optional[str] = None,
     category: Optional[str] = None,
@@ -206,6 +232,7 @@ async def list_issues(
     
     issues, total = await get_store_issues(
         db, store.id,
+        card_id=card_id,
         status=status_enum,
         severity=severity_enum,
         category=category,
@@ -445,6 +472,78 @@ async def postpone_issue_endpoint(
     await update_store_stats(db, store.id)
     
     return IssueOut.model_validate(updated)
+
+
+@router.post("/{issue_id}/assign")
+async def assign_issue_endpoint(
+    issue_id: int,
+    data: IssueAssignRequest,
+    store: Store = Depends(get_user_store),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    issue = await get_issue_by_id(db, issue_id)
+    if not issue or issue.card.store_id != store.id:
+        raise HTTPException(status_code=404, detail="Issue not found")
+
+    assignee_ids = _normalize_assignee_ids(data.assignee_id, data.assignee_ids)
+    if not assignee_ids:
+        raise HTTPException(status_code=400, detail="At least one assignee is required")
+
+    assignees_r = await db.execute(
+        select(User).where(User.id.in_(assignee_ids), User.is_active == True)
+    )
+    assignees = list(assignees_r.scalars().all())
+    assignees_by_id = {user.id: user for user in assignees}
+
+    missing_ids = [user_id for user_id in assignee_ids if user_id not in assignees_by_id]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail=f"Assignee not found: {missing_ids[0]}")
+
+    ordered_assignees = [assignees_by_id[user_id] for user_id in assignee_ids]
+    for assignee in ordered_assignees:
+        role_val = assignee.role.value if hasattr(assignee.role, "value") else assignee.role
+        if role_val != "admin" and assignee.id != store.owner_id and getattr(assignee, "store_id", None) != store.id:
+            raise HTTPException(status_code=400, detail=f"Assignee has no access to this store: {assignee.id}")
+
+    if issue.status in (IssueStatus.FIXED, IssueStatus.AUTO_FIXED):
+        raise HTTPException(status_code=400, detail="Issue is already resolved")
+
+    note = (data.note or "").strip() or None
+    assignee_names = ", ".join((assignee.full_name or f"Пользователь #{assignee.id}") for assignee in ordered_assignees)
+    reason = note or f"Передано: {assignee_names}"
+    if issue.status != IssueStatus.POSTPONED:
+        await postpone_issue(db, issue, reason=reason)
+    else:
+        issue.postpone_reason = reason
+        issue.updated_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(issue)
+
+    tickets = await create_team_tickets(
+        db,
+        store_id=store.id,
+        from_user_id=current_user.id,
+        to_user_ids=assignee_ids,
+        ticket_type="delegation",
+        issue_id=issue.id,
+        card_id=issue.card_id,
+        issue_title=issue.title,
+        issue_severity=issue.severity.value if hasattr(issue.severity, "value") else str(issue.severity),
+        issue_code=issue.code,
+        card_title=issue.card.title if issue.card else None,
+        card_photo=(issue.card.photos[0] if issue.card and issue.card.photos else None),
+        card_nm_id=issue.card.nm_id if issue.card else None,
+        card_vendor_code=issue.card.vendor_code if issue.card else None,
+        note=note,
+    )
+    await update_store_stats(db, store.id)
+    return {
+        "ok": True,
+        "issue": IssueOut.model_validate(issue),
+        "ticket": tickets[0] if tickets else None,
+        "tickets": tickets,
+    }
 
 
 # === Queue endpoints for sequential fixing ===
@@ -699,8 +798,10 @@ async def list_card_issues(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Card not found"
         )
+
+    card = await ensure_card_issue_consistency(db, card, reanalyze_if_missing=True)
     
     status_enum = IssueStatus(status_filter) if status_filter else None
-    issues = await get_card_issues(db, card_id, status=status_enum)
+    issues = await get_card_issues(db, card.id, status=status_enum)
     
     return [IssueOut.model_validate(i) for i in issues]

@@ -3,6 +3,7 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, model_validator
 
 from .issue import IssueOut
+from .workflow import CardConfirmationSummaryOut
 
 
 # === Card Schemas ===
@@ -38,6 +39,7 @@ class CardOut(CardBase):
     warnings_count: Optional[int] = 0
     improvements_count: Optional[int] = 0
     growth_points_count: Optional[int] = 0
+    confirmation_summary: Optional[CardConfirmationSummaryOut] = None
     
     last_analysis_at: Optional[datetime] = None
     created_at: datetime

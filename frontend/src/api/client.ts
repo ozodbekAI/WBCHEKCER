@@ -1,8 +1,6 @@
 const DEFAULT_API_BASE = '/api';
-const RAW_API_BASE = (import.meta.env.VITE_API_BASE_URL || DEFAULT_API_BASE).trim().replace(/\/+$/, '');
-const IS_LOCALHOST_BASE = /^(https?:\/\/)?(localhost|127\.0\.0\.1)(:\d+)?$/i.test(RAW_API_BASE);
-
-const API_BASE = !import.meta.env.DEV && IS_LOCALHOST_BASE ? DEFAULT_API_BASE : RAW_API_BASE;
+const RAW_API_BASE = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const API_BASE = RAW_API_BASE || DEFAULT_API_BASE;
 export const API_ORIGIN = new URL(API_BASE, window.location.origin).origin;
 
 class ApiClient {
@@ -25,7 +23,7 @@ class ApiClient {
     return this.token;
   }
 
-  private buildUrl(path: string): string {
+  buildUrl(path: string): string {
     return new URL(`${API_BASE}${path}`, window.location.origin).toString();
   }
 
@@ -100,7 +98,7 @@ class ApiClient {
     }
 
     if (res.status === 204) return null as T;
-    
+
     const text = await res.text();
     if (!text) return null as T;
     return JSON.parse(text);
@@ -120,18 +118,13 @@ class ApiClient {
 
   async requestRegisterAccess(email: string, first_name?: string, last_name?: string) {
     return this.request<{ message: string; cooldown_seconds: number }>('POST', '/auth/register/request-access', {
-      email,
-      first_name,
-      last_name,
+      email, first_name, last_name,
     });
   }
 
   async registerStart(email: string, password: string, first_name?: string, last_name?: string) {
     return this.request<{ message: string; cooldown_seconds: number; expires_in_seconds: number }>('POST', '/auth/register/start', {
-      email,
-      password,
-      first_name,
-      last_name,
+      email, password, first_name, last_name,
     });
   }
 
@@ -200,9 +193,7 @@ class ApiClient {
 
   async onboard(apiKey: string, name?: string, useAi: boolean = true) {
     return this.request<any>('POST', '/stores/onboard', {
-      api_key: apiKey,
-      name: name || undefined,
-      use_ai: useAi,
+      api_key: apiKey, name: name || undefined, use_ai: useAi,
     });
   }
 
@@ -212,15 +203,13 @@ class ApiClient {
 
   async analyzeStore(storeId: number, useAi: boolean = true, limit?: number) {
     return this.request<any>('POST', `/stores/${storeId}/analyze`, undefined, {
-      use_ai: useAi,
-      limit: limit,
+      use_ai: useAi, limit: limit,
     });
   }
 
   async startSync(storeId: number, mode: 'incremental' | 'manual' = 'incremental', nmIds?: number[]) {
     return this.request<{ task_id: string; status: string; mode: string }>('POST', `/stores/${storeId}/sync/start`, {
-      mode,
-      nm_ids: nmIds,
+      mode, nm_ids: nmIds,
     });
   }
 
@@ -250,17 +239,104 @@ class ApiClient {
     return this.request<any>('GET', `/stores/${storeId}/sync/preview`);
   }
 
+  // ============ Ad Analysis / SKU Economics ============
+  async getAdAnalysisOverview(storeId: number, params?: {
+    days?: number;
+    preset?: string;
+    period_start?: string;
+    period_end?: string;
+    page?: number;
+    page_size?: number;
+    status?: string;
+    search?: string;
+    force?: boolean;
+  }) {
+    return this.request<import('../types').AdAnalysisOverview>('GET', `/stores/${storeId}/ad-analysis/overview`, undefined, params);
+  }
+
+  async uploadAdAnalysisCosts(storeId: number, file: File) {
+    const form = new FormData();
+    form.append('file', file);
+    const resp = await fetch(this.buildUrl(`/stores/${storeId}/ad-analysis/costs/upload`), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.token || ''}` },
+      body: form,
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || 'Upload failed');
+    }
+    return resp.json() as Promise<import('../types').AdAnalysisUploadResult>;
+  }
+
+  async uploadAdAnalysisManualSpend(storeId: number, file: File, periodStart: string, periodEnd: string) {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('period_start', periodStart);
+    form.append('period_end', periodEnd);
+    const resp = await fetch(this.buildUrl(`/stores/${storeId}/ad-analysis/manual-spend/upload`), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.token || ''}` },
+      body: form,
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || 'Upload failed');
+    }
+    return resp.json() as Promise<import('../types').AdAnalysisUploadResult>;
+  }
+
+  async uploadAdAnalysisFinance(storeId: number, file: File, periodStart: string, periodEnd: string) {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('period_start', periodStart);
+    form.append('period_end', periodEnd);
+    const resp = await fetch(this.buildUrl(`/stores/${storeId}/ad-analysis/finance/upload`), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.token || ''}` },
+      body: form,
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || 'Upload failed');
+    }
+    return resp.json() as Promise<import('../types').AdAnalysisUploadResult>;
+  }
+
   // ============ Cards ============
   async getCards(storeId: number, page = 1, limit = 50, filters?: Record<string, any>) {
-    return this.request<any>('GET', `/stores/${storeId}/cards`, undefined, {
-      page,
-      limit,
-      ...filters,
-    });
+    return this.request<any>('GET', `/stores/${storeId}/cards`, undefined, { page, limit, ...filters });
   }
 
   async getCard(storeId: number, cardId: number) {
     return this.request<any>('GET', `/stores/${storeId}/cards/${cardId}`);
+  }
+
+  async getDescriptionEditorContext(
+    storeId: number,
+    cardId: number,
+    draft?: import('../types').DescriptionEditorDraftPayload,
+  ) {
+    return this.request<import('../types').DescriptionEditorContext>(
+      'POST',
+      `/stores/${storeId}/cards/${cardId}/description-editor/context`,
+      { draft: draft || undefined },
+    );
+  }
+
+  async generateDescriptionEditorValue(
+    storeId: number,
+    cardId: number,
+    data: {
+      draft?: import('../types').DescriptionEditorDraftPayload;
+      instructions?: string;
+    },
+  ) {
+    return this.request<import('../types').DescriptionEditorGenerateResult>(
+      'POST',
+      `/stores/${storeId}/cards/${cardId}/description-editor/generate`,
+      data,
+    );
   }
 
   async getWbCardsLive(
@@ -278,21 +354,42 @@ class ApiClient {
 
   async replaceWbCardPhoto(storeId: number, nmId: number, slot: number, sourceUrl: string) {
     return this.request<any>('POST', `/stores/${storeId}/cards/wb/${nmId}/photos/replace`, {
-      source_url: sourceUrl,
-      slot,
+      source_url: sourceUrl, slot,
     });
+  }
+
+  async syncCardPhotos(storeId: number, cardId: number, photos: string[]) {
+    return this.request<any>('POST', `/stores/${storeId}/cards/${cardId}/photos/sync`, {
+      photos,
+    });
+  }
+
+  async uploadUserPhotoAsset(file: File, options?: { assetType?: string; name?: string }) {
+    const form = new FormData();
+    form.append('file', file);
+    if (options?.assetType) form.append('asset_type', options.assetType);
+    if (options?.name) form.append('name', options.name);
+
+    const resp = await fetch(this.buildUrl('/photo-assets/user/upload'), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.token || ''}` },
+      body: form,
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || 'Photo upload failed');
+    }
+
+    return resp.json();
   }
 
   async getCardIssues(storeId: number, cardId: number, status?: string) {
-    return this.request<any[]>('GET', `/stores/${storeId}/cards/${cardId}/issues`, undefined, {
-      status,
-    });
+    return this.request<any[]>('GET', `/stores/${storeId}/cards/${cardId}/issues`, undefined, { status });
   }
 
   async getCardsQueue(storeId: number, limit = 100) {
-    return this.request<any[]>('GET', `/stores/${storeId}/cards/queue`, undefined, {
-      limit,
-    });
+    return this.request<any[]>('GET', `/stores/${storeId}/cards/queue`, undefined, { limit });
   }
 
   // ============ Dashboard ============
@@ -310,9 +407,7 @@ class ApiClient {
   }
 
   async getIssuesGrouped(storeId: number, limit = 200) {
-    return this.request<any>('GET', `/stores/${storeId}/issues/grouped`, undefined, {
-      limit,
-    });
+    return this.request<any>('GET', `/stores/${storeId}/issues/grouped`, undefined, { limit });
   }
 
   async getIssueStats(storeId: number) {
@@ -335,15 +430,12 @@ class ApiClient {
 
   async fixIssue(storeId: number, issueId: number, fixedValue: string, applyToWb = false) {
     return this.request<any>('POST', `/stores/${storeId}/issues/${issueId}/fix`, {
-      fixed_value: fixedValue,
-      apply_to_wb: applyToWb,
+      fixed_value: fixedValue, apply_to_wb: applyToWb,
     });
   }
 
   async skipIssue(storeId: number, issueId: number, reason?: string) {
-    return this.request<any>('POST', `/stores/${storeId}/issues/${issueId}/skip`, {
-      reason: reason || null,
-    });
+    return this.request<any>('POST', `/stores/${storeId}/issues/${issueId}/skip`, { reason: reason || null });
   }
 
   async unskipIssue(storeId: number, issueId: number) {
@@ -351,8 +443,17 @@ class ApiClient {
   }
 
   async postponeIssue(storeId: number, issueId: number, reason?: string) {
-    return this.request<any>('POST', `/stores/${storeId}/issues/${issueId}/postpone`, {
-      reason: reason || null,
+    return this.request<any>('POST', `/stores/${storeId}/issues/${issueId}/postpone`, { reason: reason || null });
+  }
+
+  async assignIssue(storeId: number, issueId: number, assigneeIds: number[] | number, note?: string) {
+    const normalized = (Array.isArray(assigneeIds) ? assigneeIds : [assigneeIds])
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id) && id > 0);
+
+    return this.request<any>('POST', `/stores/${storeId}/issues/${issueId}/assign`, {
+      assignee_ids: normalized,
+      note: note || undefined,
     });
   }
 
@@ -393,22 +494,54 @@ class ApiClient {
     return this.request<any>('GET', `/stores/${storeId}/team/activity`);
   }
 
+  async getTeamTickets(storeId: number, params?: { status?: string; type?: string }) {
+    return this.request<import('../types').TeamTicket[]>('GET', `/stores/${storeId}/team/tickets`, undefined, params);
+  }
+
+  async createTeamTicket(storeId: number, data: {
+    type: 'delegation' | 'approval';
+    issue_id?: number;
+    approval_id?: number;
+    card_id?: number;
+    issue_title?: string;
+    issue_severity?: string;
+    issue_code?: string;
+    card_title?: string;
+    card_photo?: string;
+    card_nm_id?: number;
+    card_vendor_code?: string;
+    to_user_id: number;
+    note?: string;
+  }) {
+    return this.request<import('../types').TeamTicket>('POST', `/stores/${storeId}/team/tickets`, data);
+  }
+
+  async completeTeamTicket(storeId: number, ticketId: number) {
+    return this.request<import('../types').TeamTicket>('POST', `/stores/${storeId}/team/tickets/${ticketId}/done`);
+  }
+
+  async logTeamActivity(storeId: number, data: import('../types').TeamActionLogPayload) {
+    return this.request<void>('POST', `/stores/${storeId}/team/activity/log`, data);
+  }
+
+  async getTeamWorklog(storeId: number, days = 30) {
+    return this.request<import('../types').TeamWorklog>('GET', `/stores/${storeId}/team/worklog`, undefined, { days });
+  }
+
   async getApprovals(storeId: number, params?: { status?: string; page?: number; limit?: number }) {
     return this.request<any>('GET', `/stores/${storeId}/team/approvals`, undefined, params);
   }
 
-  async submitForReview(storeId: number, cardId: number, note?: string) {
+  async submitForReview(storeId: number, cardId: number, note?: string, reviewerIds?: number[]) {
     return this.request<any>('POST', `/stores/${storeId}/team/approvals/submit`, {
       card_id: cardId,
       note: note || null,
+      reviewer_ids: reviewerIds,
     });
   }
 
   async reviewApproval(storeId: number, approvalId: number, action: 'approve' | 'reject', comment?: string) {
-    return this.request<any>('POST', `/stores/${storeId}/team/approvals/${approvalId}/review`, {
-      action,
-      comment: comment || null,
-    });
+    return this.request<any>('POST', `/stores/${storeId}/team/approvals/${approvalId}/review`, { action, comment: comment || null });
   }
 
   async applyApproval(storeId: number, approvalId: number) {
@@ -467,6 +600,38 @@ class ApiClient {
 
   async recheckCardFixed(storeId: number, nmId: number) {
     return this.request<import('../types').RecheckResult>('POST', `/stores/${storeId}/fixed-file/recheck/${nmId}`);
+  }
+
+  // ─── Section confirmation ────────────────────────────────────────────────
+
+  async getConfirmedSections(storeId: number, cardId: number): Promise<string[]> {
+    return this.request<string[]>('GET', `/stores/${storeId}/cards/${cardId}/confirmed-sections`);
+  }
+
+  async confirmSection(storeId: number, cardId: number, section: string): Promise<void> {
+    return this.request<void>('POST', `/stores/${storeId}/cards/${cardId}/confirmed-sections/${section}`);
+  }
+
+  async unconfirmSection(storeId: number, cardId: number, section: string): Promise<void> {
+    return this.request<void>('DELETE', `/stores/${storeId}/cards/${cardId}/confirmed-sections/${section}`);
+  }
+
+  // ─── Card Drafts ──────────────────────────────────────────────────────────
+
+  async getCardDraft(storeId: number, cardId: number): Promise<import('../types').CardDraft | null> {
+    return this.request<import('../types').CardDraft | null>('GET', `/stores/${storeId}/cards/${cardId}/draft`);
+  }
+
+  async saveCardDraft(storeId: number, cardId: number, data: import('../types').CardDraftPayload): Promise<import('../types').CardDraft> {
+    return this.request<import('../types').CardDraft>('PUT', `/stores/${storeId}/cards/${cardId}/draft`, data);
+  }
+
+  async deleteCardDraft(storeId: number, cardId: number): Promise<void> {
+    return this.request<void>('DELETE', `/stores/${storeId}/cards/${cardId}/draft`);
+  }
+
+  async applyCard(storeId: number, cardId: number): Promise<import('../types').CardDetail> {
+    return this.request<import('../types').CardDetail>('POST', `/stores/${storeId}/cards/${cardId}/apply`);
   }
 }
 

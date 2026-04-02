@@ -1,0 +1,103 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Definition of the design system. All colors use full hsl() format
+   so they work both as Tailwind classes AND as direct var(--name) references.
+*/
+
+@layer base {
+  :root {
+    --background: #FFFFFF;
+    --foreground: #0a0f1a;
+
+    --card: #FFFFFF;
+    --card-foreground: #0a0f1a;
+
+    --popover: #FFFFFF;
+    --popover-foreground: #0a0f1a;
+
+    --primary: #6C5CE7;
+    --primary-foreground: #FFFFFF;
+
+    --secondary: #f1f5f9;
+    --secondary-foreground: #0a0f1a;
+
+    --muted: #f1f5f9;
+    --muted-foreground: #64748b;
+
+    --accent: #f1f5f9;
+    --accent-foreground: #0a0f1a;
+
+    --destructive: #EF4444;
+    --destructive-foreground: #FFFFFF;
+
+    --border: #E5E7EB;
+    --input: #E5E7EB;
+    --ring: #6C5CE7;
+
+    --radius: 0.5rem;
+
+    --zone-red: #ef4444;
+    --zone-yellow: #eab308;
+    --zone-green: #22c55e;
+
+    --sidebar-background: #fafafa;
+    --sidebar-foreground: #3f3f46;
+    --sidebar-primary: #18181b;
+    --sidebar-primary-foreground: #fafafa;
+    --sidebar-accent: #f4f4f5;
+    --sidebar-accent-foreground: #18181b;
+    --sidebar-border: #e4e4e7;
+    --sidebar-ring: #3b82f6;
+  }
+
+  .dark {
+    --background: #0a0f1a;
+    --foreground: #f1f5f9;
+
+    --card: #0a0f1a;
+    --card-foreground: #f1f5f9;
+
+    --popover: #0a0f1a;
+    --popover-foreground: #f1f5f9;
+
+    --primary: #8b7cf6;
+    --primary-foreground: #0a0f1a;
+
+    --secondary: #1e293b;
+    --secondary-foreground: #f1f5f9;
+
+    --muted: #1e293b;
+    --muted-foreground: #94a3b8;
+
+    --accent: #1e293b;
+    --accent-foreground: #f1f5f9;
+
+    --destructive: #7f1d1d;
+    --destructive-foreground: #f1f5f9;
+
+    --border: #1e293b;
+    --input: #1e293b;
+    --ring: #8b7cf6;
+
+    --sidebar-background: #18181b;
+    --sidebar-foreground: #f4f4f5;
+    --sidebar-primary: #3b82f6;
+    --sidebar-primary-foreground: #FFFFFF;
+    --sidebar-accent: #27272a;
+    --sidebar-accent-foreground: #f4f4f5;
+    --sidebar-border: #27272a;
+    --sidebar-ring: #3b82f6;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}

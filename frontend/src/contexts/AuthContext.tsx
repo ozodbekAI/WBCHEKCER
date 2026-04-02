@@ -90,18 +90,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   return (
     <AuthContext.Provider
       value={{
-        user,
-        loading,
-        login,
-        registerStart,
-        resendRegisterCode,
-        verifyRegisterCode,
-        logout,
-        refreshUser,
-        isAuthenticated: !!user,
-        hasPermission,
-        hasAnyPermission,
-        isRole,
+        user, loading, login, registerStart, resendRegisterCode, verifyRegisterCode,
+        logout, refreshUser, isAuthenticated: !!user, hasPermission, hasAnyPermission, isRole,
       }}
     >
       {children}

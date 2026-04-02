@@ -36,7 +36,7 @@ async def get_dashboard(
     avg_result = await db.execute(
         select(func.avg(Card.score)).where(Card.store_id.in_(store_ids))
     )
-    avg_score = avg_result.scalar() or 0
+    avg_score = float(avg_result.scalar() or 0)
     
     # Critical issues
     critical_result = await db.execute(

@@ -460,6 +460,7 @@ async def user_upload_asset(
         raise HTTPException(500, str(e))
 
 @router.post("/user/add-from-url", response_model=PhotoAssetResponse)
+@router.post("/user/import", response_model=PhotoAssetResponse)
 async def user_add_asset_from_url(
     data: PhotoAssetAddFromUrlRequest,
     db: Session = Depends(get_db_dependency),
