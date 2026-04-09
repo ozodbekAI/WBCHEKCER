@@ -100,3 +100,7 @@ test-results/
 
 # Media
 media/
+
+# Keep frontend runtime helpers tracked (overrides top-level `lib/` rule above).
+!frontend/src/lib/
+!frontend/src/lib/**
