@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -17,10 +18,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up SSH
-        uses: webfactory/ssh-agent@v0.5.3
+        uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
@@ -51,7 +52,7 @@ jobs:
       - name: Backend - install deps, migrate & restart
         run: |
           ssh ${{ env.USER }}@${{ env.SERVER_IP }} 'bash -s' << 'SSHEOF'
-            set -e
+            set -euo pipefail
             cd /var/www/WBCHEKCER
 
             echo ">>> [1/4] Venv tekshirilmoqda..."
@@ -75,7 +76,7 @@ jobs:
       - name: Frontend - build & serve
         run: |
           ssh ${{ env.USER }}@${{ env.SERVER_IP }} 'bash -s' << 'SSHEOF'
-            set -e
+            set -euo pipefail
             cd /var/www/WBCHEKCER/frontend
 
             if [ ! -f "package.json" ]; then
@@ -83,11 +84,15 @@ jobs:
               exit 0
             fi
 
+            echo ">>> [FRONTEND] node/npm version..."
+            node -v
+            npm -v
+
             echo ">>> [FRONTEND] npm install..."
             if [ -f "package-lock.json" ]; then
-              npm ci --silent
+              npm ci --no-audit --no-fund || npm ci --no-audit --no-fund || npm install --no-audit --no-fund
             else
-              npm install --silent
+              npm install --no-audit --no-fund
             fi
 
             echo ">>> [FRONTEND] npm run build..."
