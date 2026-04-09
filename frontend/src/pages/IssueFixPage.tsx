@@ -100,10 +100,6 @@ function isMediaIssue(issue: IssueWithCard): boolean {
   );
 }
 
-function isDedicatedMediaQueueIssue(issue: IssueWithCard): boolean {
-  return isMediaIssue(issue) && String(issue.severity || '').toLowerCase() !== 'critical';
-}
-
 function isVideoMediaIssue(issue: IssueWithCard): boolean {
   const code = String(issue.code || '').toLowerCase();
   const category = String(issue.category || '').toLowerCase();
@@ -341,34 +337,20 @@ export default function IssueFixPage() {
     }
   };
 
-  const filterBySeverity = (issues: IssueWithCard[], sev?: string): IssueWithCard[] => {
-    if (sev === 'media') {
-      const all = [...(issues || [])];
-      return all.filter(i => isDedicatedMediaQueueIssue(i));
-    }
-    return issues;
-  };
-
   const getPoolFromGrouped = (grouped: IssuesGrouped, sev?: string): IssueWithCard[] => {
-    if (sev === 'media') {
-      return [
-        ...(grouped.warnings || []),
-        ...(grouped.improvements || []),
-      ].filter(i => isDedicatedMediaQueueIssue(i));
-    }
+    if (sev === 'media') return grouped.media || [];
     if (sev === 'critical') return grouped.critical || [];
     if (sev === 'warning') return grouped.warnings || [];
     if (sev === 'improvement') return grouped.improvements || [];
-    return [...(grouped.critical || []), ...(grouped.warnings || []), ...(grouped.improvements || [])];
+    return [...(grouped.critical || []), ...(grouped.warnings || []), ...(grouped.improvements || []), ...(grouped.media || [])];
   };
 
   const loadFirstIssue = async () => {
     if (!activeStore) return;
     setLoading(true);
     try {
-      const issue = await api.getNextIssue(activeStore.id, undefined, cardIdMode || undefined, severity === 'media' ? undefined : severity || undefined);
-      // For media mode, skip non-media issues
-      const effectiveIssue = (severity === 'media' && issue && !isDedicatedMediaQueueIssue(issue)) ? null : issue;
+      const issue = await api.getNextIssue(activeStore.id, undefined, cardIdMode || undefined, severity || undefined);
+      const effectiveIssue = issue;
       if (effectiveIssue) {
         applyIssueToState(effectiveIssue);
       } else {
@@ -486,8 +468,7 @@ export default function IssueFixPage() {
     setCustomSearch('');
     try {
       if (currentCardId !== null) {
-        const sameCardRaw = await api.getNextIssue(activeStore.id, undefined, currentCardId, severity === 'media' ? undefined : severity || undefined);
-        const sameCard = (severity === 'media' && sameCardRaw && !isDedicatedMediaQueueIssue(sameCardRaw)) ? null : sameCardRaw;
+        const sameCard = await api.getNextIssue(activeStore.id, undefined, currentCardId, severity || undefined);
         if (sameCard) {
           applyIssueToState(sameCard);
           refreshProgress();
@@ -503,8 +484,7 @@ export default function IssueFixPage() {
         await new Promise(resolve => setTimeout(resolve, 1200));
         setCardDone(false);
       }
-      const nextRaw = await api.getNextIssue(activeStore.id, undefined, undefined, severity === 'media' ? undefined : severity || undefined);
-      const next = (severity === 'media' && nextRaw && !isDedicatedMediaQueueIssue(nextRaw)) ? null : nextRaw;
+      const next = await api.getNextIssue(activeStore.id, undefined, undefined, severity || undefined);
       if (next) {
         applyIssueToState(next);
       } else {
@@ -1623,6 +1603,8 @@ export default function IssueFixPage() {
             });
             return Array.from(kws);
           })()}
+          forceRichLayout={getTextIssueField(currentIssue) === 'description'}
+          suggestionActionLabel={getTextIssueField(currentIssue) === 'description' ? 'Сделать новое' : 'Вставить рекомендацию'}
           onApply={(newValue) => {
             setTextEditorValue(newValue);
           }}

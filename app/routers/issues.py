@@ -6,7 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.database import get_db
-from ..core.security import get_current_user
+from ..core.security import get_current_user, require_issues_apply, require_issues_fix
+from ..core.time import utc_now
 from ..models import User, Store, CardIssue, IssueStatus, IssueSeverity
 from ..schemas import (
     IssueOut, IssueWithCard, IssueListOut, IssuesGrouped,
@@ -25,6 +26,7 @@ from ..services.issue_service import (
     get_next_issue, get_card_pending_count, get_fixed_issues_for_store,
     get_queue_progress, mark_applied_to_wb,
 )
+from ..services.wb_token_access import ensure_store_feature_access, get_store_feature_api_key
 from ..services.workflow_service import create_team_tickets
 
 router = APIRouter(prefix="/stores/{store_id}/issues", tags=["Issues"])
@@ -51,6 +53,11 @@ def _normalize_assignee_ids(primary_id: Optional[int], extra_ids: List[int]) -> 
     return normalized
 
 
+def _is_admin_user(user: User) -> bool:
+    role_value = user.role.value if hasattr(user.role, "value") else str(user.role)
+    return role_value == "admin"
+
+
 async def get_user_store(
     store_id: int,
     db: AsyncSession = Depends(get_db),
@@ -64,7 +71,7 @@ async def get_user_store(
             detail="Store not found"
         )
     
-    if store.owner_id != current_user.id and current_user.role != "admin":
+    if store.owner_id != current_user.id and not _is_admin_user(current_user):
         if getattr(current_user, 'store_id', None) != store.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -102,8 +109,9 @@ async def _fresh_allowed_values(issue: CardIssue, store: Store) -> list:
 
     # 2) Try WB directory API
     try:
-        if store.api_key:
-            wb = WildberriesAPI(store.api_key)
+        feature_api_key = get_store_feature_api_key(store, "cards")
+        if feature_api_key:
+            wb = WildberriesAPI(feature_api_key)
             result = await wb.get_directory_values(char_name)
             if result.get("success") and result.get("values"):
                 _wb_directory_cache[char_name] = result["values"]
@@ -205,7 +213,7 @@ async def _auto_resolve_if_now_valid(
         # Auto-resolve: mark as fixed with original value (no longer an issue)
         issue.status = IssueStatus.FIXED
         issue.fixed_value = issue.current_value
-        issue.fixed_at = datetime.utcnow()
+        issue.fixed_at = utc_now()
         await db.commit()
         return True
 
@@ -228,7 +236,9 @@ async def list_issues(
     
     # Convert string to enum if provided
     status_enum = IssueStatus(status_filter) if status_filter else None
-    severity_enum = IssueSeverity(severity) if severity else None
+    severity_mode = (severity or "").strip().lower()
+    severity_enum = IssueSeverity(severity_mode) if severity_mode and severity_mode != "media" else None
+    dedicated_media = True if severity_mode == "media" else False if severity_mode in {"warning", "improvement"} else None
     
     issues, total = await get_store_issues(
         db, store.id,
@@ -236,6 +246,7 @@ async def list_issues(
         status=status_enum,
         severity=severity_enum,
         category=category,
+        dedicated_media=dedicated_media,
         skip=skip,
         limit=limit,
     )
@@ -310,16 +321,19 @@ async def get_grouped_issues(
     critical = [x for x in [await issue_to_dict(i) for i in grouped["critical"]] if x is not None]
     warnings = [x for x in [await issue_to_dict(i) for i in grouped["warnings"]] if x is not None]
     improvements = [x for x in [await issue_to_dict(i) for i in grouped["improvements"]] if x is not None]
+    media = [x for x in [await issue_to_dict(i) for i in grouped["media"]] if x is not None]
     postponed = [x for x in [await issue_to_dict(i) for i in grouped["postponed"]] if x is not None]
 
     return IssuesGrouped(
         critical=critical,
         warnings=warnings,
         improvements=improvements,
+        media=media,
         postponed=postponed,
         critical_count=len(critical),
         warnings_count=len(warnings),
         improvements_count=len(improvements),
+        media_count=len(media),
         postponed_count=len(postponed),
     )
 
@@ -358,7 +372,7 @@ async def fix_issue_endpoint(
     fix_data: IssueFixRequest,
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_issues_fix),
 ):
     """Fix an issue"""
     issue = await get_issue_by_id(db, issue_id)
@@ -378,7 +392,11 @@ async def fix_issue_endpoint(
     # Apply fix to WB if requested
     if fix_data.apply_to_wb:
         # Build update payload based on field_path
-        wb_api = WildberriesAPI(store.api_key)
+        ensure_store_feature_access(store, "cards_write")
+        feature_api_key = get_store_feature_api_key(store, "cards_write")
+        if not feature_api_key:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
+        wb_api = WildberriesAPI(feature_api_key)
         # In a real implementation, you would build the proper update payload
         # For now, just mark as fixed
     
@@ -397,6 +415,7 @@ async def skip_issue_endpoint(
     skip_data: IssueSkipRequest,
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_issues_fix),
 ):
     """Skip an issue"""
     issue = await get_issue_by_id(db, issue_id)
@@ -420,6 +439,7 @@ async def unskip_issue_endpoint(
     issue_id: int,
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_issues_fix),
 ):
     """Reset a skipped issue back to pending"""
     from ..services.issue_service import unskip_issue
@@ -452,6 +472,7 @@ async def postpone_issue_endpoint(
     postpone_data: IssuePostponeRequest,
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_issues_fix),
 ):
     """Postpone an issue for later"""
     issue = await get_issue_by_id(db, issue_id)
@@ -480,7 +501,7 @@ async def assign_issue_endpoint(
     data: IssueAssignRequest,
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_issues_fix),
 ):
     issue = await get_issue_by_id(db, issue_id)
     if not issue or issue.card.store_id != store.id:
@@ -516,7 +537,7 @@ async def assign_issue_endpoint(
         await postpone_issue(db, issue, reason=reason)
     else:
         issue.postpone_reason = reason
-        issue.updated_at = datetime.utcnow()
+        issue.updated_at = utc_now()
         await db.commit()
         await db.refresh(issue)
 
@@ -554,7 +575,7 @@ async def get_next_queue_issue(
     db: AsyncSession = Depends(get_db),
     after: Optional[int] = Query(None, description="Get issue after this ID"),
     card_id: Optional[int] = Query(None, description="Limit to specific card"),
-    severity: Optional[str] = Query(None, description="Filter by severity: critical, warning, improvement"),
+    severity: Optional[str] = Query(None, description="Filter by severity: critical, warning, improvement, media"),
 ):
     """
     Get next pending issue in the fixing queue.
@@ -643,7 +664,7 @@ async def get_next_queue_issue(
 async def get_queue_progress_endpoint(
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
-    severity: Optional[str] = Query(None, description="Filter by severity: critical, warning, improvement"),
+    severity: Optional[str] = Query(None, description="Filter by severity: critical, warning, improvement, media"),
 ):
     """Get progress of issue fixing queue, optionally filtered by severity"""
     progress = await get_queue_progress(db, store.id, severity=severity)
@@ -654,7 +675,7 @@ async def get_queue_progress_endpoint(
 async def apply_all_fixes_to_wb(
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_issues_apply),
 ):
     """
     Apply all fixed issues to Wildberries.
@@ -683,7 +704,11 @@ async def apply_all_fixes_to_wb(
             }
         cards_fixes[card_id]["issues"].append(issue)
     
-    wb_api = WildberriesAPI(store.api_key)
+    ensure_store_feature_access(store, "cards_write")
+    feature_api_key = get_store_feature_api_key(store, "cards_write")
+    if not feature_api_key:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
+    wb_api = WildberriesAPI(feature_api_key)
     applied_ids = []
     errors = []
     

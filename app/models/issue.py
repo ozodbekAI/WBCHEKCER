@@ -7,6 +7,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from ..core.database import Base
+from app.core.time import utc_now
 
 
 class IssueSeverity(str, enum.Enum):
@@ -98,8 +99,8 @@ class CardIssue(Base):
     postpone_reason = Column(Text, nullable=True)
     
     # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     
     # Relationships
     card = relationship("Card", back_populates="issues")
@@ -143,8 +144,8 @@ class IssueRule(Base):
     # Conditions (JSON schema for when this rule applies)
     conditions = Column(JSON, default=dict)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     
     __table_args__ = (
         Index("idx_issue_rules_code", "code"),

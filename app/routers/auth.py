@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from ..core.database import get_db
 from ..core.config import settings
+from ..core.time import utc_now
 from ..core.security import (
     create_access_token,
     create_refresh_token,
@@ -81,7 +82,7 @@ async def register_request_access(
     - User logs in with that password and then changes it in Profile
     """
     email = req.email.lower().strip()
-    now = datetime.utcnow()
+    now = utc_now()
 
     existing_user = await get_user_by_email(db, email)
     if existing_user and existing_user.is_active:
@@ -175,7 +176,7 @@ async def register_start(
 ):
     """Start registration: save user as inactive and send 6-digit email code."""
     email = req.email.lower().strip()
-    now = datetime.utcnow()
+    now = utc_now()
     existing_user = await get_user_by_email(db, email)
     if existing_user and existing_user.is_active and existing_user.is_verified:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -259,7 +260,7 @@ async def register_resend_code(
 ):
     """Resend 6-digit code for inactive account."""
     email = req.email.lower().strip()
-    now = datetime.utcnow()
+    now = utc_now()
 
     user = await get_user_by_email(db, email)
     if not user:
@@ -322,7 +323,7 @@ async def register_verify_code(
     """Verify email code, activate account, and login."""
     email = req.email.lower().strip()
     code = req.code.strip()
-    now = datetime.utcnow()
+    now = utc_now()
 
     row = (
         await db.execute(
@@ -473,7 +474,7 @@ async def upload_avatar(
 
     avatars_dir = Path(settings.MEDIA_ROOT) / "avatars"
     avatars_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"user_{current_user.id}_{int(datetime.utcnow().timestamp())}_{secrets.token_hex(4)}{ext}"
+    filename = f"user_{current_user.id}_{int(utc_now().timestamp())}_{secrets.token_hex(4)}{ext}"
     file_path = avatars_dir / filename
 
     data = await file.read()
@@ -493,7 +494,7 @@ async def heartbeat(
     current_user: User = Depends(get_current_user),
 ):
     """Update last_active_at — called every 60s from frontend when user is active."""
-    current_user.last_active_at = datetime.utcnow()
+    current_user.last_active_at = utc_now()
     await db.commit()
     return {"ok": True}
 
@@ -529,7 +530,7 @@ async def get_invite_info(token: str, db: AsyncSession = Depends(get_db)):
         select(UserInvite).where(UserInvite.token == token)
     )
     invite = result.scalar_one_or_none()
-    if not invite or invite.is_used or invite.expires_at < datetime.utcnow():
+    if not invite or invite.is_used or invite.expires_at < utc_now():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Invite link is invalid or has expired",
@@ -556,7 +557,7 @@ async def accept_invite(
         select(UserInvite).where(UserInvite.token == token)
     )
     invite = result.scalar_one_or_none()
-    if not invite or invite.is_used or invite.expires_at < datetime.utcnow():
+    if not invite or invite.is_used or invite.expires_at < utc_now():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invite link is invalid or has expired",

@@ -6,6 +6,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import api from '../api/client';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -117,7 +118,6 @@ async function syncActivityToBackend(type: ActionType, label: string, timestamp:
   const storeId = Number(localStorage.getItem(ACTIVE_STORE_KEY) || 0);
   if (!storeId) return;
   try {
-    const { default: api } = await import('../api/client');
     await api.logTeamActivity(storeId, { action: type, label, timestamp, meta });
   } catch {
     /* ignore */
@@ -157,14 +157,13 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 function startHeartbeat() {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   heartbeatTimer = setInterval(async () => {
-    const active = loadActive();
-    if (!active) return;
-    const last = new Date(active.lastActivityAt).getTime();
-    if (Date.now() - last > IDLE_MS) return;
-    try {
-      const { default: api } = await import('../api/client');
+  const active = loadActive();
+  if (!active) return;
+  const last = new Date(active.lastActivityAt).getTime();
+  if (Date.now() - last > IDLE_MS) return;
+  try {
       await api.heartbeat();
-    } catch { /* ignore */ }
+  } catch { /* ignore */ }
   }, HEARTBEAT_MS);
 }
 

@@ -5171,6 +5171,12 @@ tr:hover .row-actions {
   color: #c8374b;
 }
 
+.abt-state-pill--stopped {
+  border-color: #d9dce7;
+  background: #f4f5f8;
+  color: #5a6478;
+}
+
 .abt-state-pill--pending {
   border-color: #ece1ba;
   background: #fff8de;
@@ -7941,4 +7947,3 @@ tr:hover .row-actions {
 }
 
 /* Team page styles removed — migrated to Tailwind + shadcn/ui */
-

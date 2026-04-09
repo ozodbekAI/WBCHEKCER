@@ -6,7 +6,11 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
+
+pytestmark = pytest.mark.skip(reason="Manual Gemini smoke script; not part of automated pytest coverage")
 
 from app.services.gemini_service import GeminiService
 

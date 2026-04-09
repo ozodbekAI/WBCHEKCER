@@ -3,6 +3,7 @@ from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Inde
 from sqlalchemy.orm import relationship
 
 from ..core.database import Base
+from app.core.time import utc_now
 
 
 class FixedFileEntry(Base):
@@ -20,8 +21,8 @@ class FixedFileEntry(Base):
     char_name = Column(String(255), nullable=False)  # Characteristic name (e.g. "Состав")
     fixed_value = Column(Text, nullable=False)        # The correct value from the file
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     created_by_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     # Relationships

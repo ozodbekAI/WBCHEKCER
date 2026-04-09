@@ -1,11 +1,98 @@
 import json
 from datetime import datetime
-from typing import List, Optional
-from sqlalchemy import select, update, func
+from typing import Any, Iterable, List, Optional
+from sqlalchemy import and_, func, not_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..core.time import utc_now
 from ..models import Card, CardIssue, IssueSeverity, IssueStatus, IssueCategory
+
+MEDIA_QUEUE_CODES = {"no_photos", "few_photos", "add_more_photos", "no_video"}
+
+
+def _enum_value(value: Any) -> str:
+    return str(value.value if hasattr(value, "value") else value or "").strip().lower()
+
+
+def is_media_issue_like(
+    code: Any,
+    category: Any,
+    field_path: Any,
+) -> bool:
+    normalized_code = str(code or "").strip().lower()
+    normalized_category = _enum_value(category)
+    normalized_field_path = str(field_path or "").strip().lower()
+    return (
+        normalized_code in MEDIA_QUEUE_CODES
+        or normalized_category in {IssueCategory.PHOTOS.value, IssueCategory.VIDEO.value}
+        or normalized_field_path.startswith("photos")
+        or normalized_field_path.startswith("videos")
+    )
+
+
+def is_dedicated_media_issue_like(
+    code: Any,
+    category: Any,
+    field_path: Any,
+    severity: Any,
+) -> bool:
+    return _enum_value(severity) != IssueSeverity.CRITICAL.value and is_media_issue_like(code, category, field_path)
+
+
+def is_dedicated_media_issue(issue: Any) -> bool:
+    return is_dedicated_media_issue_like(
+        getattr(issue, "code", None),
+        getattr(issue, "category", None),
+        getattr(issue, "field_path", None),
+        getattr(issue, "severity", None),
+    )
+
+
+def dedicated_media_issue_filter() -> Any:
+    media_match = or_(
+        CardIssue.code.in_(tuple(MEDIA_QUEUE_CODES)),
+        CardIssue.category.in_((IssueCategory.PHOTOS, IssueCategory.VIDEO)),
+        CardIssue.field_path.like("photos%"),
+        CardIssue.field_path.like("videos%"),
+    )
+    return and_(CardIssue.severity != IssueSeverity.CRITICAL, media_match)
+
+
+def non_dedicated_media_issue_filter() -> Any:
+    return not_(dedicated_media_issue_filter())
+
+
+def calculate_visible_issue_counts(issues: Iterable[Any]) -> dict[str, int]:
+    counts = {
+        IssueSeverity.CRITICAL.value: 0,
+        IssueSeverity.WARNING.value: 0,
+        IssueSeverity.IMPROVEMENT.value: 0,
+    }
+    for issue in issues:
+        severity = _enum_value(getattr(issue, "severity", None))
+        if severity not in counts:
+            continue
+        if is_dedicated_media_issue(issue):
+            continue
+        counts[severity] += 1
+    return counts
+
+
+def calculate_visible_issue_counts_from_rows(rows: Iterable[tuple[Any, Any, Any, Any, int]]) -> dict[str, int]:
+    counts = {
+        IssueSeverity.CRITICAL.value: 0,
+        IssueSeverity.WARNING.value: 0,
+        IssueSeverity.IMPROVEMENT.value: 0,
+    }
+    for severity, code, category, field_path, count in rows:
+        normalized_severity = _enum_value(severity)
+        if normalized_severity not in counts:
+            continue
+        if is_dedicated_media_issue_like(code, category, field_path, severity):
+            continue
+        counts[normalized_severity] += int(count or 0)
+    return counts
 
 
 def _extract_compound_fixes(error_details: list) -> list:
@@ -23,7 +110,7 @@ async def _apply_compound_fixes(
     user_id: int,
 ) -> None:
     """Auto-create or auto-fix linked CardIssue records for compound fixes."""
-    now = datetime.utcnow()
+    now = utc_now()
     for fix in fixes:
         field_path = fix.get("field_path")
         if not field_path:
@@ -118,6 +205,7 @@ async def get_store_issues(
     status: Optional[IssueStatus] = None,
     severity: Optional[IssueSeverity] = None,
     category: Optional[str] = None,
+    dedicated_media: Optional[bool] = None,
     skip: int = 0,
     limit: int = 50,
 ) -> tuple[List[CardIssue], int]:
@@ -144,10 +232,19 @@ async def get_store_issues(
     if severity:
         base_filter = base_filter.where(CardIssue.severity == severity)
         count_filter = count_filter.where(CardIssue.severity == severity)
-    
+
     if category:
         base_filter = base_filter.where(CardIssue.category == category)
         count_filter = count_filter.where(CardIssue.category == category)
+
+    if dedicated_media is True:
+        media_filter = dedicated_media_issue_filter()
+        base_filter = base_filter.where(media_filter)
+        count_filter = count_filter.where(media_filter)
+    elif dedicated_media is False:
+        non_media_filter = non_dedicated_media_issue_filter()
+        base_filter = base_filter.where(non_media_filter)
+        count_filter = count_filter.where(non_media_filter)
     
     # Get total count
     total_result = await db.execute(count_filter)
@@ -184,10 +281,12 @@ async def get_issues_grouped(
         "critical": [],
         "warnings": [],
         "improvements": [],
+        "media": [],
         "postponed": [],
         "critical_count": 0,
         "warnings_count": 0,
         "improvements_count": 0,
+        "media_count": 0,
         "postponed_count": 0,
     }
 
@@ -202,16 +301,35 @@ async def get_issues_grouped(
             db, store_id,
             status=IssueStatus.PENDING,
             severity=severity,
+            dedicated_media=False,
             limit=limit_per_group
         )
         skipped, s_count = await get_store_issues(
             db, store_id,
             status=IssueStatus.SKIPPED,
             severity=severity,
+            dedicated_media=False,
             limit=max(0, limit_per_group - len(pending))  # Fill remaining space
         )
         result[key] = list(pending) + list(skipped)
         result[f"{key}_count"] = p_count + s_count
+
+    media_pending, media_pending_count = await get_store_issues(
+        db,
+        store_id,
+        status=IssueStatus.PENDING,
+        dedicated_media=True,
+        limit=limit_per_group,
+    )
+    media_skipped, media_skipped_count = await get_store_issues(
+        db,
+        store_id,
+        status=IssueStatus.SKIPPED,
+        dedicated_media=True,
+        limit=max(0, limit_per_group - len(media_pending)),
+    )
+    result["media"] = list(media_pending) + list(media_skipped)
+    result["media_count"] = media_pending_count + media_skipped_count
 
     # Postponed issues
     postponed, postponed_count = await get_store_issues(
@@ -234,9 +352,9 @@ async def fix_issue(
     """Mark issue as fixed, and auto-apply any compound linked fixes."""
     issue.status = IssueStatus.FIXED
     issue.fixed_value = fixed_value
-    issue.fixed_at = datetime.utcnow()
+    issue.fixed_at = utc_now()
     issue.fixed_by_id = user_id
-    issue.updated_at = datetime.utcnow()
+    issue.updated_at = utc_now()
 
     # Apply all compound/linked field fixes automatically
     compound_fixes = _extract_compound_fixes(issue.error_details)
@@ -260,7 +378,7 @@ async def skip_issue(
     """Mark issue as skipped"""
     issue.status = IssueStatus.SKIPPED
     issue.postpone_reason = reason
-    issue.updated_at = datetime.utcnow()
+    issue.updated_at = utc_now()
     
     await db.commit()
     await db.refresh(issue)
@@ -277,7 +395,7 @@ async def unskip_issue(
     """Reset a skipped issue back to pending so it can be fixed."""
     issue.status = IssueStatus.PENDING
     issue.postpone_reason = None
-    issue.updated_at = datetime.utcnow()
+    issue.updated_at = utc_now()
 
     await db.commit()
     await db.refresh(issue)
@@ -297,7 +415,7 @@ async def postpone_issue(
     issue.status = IssueStatus.POSTPONED
     issue.postponed_until = until
     issue.postpone_reason = reason
-    issue.updated_at = datetime.utcnow()
+    issue.updated_at = utc_now()
     
     await db.commit()
     await db.refresh(issue)
@@ -309,36 +427,28 @@ async def postpone_issue(
 
 async def _update_card_issue_counts(db: AsyncSession, card_id: int) -> None:
     """Update issue counts on card after status change"""
-    # Count pending issues by severity
-    critical = await db.execute(
-        select(func.count(CardIssue.id)).where(
+    pending_counts = await db.execute(
+        select(
+            CardIssue.severity,
+            CardIssue.code,
+            CardIssue.category,
+            CardIssue.field_path,
+            func.count(CardIssue.id),
+        ).where(
             CardIssue.card_id == card_id,
-            CardIssue.severity == IssueSeverity.CRITICAL,
             CardIssue.status == IssueStatus.PENDING
         )
+        .group_by(CardIssue.severity, CardIssue.code, CardIssue.category, CardIssue.field_path)
     )
-    warnings = await db.execute(
-        select(func.count(CardIssue.id)).where(
-            CardIssue.card_id == card_id,
-            CardIssue.severity == IssueSeverity.WARNING,
-            CardIssue.status == IssueStatus.PENDING
-        )
-    )
-    improvements = await db.execute(
-        select(func.count(CardIssue.id)).where(
-            CardIssue.card_id == card_id,
-            CardIssue.severity == IssueSeverity.IMPROVEMENT,
-            CardIssue.status == IssueStatus.PENDING
-        )
-    )
+    counts = calculate_visible_issue_counts_from_rows(pending_counts.all())
     
     await db.execute(
         update(Card)
         .where(Card.id == card_id)
         .values(
-            critical_issues_count=critical.scalar() or 0,
-            warnings_count=warnings.scalar() or 0,
-            improvements_count=improvements.scalar() or 0,
+            critical_issues_count=counts[IssueSeverity.CRITICAL.value],
+            warnings_count=counts[IssueSeverity.WARNING.value],
+            improvements_count=counts[IssueSeverity.IMPROVEMENT.value],
         )
     )
     await db.commit()
@@ -371,13 +481,17 @@ async def get_issue_stats(db: AsyncSession, store_id: int) -> dict:
     
     # Count by severity (pending only)
     for severity in IssueSeverity:
+        extra_conditions = []
+        if severity in {IssueSeverity.WARNING, IssueSeverity.IMPROVEMENT}:
+            extra_conditions.append(non_dedicated_media_issue_filter())
         result = await db.execute(
             select(func.count(CardIssue.id))
             .join(Card)
             .where(
                 Card.store_id == store_id,
                 CardIssue.severity == severity,
-                CardIssue.status == IssueStatus.PENDING
+                CardIssue.status == IssueStatus.PENDING,
+                *extra_conditions,
             )
         )
         stats["by_severity"][severity.value] = result.scalar() or 0
@@ -422,10 +536,15 @@ async def get_next_issue(
         conditions.append(CardIssue.id > after_issue_id)
 
     if severity:
-        try:
-            conditions.append(CardIssue.severity == IssueSeverity(severity))
-        except ValueError:
-            pass
+        if severity == "media":
+            conditions.append(dedicated_media_issue_filter())
+        else:
+            try:
+                conditions.append(CardIssue.severity == IssueSeverity(severity))
+                if severity in {IssueSeverity.WARNING.value, IssueSeverity.IMPROVEMENT.value}:
+                    conditions.append(non_dedicated_media_issue_filter())
+            except ValueError:
+                pass
 
     query = (
         select(CardIssue)
@@ -480,10 +599,15 @@ async def get_queue_progress(db: AsyncSession, store_id: int, severity: Optional
     """Get progress of issue fixing queue, optionally filtered by severity."""
     severity_filter = []
     if severity:
-        try:
-            severity_filter = [CardIssue.severity == IssueSeverity(severity)]
-        except ValueError:
-            pass
+        if severity == "media":
+            severity_filter = [dedicated_media_issue_filter()]
+        else:
+            try:
+                severity_filter = [CardIssue.severity == IssueSeverity(severity)]
+                if severity in {IssueSeverity.WARNING.value, IssueSeverity.IMPROVEMENT.value}:
+                    severity_filter.append(non_dedicated_media_issue_filter())
+            except ValueError:
+                pass
 
     # Total pending
     pending_result = await db.execute(
@@ -557,7 +681,7 @@ async def mark_applied_to_wb(
         .where(CardIssue.id.in_(issue_ids))
         .values(
             status=IssueStatus.AUTO_FIXED,
-            updated_at=datetime.utcnow(),
+            updated_at=utc_now(),
         )
     )
     await db.commit()

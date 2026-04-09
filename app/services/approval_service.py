@@ -10,6 +10,7 @@ from sqlalchemy import select, func, and_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..core.time import utc_now
 from ..models import (
     Card,
     CardApproval,
@@ -447,6 +448,11 @@ async def submit_for_review(
     """
     Collect all pending card changes (fixed issues + current draft diff) and create an approval request.
     """
+    card_r = await db.execute(select(Card).where(Card.id == card_id))
+    card = card_r.scalar_one_or_none()
+    if not card or card.store_id != store_id:
+        raise ValueError("Card not found")
+
     changes = await build_card_approval_changes(db, card_id, prepared_by_id)
     if not changes:
         raise ValueError("No card changes found for this card")
@@ -496,7 +502,7 @@ async def review_approval(
         raise ValueError("Approval is not pending")
 
     approval.reviewed_by_id = reviewer_id
-    approval.reviewed_at = datetime.utcnow()
+    approval.reviewed_at = utc_now()
     approval.reviewer_comment = comment
 
     if action == "approve":
@@ -532,7 +538,7 @@ async def mark_approval_applied(
         raise ValueError("Approval not found")
 
     approval.status = ApprovalStatus.APPLIED
-    approval.applied_at = datetime.utcnow()
+    approval.applied_at = utc_now()
     await db.commit()
     await db.refresh(approval)
     return approval
@@ -599,41 +605,46 @@ async def get_approval_by_id(
 async def get_user_approval_stats(
     db: AsyncSession,
     user_id: int,
+    store_id: int | None = None,
 ) -> dict:
     """Fixes total, fixes today, pending approvals, approved count."""
     today = date.today()
 
     # Total fixes (issues fixed by this user)
-    total_r = await db.execute(
-        select(func.count()).select_from(CardIssue).where(CardIssue.fixed_by_id == user_id)
-    )
+    total_q = select(func.count()).select_from(CardIssue).where(CardIssue.fixed_by_id == user_id)
+    if store_id is not None:
+        total_q = total_q.join(Card).where(Card.store_id == store_id)
+    total_r = await db.execute(total_q)
     fixes_total = total_r.scalar() or 0
 
     # Fixes today
-    today_r = await db.execute(
-        select(func.count()).select_from(CardIssue).where(
-            CardIssue.fixed_by_id == user_id,
-            func.date(CardIssue.fixed_at) == today,
-        )
+    today_q = select(func.count()).select_from(CardIssue).where(
+        CardIssue.fixed_by_id == user_id,
+        func.date(CardIssue.fixed_at) == today,
     )
+    if store_id is not None:
+        today_q = today_q.join(Card).where(Card.store_id == store_id)
+    today_r = await db.execute(today_q)
     fixes_today = today_r.scalar() or 0
 
     # Approvals this user prepared — pending
-    pend_r = await db.execute(
-        select(func.count()).select_from(CardApproval).where(
-            CardApproval.prepared_by_id == user_id,
-            CardApproval.status == ApprovalStatus.PENDING,
-        )
+    pending_q = select(func.count()).select_from(CardApproval).where(
+        CardApproval.prepared_by_id == user_id,
+        CardApproval.status == ApprovalStatus.PENDING,
     )
+    if store_id is not None:
+        pending_q = pending_q.where(CardApproval.store_id == store_id)
+    pend_r = await db.execute(pending_q)
     approvals_pending = pend_r.scalar() or 0
 
     # Approved
-    appr_r = await db.execute(
-        select(func.count()).select_from(CardApproval).where(
-            CardApproval.prepared_by_id == user_id,
-            CardApproval.status.in_([ApprovalStatus.APPROVED, ApprovalStatus.APPLIED]),
-        )
+    approved_q = select(func.count()).select_from(CardApproval).where(
+        CardApproval.prepared_by_id == user_id,
+        CardApproval.status.in_([ApprovalStatus.APPROVED, ApprovalStatus.APPLIED]),
     )
+    if store_id is not None:
+        approved_q = approved_q.where(CardApproval.store_id == store_id)
+    appr_r = await db.execute(approved_q)
     approvals_approved = appr_r.scalar() or 0
 
     return {

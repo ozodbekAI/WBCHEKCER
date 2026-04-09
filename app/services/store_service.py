@@ -4,8 +4,10 @@ from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..core.time import utc_now
 from ..models import Store, StoreStatus, Card, CardIssue, User
 from ..schemas import StoreCreate, StoreUpdate
+from ..services.issue_service import non_dedicated_media_issue_filter
 
 
 async def create_store(db: AsyncSession, owner_id: int, store_data: StoreCreate) -> Store:
@@ -42,50 +44,103 @@ async def ensure_store_not_exists(
     owner_id: int,
     api_key: Optional[str] = None,
     wb_supplier_id: Optional[str] = None,
+    exclude_store_id: Optional[int] = None,
 ) -> None:
     """Prevent connecting the same store twice for one owner."""
     if api_key:
-        by_key = await db.execute(
-            select(Store).where(
-                Store.owner_id == owner_id,
-                Store.api_key == api_key,
-            )
+        query = select(Store).where(
+            Store.owner_id == owner_id,
+            Store.api_key == api_key,
         )
+        if exclude_store_id is not None:
+            query = query.where(Store.id != exclude_store_id)
+        by_key = await db.execute(query)
         if by_key.scalar_one_or_none():
             raise ValueError("Store with this API key is already connected")
 
     if wb_supplier_id:
-        by_supplier = await db.execute(
-            select(Store).where(
-                Store.owner_id == owner_id,
-                Store.wb_supplier_id == str(wb_supplier_id),
-            )
+        query = select(Store).where(
+            Store.owner_id == owner_id,
+            Store.wb_supplier_id == str(wb_supplier_id),
         )
+        if exclude_store_id is not None:
+            query = query.where(Store.id != exclude_store_id)
+        by_supplier = await db.execute(query)
         if by_supplier.scalar_one_or_none():
             raise ValueError("This WB supplier is already connected")
 
 
+async def _hydrate_missing_wb_ping_access(db: AsyncSession, stores: List[Store]) -> bool:
+    from .wb_api import WildberriesAPI
+
+    updated = False
+    for store in stores:
+        if not store:
+            continue
+
+        default_api_key = str(getattr(store, "api_key", "") or "").strip()
+        if default_api_key and not isinstance(getattr(store, "wb_ping_access", None), dict):
+            store.wb_ping_access = await WildberriesAPI(default_api_key).collect_ping_access()
+            store.wb_ping_checked_at = utc_now()
+            updated = True
+
+        for slot_row in getattr(store, "feature_api_keys", []) or []:
+            slot_api_key = str(getattr(slot_row, "api_key", "") or "").strip()
+            if slot_api_key and not isinstance(getattr(slot_row, "wb_ping_access", None), dict):
+                slot_row.wb_ping_access = await WildberriesAPI(slot_api_key).collect_ping_access()
+                slot_row.wb_ping_checked_at = utc_now()
+                updated = True
+
+    if updated:
+        await db.commit()
+    return updated
+
+
 async def get_store_by_id(db: AsyncSession, store_id: int) -> Optional[Store]:
-    result = await db.execute(select(Store).where(Store.id == store_id))
-    return result.scalar_one_or_none()
+    async def _load() -> Optional[Store]:
+        result = await db.execute(
+            select(Store)
+            .where(Store.id == store_id)
+            .options(selectinload(Store.feature_api_keys))
+        )
+        return result.scalar_one_or_none()
+
+    store = await _load()
+    if store and await _hydrate_missing_wb_ping_access(db, [store]):
+        store = await _load()
+    return store
 
 
 async def get_user_stores(db: AsyncSession, owner_id: int) -> List[Store]:
-    # Stores owned by this user
-    owned = await db.execute(
-        select(Store)
-        .where(Store.owner_id == owner_id)
-        .order_by(Store.created_at.desc())
-    )
-    stores = list(owned.scalars().all())
+    async def _load_owned() -> List[Store]:
+        owned = await db.execute(
+            select(Store)
+            .where(Store.owner_id == owner_id)
+            .options(selectinload(Store.feature_api_keys))
+            .order_by(Store.created_at.desc())
+        )
+        return list(owned.scalars().all())
+
+    stores = await _load_owned()
+    if stores and await _hydrate_missing_wb_ping_access(db, stores):
+        stores = await _load_owned()
 
     # If not an owner, find store via user.store_id (invited member)
     if not stores:
         user_r = await db.execute(select(User).where(User.id == owner_id))
         user = user_r.scalar_one_or_none()
         if user and user.store_id:
-            store_r = await db.execute(select(Store).where(Store.id == user.store_id))
-            member_store = store_r.scalar_one_or_none()
+            async def _load_member_store() -> Optional[Store]:
+                store_r = await db.execute(
+                    select(Store)
+                    .where(Store.id == user.store_id)
+                    .options(selectinload(Store.feature_api_keys))
+                )
+                return store_r.scalar_one_or_none()
+
+            member_store = await _load_member_store()
+            if member_store and await _hydrate_missing_wb_ping_access(db, [member_store]):
+                member_store = await _load_member_store()
             if member_store:
                 stores = [member_store]
 
@@ -96,7 +151,7 @@ async def update_store(db: AsyncSession, store: Store, store_data: StoreUpdate) 
     update_data = store_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(store, field, value)
-    store.updated_at = datetime.utcnow()
+    store.updated_at = utc_now()
     await db.commit()
     await db.refresh(store)
     return store
@@ -114,7 +169,7 @@ async def update_store_status(
     if wb_info:
         store.wb_supplier_id = wb_info.get("supplier_id")
         store.wb_supplier_name = wb_info.get("supplier_name")
-    store.updated_at = datetime.utcnow()
+    store.updated_at = utc_now()
     await db.commit()
     await db.refresh(store)
     return store
@@ -148,7 +203,8 @@ async def update_store_stats(db: AsyncSession, store_id: int) -> None:
         .where(
             Card.store_id == store_id,
             CardIssue.severity == IssueSeverity.WARNING,
-            CardIssue.status == IssueStatus.PENDING
+            CardIssue.status == IssueStatus.PENDING,
+            non_dedicated_media_issue_filter(),
         )
     )
     warnings_count = warnings_result.scalar() or 0
@@ -169,7 +225,7 @@ async def update_store_stats(db: AsyncSession, store_id: int) -> None:
             critical_issues=critical_count,
             warnings_count=warnings_count,
             growth_potential=potential_growth,
-            updated_at=datetime.utcnow()
+            updated_at=utc_now()
         )
     )
     await db.commit()

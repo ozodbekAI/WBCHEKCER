@@ -2,6 +2,7 @@ from typing import Optional, List
 from sqlalchemy.orm import Session
 from datetime import datetime
 
+from app.core.time import utc_now
 from app.models.promt import PromptTemplate, PromptVersion
 
 
@@ -106,7 +107,7 @@ class PromptRepository:
             prompt.examples = examples
 
         prompt.version += 1
-        prompt.updated_at = datetime.utcnow()
+        prompt.updated_at = utc_now()
 
         self.db.flush()
 
@@ -134,7 +135,7 @@ class PromptRepository:
             raise ValueError(f"Prompt type '{prompt_type}' not found")
 
         prompt.is_active = is_active
-        prompt.updated_at = datetime.utcnow()
+        prompt.updated_at = utc_now()
 
         self.db.commit()
         self.db.refresh(prompt)

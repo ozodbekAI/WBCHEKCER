@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, List, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # === Issue Schemas ===
@@ -14,6 +14,8 @@ class IssueBase(BaseModel):
 
 
 class IssueOut(IssueBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     card_id: int
     
@@ -44,10 +46,6 @@ class IssueOut(IssueBase):
     
     created_at: datetime
     
-    class Config:
-        from_attributes = True
-
-
 class IssueWithCard(IssueOut):
     """Issue with card info"""
     card_nm_id: int
@@ -69,11 +67,13 @@ class IssuesGrouped(BaseModel):
     critical: List[IssueWithCard] = []
     warnings: List[IssueWithCard] = []
     improvements: List[IssueWithCard] = []
+    media: List[IssueWithCard] = []
     postponed: List[IssueWithCard] = []
     
     critical_count: int = 0
     warnings_count: int = 0
     improvements_count: int = 0
+    media_count: int = 0
     postponed_count: int = 0
 
 

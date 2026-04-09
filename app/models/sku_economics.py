@@ -3,6 +3,7 @@ from datetime import datetime, date
 from sqlalchemy import Column, Integer, Float, DateTime, Date, ForeignKey, Index, String, JSON, Boolean
 
 from ..core.database import Base
+from app.core.time import utc_now
 
 
 class SkuEconomicsCost(Base):
@@ -14,8 +15,8 @@ class SkuEconomicsCost(Base):
     title = Column(String(500), nullable=True)
     vendor_code = Column(String(100), nullable=True)
     unit_cost = Column(Float, nullable=False, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index("idx_sku_economics_costs_store_nm", "store_id", "nm_id", unique=True),
@@ -37,8 +38,8 @@ class SkuEconomicsManualSpend(Base):
     orders = Column(Integer, nullable=True)
     gmv = Column(Float, nullable=True)
     source_file_name = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index(
@@ -66,8 +67,8 @@ class SkuEconomicsManualFinance(Base):
     payout = Column(Float, nullable=True)
     orders = Column(Integer, nullable=True)
     source_file_name = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index(
@@ -105,9 +106,9 @@ class SkuEconomicsSnapshot(Base):
     cr = Column(Float, nullable=False, default=0)
     orders = Column(Integer, nullable=False, default=0)
     ad_orders = Column(Integer, nullable=False, default=0)
-    generated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    generated_at = Column(DateTime, default=utc_now, nullable=False)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index(
@@ -129,9 +130,9 @@ class SkuEconomicsOverviewCache(Base):
     period_start = Column(Date, nullable=False)
     period_end = Column(Date, nullable=False)
     payload = Column(JSON, nullable=False)
-    generated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    generated_at = Column(DateTime, default=utc_now, nullable=False)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index(
@@ -176,9 +177,9 @@ class SkuEconomicsDailyMetric(Base):
     has_advert = Column(Boolean, nullable=False, default=False)
     has_finance = Column(Boolean, nullable=False, default=False)
     has_funnel = Column(Boolean, nullable=False, default=False)
-    synced_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    synced_at = Column(DateTime, default=utc_now, nullable=False)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index(

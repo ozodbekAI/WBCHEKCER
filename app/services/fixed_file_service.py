@@ -14,6 +14,7 @@ from sqlalchemy import select, delete, update, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..core.time import utc_now
 from ..models.fixed_file import FixedFileEntry
 
 # Columns in the Excel that are NOT characteristics (skip when parsing)
@@ -125,7 +126,7 @@ async def upsert_entries(
     if not entries:
         return 0
 
-    now = datetime.utcnow()
+    now = utc_now()
     rows = [
         {
             "store_id": store_id,
@@ -226,7 +227,7 @@ async def update_entry(
     if not entry:
         return None
     entry.fixed_value = fixed_value
-    entry.updated_at = datetime.utcnow()
+    entry.updated_at = utc_now()
     await db.commit()
     await db.refresh(entry)
     return entry
@@ -426,4 +427,3 @@ async def generate_characteristics_from_photo(
         "characteristics": chars,
         "product_dna": dna,
     }
-

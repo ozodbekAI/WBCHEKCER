@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 # === User Schemas ===
@@ -29,6 +29,8 @@ class UserUpdateAdmin(UserUpdate):
 
 
 class UserOut(UserBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     role: str
     is_active: bool
@@ -37,10 +39,6 @@ class UserOut(UserBase):
     last_login: Optional[datetime] = None
     permissions: list[str] = []
     
-    class Config:
-        from_attributes = True
-
-
 class UserWithStats(UserOut):
     stores_count: int = 0
     total_cards: int = 0

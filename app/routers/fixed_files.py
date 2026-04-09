@@ -9,7 +9,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, status
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.database import get_db
@@ -53,6 +53,8 @@ def _require_manage(current_user: User) -> None:
 # ─── Schemas ──────────────────────────────────────────────────────────────────
 
 class FixedEntryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     store_id: int
     nm_id: int
@@ -62,10 +64,6 @@ class FixedEntryOut(BaseModel):
     fixed_value: str
     created_at: datetime
     updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
 
 class FixedEntryListOut(BaseModel):
     items: List[FixedEntryOut]

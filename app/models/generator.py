@@ -5,6 +5,7 @@ from typing import Optional, List
 import enum
 
 from app.core.database import Base
+from app.core.time import utc_now
 
 
 class TaskStatus(enum.Enum):
@@ -37,7 +38,7 @@ class PoseGroup(Base):
     name: Mapped[str] = mapped_column(String(255))
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     
     subgroups: Mapped[List["PoseSubgroup"]] = relationship("PoseSubgroup", back_populates="group", cascade="all, delete-orphan")
 
@@ -50,7 +51,7 @@ class PoseSubgroup(Base):
     name: Mapped[str] = mapped_column(String(255))
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     
     group: Mapped["PoseGroup"] = relationship("PoseGroup", back_populates="subgroups")
     prompts: Mapped[List["PosePrompt"]] = relationship("PosePrompt", back_populates="subgroup", cascade="all, delete-orphan")
@@ -65,7 +66,7 @@ class PosePrompt(Base):
     prompt: Mapped[str] = mapped_column(Text)
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     
     subgroup: Mapped["PoseSubgroup"] = relationship("PoseSubgroup", back_populates="prompts")
 
@@ -77,7 +78,7 @@ class ModelCategory(Base):
     name: Mapped[str] = mapped_column(String(255))
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     
     subcategories: Mapped[List["ModelSubcategory"]] = relationship(
         "ModelSubcategory", back_populates="category", cascade="all, delete-orphan"
@@ -92,7 +93,7 @@ class ModelSubcategory(Base):
     name: Mapped[str] = mapped_column(String(255))
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     
     category: Mapped["ModelCategory"] = relationship("ModelCategory", back_populates="subcategories")
     items: Mapped[List["ModelItem"]] = relationship("ModelItem", back_populates="subcategory", cascade="all, delete-orphan")
@@ -107,7 +108,7 @@ class ModelItem(Base):
     prompt: Mapped[str] = mapped_column(Text)  
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     
     subcategory: Mapped["ModelSubcategory"] = relationship("ModelSubcategory", back_populates="items")
 
@@ -120,7 +121,7 @@ class VideoScenario(Base):
     prompt: Mapped[str] = mapped_column(Text)
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 class SceneCategory(Base):
     __tablename__ = "scene_categories"
@@ -129,7 +130,7 @@ class SceneCategory(Base):
     name: Mapped[str] = mapped_column(String(255))
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     
     subcategories: Mapped[List["SceneSubcategory"]] = relationship(
         "SceneSubcategory", back_populates="category", cascade="all, delete-orphan"
@@ -144,7 +145,7 @@ class SceneSubcategory(Base):
     name: Mapped[str] = mapped_column(String(255))
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     
     category: Mapped["SceneCategory"] = relationship("SceneCategory", back_populates="subcategories")
     items: Mapped[List["SceneItem"]] = relationship("SceneItem", back_populates="subcategory", cascade="all, delete-orphan")
@@ -159,7 +160,7 @@ class SceneItem(Base):
     prompt: Mapped[str] = mapped_column(Text)
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     
     subcategory: Mapped["SceneSubcategory"] = relationship("SceneSubcategory", back_populates="items")
 
@@ -171,4 +172,4 @@ class AdminLog(Base):
     admin_id: Mapped[int] = mapped_column(BigInteger, index=True)
     action: Mapped[str] = mapped_column(String(100))
     details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)

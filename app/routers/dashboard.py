@@ -4,8 +4,10 @@ from sqlalchemy import select, func
 
 from ..core.database import get_db
 from ..core.security import get_current_user
+from ..core.time import utc_now
 from ..models import User, Store, Card, CardIssue, IssueStatus, IssueSeverity
 from ..schemas import DashboardStats, WorkspaceDashboard, TaskCategory
+from ..services.issue_service import non_dedicated_media_issue_filter
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
@@ -57,7 +59,8 @@ async def get_dashboard(
         .where(
             Card.store_id.in_(store_ids),
             CardIssue.severity == IssueSeverity.WARNING,
-            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED])
+            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED]),
+            non_dedicated_media_issue_filter(),
         )
     )
     warnings = warnings_result.scalar() or 0
@@ -69,14 +72,14 @@ async def get_dashboard(
         .where(
             Card.store_id.in_(store_ids),
             CardIssue.severity == IssueSeverity.IMPROVEMENT,
-            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED])
+            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED]),
+            non_dedicated_media_issue_filter(),
         )
     )
     improvements = improvements_result.scalar() or 0
     
     # Fixed today
-    from datetime import datetime, timedelta
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
     fixed_today_result = await db.execute(
         select(func.count(CardIssue.id))
         .join(Card)
@@ -122,7 +125,8 @@ async def get_store_dashboard(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Store not found")
 
     is_owner = store.owner_id == current_user.id
-    is_admin = current_user.role == "admin"
+    role_value = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    is_admin = role_value == "admin"
     is_member = getattr(current_user, 'store_id', None) == store_id
     if not (is_owner or is_admin or is_member):
         from fastapi import HTTPException, status
@@ -152,7 +156,8 @@ async def get_store_dashboard(
         .where(
             Card.store_id == store_id,
             CardIssue.severity == IssueSeverity.WARNING,
-            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED])
+            CardIssue.status.in_([IssueStatus.PENDING, IssueStatus.SKIPPED]),
+            non_dedicated_media_issue_filter(),
         )
     )
     warnings_row = warnings_result.one()

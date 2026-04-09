@@ -22,6 +22,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { toast } from 'sonner';
 
 const ROLE_LABELS: Record<string, string> = {
   admin: 'Администратор',
@@ -154,7 +155,7 @@ export function TeamContent() {
       await api.updateTeamMember(storeId, userId, { role: newRole });
       await loadData();
     } catch (e: any) {
-      alert(e.message || 'Ошибка при обновлении');
+      toast.error(e.message || 'Ошибка при обновлении');
     }
   };
 
@@ -164,7 +165,7 @@ export function TeamContent() {
       await api.updateTeamMember(storeId, userId, { is_active: !isActive });
       await loadData();
     } catch (e: any) {
-      alert(e.message || 'Ошибка');
+      toast.error(e.message || 'Ошибка');
     }
   };
 
@@ -202,7 +203,7 @@ export function TeamContent() {
       setPermTarget(null);
       await loadData();
     } catch (e: any) {
-      alert(e.message || 'Ошибка при сохранении');
+      toast.error(e.message || 'Ошибка при сохранении');
     } finally {
       setSavingPerms(false);
     }

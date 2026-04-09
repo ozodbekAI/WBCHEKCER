@@ -27,6 +27,7 @@ from app.services.promotion_repository import PromotionRepository
 from app.models.promotion import PromotionCompany, PromotionPhoto, PromotionStatus
 from app.models.store import Store, StoreStatus
 from app.models.user import User
+from app.services.wb_token_access import get_store_feature_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +53,16 @@ class PromotionService:
         self.wb_repo = WBRepository()
         self.wb_advert = WBAdvertRepository()
 
-    def _resolve_advert_token(self, db: Session, user_id: int) -> str:
+    def _resolve_advert_token(self, db: Session, user_id: int, store_id: int | None = None) -> str:
         user = db.query(User).filter(User.id == int(user_id)).first()
+        if store_id is not None:
+            store = db.query(Store).filter(Store.id == int(store_id)).first()
+            if store:
+                token = str(get_store_feature_api_key(store, "ab_tests") or getattr(store, "api_key", "") or "").strip()
+                if token:
+                    return token
+                return str(settings.WB_ADVERT_API_KEY or settings.WB_API_KEY or "").strip()
+
         candidate_store_ids: list[int] = []
         if user and getattr(user, "store_id", None):
             candidate_store_ids.append(int(user.store_id))
@@ -85,14 +94,14 @@ class PromotionService:
             store = db.query(Store).filter(Store.id == store_id).first()
             if not store:
                 continue
-            token = str(getattr(store, "api_key", "") or "").strip()
+            token = str(get_store_feature_api_key(store, "ab_tests") or getattr(store, "api_key", "") or "").strip()
             if token:
                 return token
 
         return str(settings.WB_ADVERT_API_KEY or settings.WB_API_KEY or "").strip()
 
-    def _get_wb_advert(self, db: Session, user_id: int) -> WBAdvertRepository:
-        token = self._resolve_advert_token(db, user_id)
+    def _get_wb_advert(self, db: Session, user_id: int, store_id: int | None = None) -> WBAdvertRepository:
+        token = self._resolve_advert_token(db, user_id, store_id=store_id)
         return WBAdvertRepository(token=token)
 
     @classmethod
@@ -113,6 +122,259 @@ class PromotionService:
         if c:
             return c
         raise ValueError(f"Company not found: {company_id}")
+
+    @staticmethod
+    def _serialize_company_list_item(c: PromotionCompany) -> dict:
+        return {
+            "id_company": c.id,
+            "company_id": int(c.wb_company_id),
+            "nm_id": int(c.nm_id),
+            "title": c.title,
+            "status": c.status.value,
+            "spend_rub": int(c.spend_rub or 0),
+            "views_per_photo": int(c.views_per_photo or 0),
+            "photos_count": int(c.photos_count or 0),
+            "current_photo_order": int(getattr(c, "current_photo_order", 1) or 1),
+            "winner_photo_order": c.winner_photo_order,
+            "last_error": str(getattr(c, "error_message", "") or "").strip() or None,
+            "can_start": c.status in {PromotionStatus.CREATED, PromotionStatus.FAILED, PromotionStatus.STOPPED},
+            "can_stop": c.status == PromotionStatus.RUNNING,
+            "started_at": getattr(c, "started_at", None).isoformat() if getattr(c, "started_at", None) else None,
+            "finished_at": getattr(c, "finished_at", None).isoformat() if getattr(c, "finished_at", None) else None,
+            "photos": [
+                {
+                    "order": int(p.order),
+                    "file_url": p.file_url,
+                    "wb_url": p.wb_url,
+                    "shows": int(p.shows),
+                    "clicks": int(p.clicks),
+                    "ctr": float(p.ctr),
+                    "is_winner": bool(p.is_winner),
+                }
+                for p in (c.photos or [])
+            ],
+        }
+
+    @staticmethod
+    def _is_retryable_start_error(error: str) -> bool:
+        raw = str(error or "").strip().lower()
+        if not raw:
+            return False
+        markers = (
+            "low budget",
+            "budget",
+            "баланс",
+            "бюджет",
+            "недостаточно",
+            "insufficient",
+            "not enough",
+            "funds",
+            "money",
+        )
+        return any(marker in raw for marker in markers)
+
+    def _wait_for_campaign_budget(
+        self,
+        wb_advert: WBAdvertRepository,
+        *,
+        advert_id: int,
+        required_budget: int,
+        timeout_sec: int = 75,
+        poll_sec: float = 5.0,
+    ) -> int:
+        target = max(int(required_budget or 0), 0)
+        if target <= 0:
+            return 0
+
+        deadline = time.time() + max(int(timeout_sec or 0), 0)
+        last_total = 0
+        while True:
+            try:
+                last_total = max(int(wb_advert.get_campaign_budget_total(int(advert_id)) or 0), 0)
+            except Exception as exc:
+                logger.warning("[promo-budget] budget check failed advert=%s err=%s", advert_id, str(exc))
+            if last_total >= target:
+                return last_total
+            if time.time() >= deadline:
+                return last_total
+            time.sleep(max(float(poll_sec or 0), 1.0))
+
+    def _ensure_current_test_photo_applied(self, db: Session, repo: PromotionRepository, company: PromotionCompany) -> None:
+        current_order = int(getattr(company, "current_photo_order", 1) or 1)
+        current_photo = (
+            db.query(PromotionPhoto)
+            .filter(PromotionPhoto.company_id == company.id, PromotionPhoto.order == current_order)
+            .first()
+        )
+        if not current_photo:
+            raise ValueError(f"Current test photo not found (order={current_order})")
+
+        nm_id = int(company.nm_id)
+        with self._get_media_lock(nm_id):
+            st = repo.get_media_state(company) or {}
+            if not isinstance(st, dict) or int(st.get("v") or 0) != 2 or int(st.get("nm_id") or 0) != int(nm_id):
+                selected: set[int] = set()
+                for p in db.query(PromotionPhoto).filter(PromotionPhoto.company_id == company.id).all():
+                    fu = str(getattr(p, "file_url", "") or "")
+                    if self._is_wb_url(fu):
+                        n = self._extract_photo_number(fu)
+                        if n:
+                            selected.add(int(n))
+                st = self._init_media_state(company, selected)
+
+            self._apply_variant_to_main_slot(nm_id, st, str(current_photo.file_url))
+            repo.set_media_state(company, state=st)
+
+        try:
+            main_url = self._get_card_photo_map(nm_id).get(1)
+            if main_url:
+                current_photo.wb_url = str(main_url)
+                db.add(current_photo)
+                db.commit()
+        except Exception as exc:
+            logger.warning("[promo-media] unable to persist current main url company=%s err=%s", company.id, str(exc))
+
+    def _restore_company_media(self, db: Session, repo: PromotionRepository, company: PromotionCompany) -> None:
+        nm_id = int(company.nm_id)
+        with self._get_media_lock(nm_id):
+            st = repo.get_media_state(company) or {}
+            if not isinstance(st, dict) or int(st.get("v") or 0) != 2 or int(st.get("nm_id") or 0) != int(nm_id):
+                return
+            self._restore_original_slots(nm_id, st)
+            repo.set_media_state(company, state=st)
+
+    def _start_existing_company(
+        self,
+        db: Session,
+        repo: PromotionRepository,
+        company: PromotionCompany,
+        *,
+        user_id: int,
+        store_id: int | None = None,
+        auto_deposit: bool = True,
+    ) -> dict:
+        wb_advert = self._get_wb_advert(db, user_id, store_id=store_id)
+        spend_total = max(int(getattr(company, "spend_rub", 0) or 0), 0)
+        cpm = max(int(getattr(company, "cpm", 0) or 0), 0)
+        deposit_amount = 0
+
+        try:
+            self._ensure_current_test_photo_applied(db, repo, company)
+
+            if cpm > 0:
+                wb_advert.set_bid(
+                    advert_id=int(company.wb_company_id),
+                    nm_id=int(company.nm_id),
+                    placement="combined",
+                    bid_value=cpm,
+                    value_unit="rub",
+                )
+
+            current_budget = 0
+            if spend_total > 0:
+                try:
+                    current_budget = int(wb_advert.get_campaign_budget_total(int(company.wb_company_id)) or 0)
+                except Exception as exc:
+                    logger.warning("[promo-start] budget read failed company=%s err=%s", company.id, str(exc))
+                    current_budget = 0
+
+                if current_budget < spend_total and auto_deposit:
+                    deposit_amount = spend_total - current_budget
+                    try:
+                        wb_advert.deposit_budget(
+                            advert_id=int(company.wb_company_id),
+                            amount_rub=int(deposit_amount),
+                            source_type=1,
+                        )
+                    except Exception as exc:
+                        logger.warning("[promo-start] deposit failed company=%s err=%s", company.id, str(exc))
+
+                current_budget = self._wait_for_campaign_budget(
+                    wb_advert,
+                    advert_id=int(company.wb_company_id),
+                    required_budget=spend_total,
+                    timeout_sec=90 if deposit_amount > 0 else 30,
+                    poll_sec=5.0,
+                )
+
+            last_error = ""
+            retryable = False
+            for attempt in range(4):
+                try:
+                    wb_advert.start_campaign(int(company.wb_company_id))
+
+                    begin_date = date.today().isoformat()
+                    end_date = (date.today() + timedelta(days=1)).isoformat()
+                    stats = wb_advert.get_fullstats([int(company.wb_company_id)], begin_date=begin_date, end_date=end_date)
+                    shows, clicks = self.parse_stats_totals(stats, advert_id=int(company.wb_company_id))
+                    repo.update_last_totals(company, shows=shows, clicks=clicks)
+                    repo.mark_started(company)
+
+                    return {
+                        "id_company": company.id,
+                        "company_id": int(company.wb_company_id),
+                        "started": True,
+                        "status": "running",
+                        "deposit_amount": int(deposit_amount),
+                        "campaign_budget": int(current_budget),
+                    }
+                except Exception as exc:
+                    last_error = str(exc)
+                    retryable = self._is_retryable_start_error(last_error)
+                    if not retryable or attempt >= 3:
+                        break
+                    current_budget = self._wait_for_campaign_budget(
+                        wb_advert,
+                        advert_id=int(company.wb_company_id),
+                        required_budget=spend_total,
+                        timeout_sec=25,
+                        poll_sec=5.0,
+                    )
+                    time.sleep(min(4 + attempt * 3, 12))
+
+            self._restore_company_media(db, repo, company)
+            if retryable:
+                wait_error = (
+                    "WB еще не видит пополнение бюджета кампании. Мы оставили тест в ожидании и попробуем запустить его автоматически."
+                    if spend_total > 0
+                    else last_error
+                )
+                repo.mark_pending_start(company, error=wait_error, delay_sec=60)
+                return {
+                    "id_company": company.id,
+                    "company_id": int(company.wb_company_id),
+                    "started": False,
+                    "status": "waiting_balance",
+                    "error": wait_error,
+                    "deposit_amount": int(deposit_amount),
+                    "campaign_budget": int(current_budget),
+                }
+
+            repo.mark_failed(company, error=last_error)
+            return {
+                "id_company": company.id,
+                "company_id": int(company.wb_company_id),
+                "started": False,
+                "status": "failed",
+                "error": last_error,
+                "deposit_amount": int(deposit_amount),
+                "campaign_budget": int(current_budget),
+            }
+        except Exception as exc:
+            err = str(exc)
+            try:
+                self._restore_company_media(db, repo, company)
+            except Exception:
+                pass
+            repo.mark_failed(company, error=err)
+            return {
+                "id_company": company.id,
+                "company_id": int(company.wb_company_id),
+                "started": False,
+                "status": "failed",
+                "error": err,
+                "deposit_amount": int(deposit_amount),
+            }
 
     # ============================================
     # MEDIA SYNC - FIXED
@@ -787,9 +1049,9 @@ class PromotionService:
     # ============================================
     # API METHODS
     # ============================================
-    def create_company(self, db: Session, user_id: int, payload: dict) -> dict:
+    def create_company(self, db: Session, user_id: int, payload: dict, store_id: int | None = None) -> dict:
         repo = PromotionRepository(db)
-        wb_advert = self._get_wb_advert(db, user_id)
+        wb_advert = self._get_wb_advert(db, user_id, store_id=store_id)
 
         nm_id = int(payload["nm_id"])
         card_id = int(payload.get("card_id") or nm_id)
@@ -840,9 +1102,9 @@ class PromotionService:
             "status": str(company.status),
         }
 
-    def update_company_and_start(self, db: Session, user_id: int, payload: dict) -> dict:
+    def update_company_and_start(self, db: Session, user_id: int, payload: dict, store_id: int | None = None) -> dict:
         repo = PromotionRepository(db)
-        wb_advert = self._get_wb_advert(db, user_id)
+        wb_advert = self._get_wb_advert(db, user_id, store_id=store_id)
 
         raw_company_id = payload.get("id_company") or payload.get("company_id")
         if not raw_company_id:
@@ -963,72 +1225,40 @@ class PromotionService:
             value_unit="rub",
         )
 
-        # 8) Budget (optional)
-        deposit_amount = 0
+        # 8) Start with budget retry / auto-recovery
         auto_deposit = bool(payload.get("auto_deposit", True))
-        if auto_deposit:
-            try:
-                wb_budget_info = wb_advert.get_campaign_budget(int(company.wb_company_id))
-                current_budget = int(wb_budget_info.get("total") or 0)
-                if current_budget < int(spend_total):
-                    deposit_needed = int(spend_total) - current_budget
-                    deposit_amount = int(payload.get("deposit_rub") or deposit_needed or spend_total)
-                    wb_advert.deposit_budget(
-                        advert_id=int(company.wb_company_id),
-                        amount_rub=int(deposit_amount),
-                        source_type=1,
-                    )
-                    time.sleep(2)
-            except Exception as e:
-                logger.warning("[update:%s] deposit failed: %s", trace_id, str(e))
+        start_result = self._start_existing_company(
+            db,
+            repo,
+            company,
+            user_id=user_id,
+            store_id=store_id,
+            auto_deposit=auto_deposit,
+        )
 
-        # 9) Baseline stats
-        begin_date = date.today().isoformat()
-        end_date = (date.today() + timedelta(days=1)).isoformat()
-        stats = wb_advert.get_fullstats([int(company.wb_company_id)], begin_date=begin_date, end_date=end_date)
-        total_shows, total_clicks = self.parse_stats_totals(stats, advert_id=int(company.wb_company_id))
-        repo.update_last_totals(company, shows=total_shows, clicks=total_clicks)
+        logger.info(
+            "[update:%s] %s: %sms",
+            trace_id,
+            str(start_result.get("status") or "done"),
+            int((time.perf_counter() - t0) * 1000),
+        )
 
-        # 10) Start
-        try:
-            wb_advert.start_campaign(int(company.wb_company_id))
-            repo.mark_started(company)
-
-            logger.info("[update:%s] SUCCESS: %sms", trace_id, int((time.perf_counter() - t0) * 1000))
-
-            return {
-                "id_company": company.id,
-                "company_id": int(company.wb_company_id),
-                "nm_id": nm_id,
-                "title": title,
-                "cpm": cpm,
-                "min_cpm": int(min_bid_rub),
-                "views_per_photo": int(views_per_photo),
-                "photos_count": int(photos_count),
-                "spend_rub": int(spend_total),
-                "deposit_amount": int(deposit_amount),
-                "started": True,
-                "status": "running",
-            }
-
-        except Exception as e:
-            err = str(e)
-            try:
-                repo.mark_failed(company, error=err)
-            except Exception:
-                pass
-
-            return {
-                "id_company": company.id,
-                "company_id": int(company.wb_company_id),
-                "started": False,
-                "error": err,
-                "status": "cannot_start",
-            }
+        return {
+            "id_company": company.id,
+            "company_id": int(company.wb_company_id),
+            "nm_id": nm_id,
+            "title": title,
+            "cpm": cpm,
+            "min_cpm": int(min_bid_rub),
+            "views_per_photo": int(views_per_photo),
+            "photos_count": int(photos_count),
+            "spend_rub": int(spend_total),
+            **start_result,
+        }
 
 
-    def get_balance(self, db: Session, user_id: int) -> dict:
-        wb_advert = self._get_wb_advert(db, user_id)
+    def get_balance(self, db: Session, user_id: int, store_id: int | None = None) -> dict:
+        wb_advert = self._get_wb_advert(db, user_id, store_id=store_id)
         try:
             balance = wb_advert.get_balance() or {}
         except Exception as e:
@@ -1040,7 +1270,7 @@ class PromotionService:
             "promo_bonus_rub": int(balance.get("bonus") or 0),
         }
 
-    def company_stats(self, db: Session, user_id: int, company_id: int) -> dict:
+    def company_stats(self, db: Session, user_id: int, company_id: int, store_id: int | None = None) -> dict:
         repo = PromotionRepository(db)
         company = self._load_company_any_id(db, repo, user_id, int(company_id))
 
@@ -1052,6 +1282,7 @@ class PromotionService:
             "nm_id": int(company.nm_id),
             "title": str(company.title),
             "status": str(company.status),
+            "last_error": str(getattr(company, "error_message", "") or "").strip() or None,
             "spend_rub": int(getattr(company, "spend_rub", 0) or 0),
             "views_per_photo": int(getattr(company, "views_per_photo", 0) or 0),
             "photos_count": int(getattr(company, "photos_count", 0) or 0),
@@ -1073,9 +1304,9 @@ class PromotionService:
             ],
         }
 
-    def company_debug(self, db: Session, user_id: int, company_id: int) -> dict:
+    def company_debug(self, db: Session, user_id: int, company_id: int, store_id: int | None = None) -> dict:
         repo = PromotionRepository(db)
-        wb_advert = self._get_wb_advert(db, user_id)
+        wb_advert = self._get_wb_advert(db, user_id, store_id=store_id)
         company = self._load_company_any_id(db, repo, user_id, int(company_id))
 
         wb_budget = wb_advert.get_campaign_budget(int(company.wb_company_id))
@@ -1086,36 +1317,54 @@ class PromotionService:
             "company_id": int(company.wb_company_id),
             "nm_id": int(company.nm_id),
             "status": str(company.status),
+            "last_error": str(getattr(company, "error_message", "") or "").strip() or None,
             "wb_budget": wb_budget,
             "wb_balance": wb_balance,
         }
 
-    def start_company(self, db: Session, user_id: int, company_id: int) -> dict:
+    def start_company(self, db: Session, user_id: int, company_id: int, store_id: int | None = None) -> dict:
         repo = PromotionRepository(db)
-        wb_advert = self._get_wb_advert(db, user_id)
+        company = self._load_company_any_id(db, repo, user_id, int(company_id))
+        return self._start_existing_company(
+            db,
+            repo,
+            company,
+            user_id=user_id,
+            store_id=store_id,
+            auto_deposit=True,
+        )
+
+    def stop_company(self, db: Session, user_id: int, company_id: int, store_id: int | None = None) -> dict:
+        repo = PromotionRepository(db)
+        wb_advert = self._get_wb_advert(db, user_id, store_id=store_id)
         company = self._load_company_any_id(db, repo, user_id, int(company_id))
 
+        stop_error = None
         try:
-            wb_advert.start_campaign(int(company.wb_company_id))
+            wb_advert.stop_campaign(int(company.wb_company_id))
+        except Exception as exc:
+            stop_error = str(exc)
+            logger.warning("[promo-stop] wb stop failed company=%s err=%s", company.id, stop_error)
 
-            begin_date = date.today().isoformat()
-            end_date = (date.today() + timedelta(days=1)).isoformat()
-            stats = wb_advert.get_fullstats([int(company.wb_company_id)], begin_date=begin_date, end_date=end_date)
-            shows, clicks = self.parse_stats_totals(stats, advert_id=int(company.wb_company_id))
-            repo.update_last_totals(company, shows=shows, clicks=clicks)
-            repo.mark_started(company)
+        restore_error = None
+        try:
+            self._restore_company_media(db, repo, company)
+        except Exception as exc:
+            restore_error = str(exc)
+            logger.warning("[promo-stop] restore failed company=%s err=%s", company.id, restore_error)
 
-            return {"id_company": company.id, "company_id": int(company.wb_company_id), "started": True, "status": "running"}
+        reason_parts = [part for part in [stop_error, restore_error] if part]
+        repo.mark_stopped(company, reason="; ".join(reason_parts) if reason_parts else None)
 
-        except Exception as e:
-            err = str(e)
-            try:
-                repo.mark_failed(company, error=err)
-            except Exception:
-                pass
-            return {"id_company": company.id, "started": False, "error": err}
+        return {
+            "id_company": company.id,
+            "company_id": int(company.wb_company_id),
+            "stopped": True,
+            "status": "stopped",
+            "error": "; ".join(reason_parts) if reason_parts else None,
+        }
 
-    def list_running(self, *, db: Session, user_id: int, page: int = 1, page_size: int = 6) -> dict:
+    def list_running(self, *, db: Session, user_id: int, page: int = 1, page_size: int = 6, store_id: int | None = None) -> dict:
         repo = PromotionRepository(db)
 
         statuses = [PromotionStatus.RUNNING]
@@ -1130,31 +1379,7 @@ class PromotionService:
             offset=offset,
         )
 
-        items = []
-        for c in companies:
-            items.append({
-                "id_company": c.id,
-                "company_id": int(c.wb_company_id),   # siz oldin shuni company_id qilib qaytargansiz
-                "nm_id": int(c.nm_id),
-                "title": c.title,
-                "status": c.status.value,             # ✅ "finished" / "running" / ...
-                "spend_rub": int(c.spend_rub),
-                "views_per_photo": int(c.views_per_photo),
-                "photos_count": int(c.photos_count),
-                "winner_photo_order": c.winner_photo_order,
-                "photos": [
-                    {
-                        "order": int(p.order),
-                        "file_url": p.file_url,
-                        "wb_url": p.wb_url,
-                        "shows": int(p.shows),
-                        "clicks": int(p.clicks),
-                        "ctr": float(p.ctr),
-                        "is_winner": bool(p.is_winner),
-                    }
-                    for p in (c.photos or [])
-                ],
-            })
+        items = [self._serialize_company_list_item(c) for c in companies]
 
         return {
             "items": items,
@@ -1166,46 +1391,14 @@ class PromotionService:
             }
         }
 
-    def list_failed(self, *, db: Session, user_id: int, page: int = 1, page_size: int = 6) -> dict:
+    def list_failed(self, *, db: Session, user_id: int, page: int = 1, page_size: int = 6, store_id: int | None = None) -> dict:
         repo = PromotionRepository(db)
-
-        statuses = [PromotionStatus.FAILED]
-        total = repo.count_by_statuses(user_id=user_id, statuses=statuses)
+        total = repo.count_attention(user_id=user_id)
         total_pages = math.ceil(total / page_size) if total else 0
         offset = (page - 1) * page_size
 
-        companies = repo.list_by_statuses(
-            user_id=user_id,
-            statuses=statuses,
-            limit=page_size,
-            offset=offset,
-        )
-
-        items = []
-        for c in companies:
-            items.append({
-                "id_company": c.id,
-                "company_id": int(c.wb_company_id),   # siz oldin shuni company_id qilib qaytargansiz
-                "nm_id": int(c.nm_id),
-                "title": c.title,
-                "status": c.status.value,             # ✅ "finished" / "running" / ...
-                "spend_rub": int(c.spend_rub),
-                "views_per_photo": int(c.views_per_photo),
-                "photos_count": int(c.photos_count),
-                "winner_photo_order": c.winner_photo_order,
-                "photos": [
-                    {
-                        "order": int(p.order),
-                        "file_url": p.file_url,
-                        "wb_url": p.wb_url,
-                        "shows": int(p.shows),
-                        "clicks": int(p.clicks),
-                        "ctr": float(p.ctr),
-                        "is_winner": bool(p.is_winner),
-                    }
-                    for p in (c.photos or [])
-                ],
-            })
+        companies = repo.list_attention(user_id=user_id, limit=page_size, offset=offset)
+        items = [self._serialize_company_list_item(c) for c in companies]
 
         return {
             "items": items,
@@ -1217,46 +1410,14 @@ class PromotionService:
             }
         }
 
-    def list_pending(self, db: Session, user_id: int, page: int = 1, page_size: int = 6) -> dict:
+    def list_pending(self, db: Session, user_id: int, page: int = 1, page_size: int = 6, store_id: int | None = None) -> dict:
         repo = PromotionRepository(db)
-
-        statuses = [PromotionStatus.CREATED]
-        total = repo.count_by_statuses(user_id=user_id, statuses=statuses)
+        total = repo.count_pending_clean(user_id=user_id)
         total_pages = math.ceil(total / page_size) if total else 0
         offset = (page - 1) * page_size
 
-        companies = repo.list_by_statuses(
-            user_id=user_id,
-            statuses=statuses,
-            limit=page_size,
-            offset=offset,
-        )
-
-        items = []
-        for c in companies:
-            items.append({
-                "id_company": c.id,
-                "company_id": int(c.wb_company_id),   # siz oldin shuni company_id qilib qaytargansiz
-                "nm_id": int(c.nm_id),
-                "title": c.title,
-                "status": c.status.value,             # ✅ "finished" / "running" / ...
-                "spend_rub": int(c.spend_rub),
-                "views_per_photo": int(c.views_per_photo),
-                "photos_count": int(c.photos_count),
-                "winner_photo_order": c.winner_photo_order,
-                "photos": [
-                    {
-                        "order": int(p.order),
-                        "file_url": p.file_url,
-                        "wb_url": p.wb_url,
-                        "shows": int(p.shows),
-                        "clicks": int(p.clicks),
-                        "ctr": float(p.ctr),
-                        "is_winner": bool(p.is_winner),
-                    }
-                    for p in (c.photos or [])
-                ],
-            })
+        companies = repo.list_pending_clean(user_id=user_id, limit=page_size, offset=offset)
+        items = [self._serialize_company_list_item(c) for c in companies]
 
         return {
             "items": items,
@@ -1268,7 +1429,7 @@ class PromotionService:
             }
         }
 
-    def list_finished(self, db: Session, user_id: int, page: int = 1, page_size: int = 6) -> dict:
+    def list_finished(self, db: Session, user_id: int, page: int = 1, page_size: int = 6, store_id: int | None = None) -> dict:
         repo = PromotionRepository(db)
 
         statuses = [PromotionStatus.FINISHED]
@@ -1283,31 +1444,7 @@ class PromotionService:
             offset=offset,
         )
 
-        items = []
-        for c in companies:
-            items.append({
-                "id_company": c.id,
-                "company_id": int(c.wb_company_id),   # siz oldin shuni company_id qilib qaytargansiz
-                "nm_id": int(c.nm_id),
-                "title": c.title,
-                "status": c.status.value,             # ✅ "finished" / "running" / ...
-                "spend_rub": int(c.spend_rub),
-                "views_per_photo": int(c.views_per_photo),
-                "photos_count": int(c.photos_count),
-                "winner_photo_order": c.winner_photo_order,
-                "photos": [
-                    {
-                        "order": int(p.order),
-                        "file_url": p.file_url,
-                        "wb_url": p.wb_url,
-                        "shows": int(p.shows),
-                        "clicks": int(p.clicks),
-                        "ctr": float(p.ctr),
-                        "is_winner": bool(p.is_winner),
-                    }
-                    for p in (c.photos or [])
-                ],
-            })
+        items = [self._serialize_company_list_item(c) for c in companies]
 
         return {
             "items": items,

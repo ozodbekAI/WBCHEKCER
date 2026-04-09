@@ -3,6 +3,7 @@ from typing import Optional
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..core.time import utc_now
 from ..models import User, UserRole
 from ..core.security import get_password_hash, verify_password
 from ..schemas import UserCreate, UserUpdate
@@ -46,20 +47,20 @@ async def update_user(db: AsyncSession, user: User, user_data: UserUpdate) -> Us
     update_data = user_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(user, field, value)
-    user.updated_at = datetime.utcnow()
+    user.updated_at = utc_now()
     await db.commit()
     await db.refresh(user)
     return user
 
 
 async def update_last_login(db: AsyncSession, user: User) -> None:
-    user.last_login = datetime.utcnow()
+    user.last_login = utc_now()
     await db.commit()
 
 
 async def change_password(db: AsyncSession, user: User, new_password: str) -> None:
     user.hashed_password = get_password_hash(new_password)
-    user.updated_at = datetime.utcnow()
+    user.updated_at = utc_now()
     await db.commit()
 
 

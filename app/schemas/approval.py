@@ -1,11 +1,13 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 # ── Approval Schemas ──
 
 class ApprovalOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     store_id: int
     card_id: int
@@ -28,10 +30,6 @@ class ApprovalOut(BaseModel):
     card_vendor_code: Optional[str] = None
     card_photo: Optional[str] = None
 
-    class Config:
-        from_attributes = True
-
-
 class ApprovalSubmitRequest(BaseModel):
     card_id: int
     note: Optional[str] = None
@@ -51,6 +49,8 @@ class ApprovalListOut(BaseModel):
 # ── Team Schemas ──
 
 class TeamMemberOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     email: str
     first_name: Optional[str] = None
@@ -67,10 +67,6 @@ class TeamMemberOut(BaseModel):
     fixes_today: int = 0
     approvals_pending: int = 0
     approvals_approved: int = 0
-
-    class Config:
-        from_attributes = True
-
 
 class TeamMemberUpdate(BaseModel):
     role: Optional[str] = None

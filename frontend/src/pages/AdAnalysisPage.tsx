@@ -641,7 +641,7 @@ export default function AdAnalysisPage() {
   const { activeStore } = useStore();
   const initialCustomRange = defaultCustomRange();
 
-  const [periodPreset, setPeriodPreset] = useState<PeriodPreset>('all');
+  const [periodPreset, setPeriodPreset] = useState<PeriodPreset>('14d');
   const [customPeriodStart, setCustomPeriodStart] = useState<string>(initialCustomRange.start);
   const [customPeriodEnd, setCustomPeriodEnd] = useState<string>(initialCustomRange.end);
   const [viewMode, setViewMode] = useState<ViewMode>('simple');

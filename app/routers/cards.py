@@ -21,13 +21,15 @@ from ..services.card_service import (
     build_description_editor_keywords,
     generate_card_description_suggestion,
 )
+from ..services.wb_token_access import ensure_store_feature_access, get_store_feature_api_key
 from ..services.approval_service import (
     apply_card_raw_snapshot,
     build_card_approval_changes,
     build_card_update_payload,
 )
-from ..services.issue_service import mark_applied_to_wb
+from ..services.issue_service import calculate_visible_issue_counts_from_rows, mark_applied_to_wb
 from ..services.wb_api import WildberriesAPI
+from ..services.wb_cards import parse_wb_timestamp
 from ..services.workflow_service import (
     CARD_WORKFLOW_SECTIONS,
     confirm_card_section,
@@ -48,6 +50,11 @@ ALLOWED_REMOTE_HOST_SUFFIXES = (
     "wildberries.ru",
     "wb.ru",
 )
+
+
+def _is_admin_user(user: User) -> bool:
+    role_value = user.role.value if hasattr(user.role, "value") else str(user.role)
+    return role_value == "admin"
 
 
 class ReplaceWbPhotoRequest(BaseModel):
@@ -281,6 +288,7 @@ def _apply_wb_card_snapshot(card: Card, raw: Dict[str, Any]) -> None:
     card.characteristics = _extract_wb_characteristics(raw.get("characteristics"))
     card.dimensions = _extract_wb_dimensions(raw.get("dimensions"))
     card.raw_data = raw
+    card.wb_updated_at = parse_wb_timestamp(raw.get("updatedAt"))
 
 
 async def _refresh_local_card_from_wb(
@@ -333,12 +341,13 @@ async def get_user_store(
             detail="Store not found"
         )
     
-    if store.owner_id != current_user.id and current_user.role != "admin":
+    if store.owner_id != current_user.id and not _is_admin_user(current_user):
         if getattr(current_user, 'store_id', None) != store.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied"
             )
+    ensure_store_feature_access(store, "cards")
 
     return store
 
@@ -418,8 +427,12 @@ async def list_wb_cards_live(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Store must be active",
         )
+    ensure_store_feature_access(store, "cards")
+    feature_api_key = get_store_feature_api_key(store, "cards")
+    if not feature_api_key:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
 
-    wb_api = WildberriesAPI(store.api_key)
+    wb_api = WildberriesAPI(feature_api_key)
     result = await wb_api.get_cards(
         limit=limit,
         updated_at=cursor_updated_at,
@@ -464,6 +477,10 @@ async def replace_wb_card_photo(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Store must be active",
         )
+    ensure_store_feature_access(store, "cards_write")
+    feature_api_key = get_store_feature_api_key(store, "cards_write")
+    if not feature_api_key:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
 
     source_url = (payload.source_url or "").strip()
     if not source_url:
@@ -474,7 +491,7 @@ async def replace_wb_card_photo(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Cannot load source image: {e}")
 
-    wb_api = WildberriesAPI(store.api_key)
+    wb_api = WildberriesAPI(feature_api_key)
     result = await wb_api.upload_card_photo(
         nm_id=int(nm_id),
         content=content,
@@ -660,6 +677,7 @@ async def apply_card_changes_endpoint(
     current_user: User = Depends(require_permission("cards.sync")),
 ):
     card = await _get_store_card(db, store.id, card_id)
+    ensure_store_feature_access(store, "cards_write")
 
     confirmed_sections = set(await list_confirmed_sections(db, card.id))
     missing_sections = [section for section in CARD_WORKFLOW_SECTIONS if section not in confirmed_sections]
@@ -679,7 +697,10 @@ async def apply_card_changes_endpoint(
 
     update_payload, next_raw_data = build_card_update_payload(card, changes)
 
-    wb_api = WildberriesAPI(store.api_key)
+    feature_api_key = get_store_feature_api_key(store, "cards_write")
+    if not feature_api_key:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
+    wb_api = WildberriesAPI(feature_api_key)
     wb_result = await wb_api.update_card(update_payload)
     if not wb_result.get("success"):
         error_msg = wb_result.get("error", "Unknown WB error")
@@ -697,17 +718,20 @@ async def apply_card_changes_endpoint(
         await analyze_card(db, card)
     except Exception:
         pending_by_severity = await db.execute(
-            select(CardIssue.severity, func.count())
+            select(
+                CardIssue.severity,
+                CardIssue.code,
+                CardIssue.category,
+                CardIssue.field_path,
+                func.count(),
+            )
             .where(
                 CardIssue.card_id == card.id,
                 CardIssue.status == IssueStatus.PENDING,
             )
-            .group_by(CardIssue.severity)
+            .group_by(CardIssue.severity, CardIssue.code, CardIssue.category, CardIssue.field_path)
         )
-        counts = {
-            str(severity.value if hasattr(severity, "value") else severity): count
-            for severity, count in pending_by_severity.all()
-        }
+        counts = calculate_visible_issue_counts_from_rows(pending_by_severity.all())
         card.critical_issues_count = int(counts.get("critical", 0) or 0)
         card.warnings_count = int(counts.get("warning", 0) or 0)
         card.improvements_count = int(counts.get("improvement", 0) or 0)
@@ -728,6 +752,7 @@ async def sync_card_photos_endpoint(
     current_user: User = Depends(require_permission("cards.sync")),
 ):
     card = await _get_store_card(db, store.id, card_id)
+    ensure_store_feature_access(store, "cards_write")
 
     desired_sources: List[str] = []
     seen_sources: set[str] = set()
@@ -741,7 +766,10 @@ async def sync_card_photos_endpoint(
         seen_sources.add(normalized)
         desired_sources.append(source_url)
 
-    wb_api = WildberriesAPI(store.api_key)
+    feature_api_key = get_store_feature_api_key(store, "cards_write")
+    if not feature_api_key:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
+    wb_api = WildberriesAPI(feature_api_key)
     current_urls = await wb_api.get_card_photo_urls(card.nm_id)
 
     uploaded_by_index: Dict[int, str] = {}
@@ -816,17 +844,20 @@ async def sync_card_photos_endpoint(
         await analyze_card(db, card)
     except Exception:
         pending_by_severity = await db.execute(
-            select(CardIssue.severity, func.count())
+            select(
+                CardIssue.severity,
+                CardIssue.code,
+                CardIssue.category,
+                CardIssue.field_path,
+                func.count(),
+            )
             .where(
                 CardIssue.card_id == card.id,
                 CardIssue.status == IssueStatus.PENDING,
             )
-            .group_by(CardIssue.severity)
+            .group_by(CardIssue.severity, CardIssue.code, CardIssue.category, CardIssue.field_path)
         )
-        counts = {
-            str(severity.value if hasattr(severity, "value") else severity): count
-            for severity, count in pending_by_severity.all()
-        }
+        counts = calculate_visible_issue_counts_from_rows(pending_by_severity.all())
         card.critical_issues_count = int(counts.get("critical", 0) or 0)
         card.warnings_count = int(counts.get("warning", 0) or 0)
         card.improvements_count = int(counts.get("improvement", 0) or 0)

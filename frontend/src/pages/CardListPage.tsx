@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useStore } from '../contexts/StoreContext';
 import api from '../api/client';
+import { saveSyncTask } from '../components/SyncProgressBanner';
 import {
   AlertTriangle,
   ArrowDown,
@@ -52,9 +53,30 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Progress } from '@/components/ui/progress';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 
 type SeverityFilter = 'all' | 'has_issues' | 'no_issues' | 'postponed' | 'unconfirmed';
 type SortFilter = 'issues' | 'score';
+
+interface SyncPreview {
+  total_wb: number;
+  changed_count: number;
+  unchanged_count: number;
+  changed: Array<{
+    nm_id: number;
+    title?: string | null;
+    vendor_code?: string | null;
+    status: 'new' | 'changed' | 'ok';
+    subject?: string | null;
+  }>;
+}
 
 interface QualityMetric {
   label: string;
@@ -183,6 +205,11 @@ export default function CardListPage() {
   const [sortBy, setSortBy] = useState<SortFilter>('issues');
   const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc');
   const [analysisTask, setAnalysisTask] = useState<{ taskId: string; step: string; progress: number; status: string } | null>(null);
+  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
+  const [syncPreview, setSyncPreview] = useState<SyncPreview | null>(null);
+  const [syncPreviewLoading, setSyncPreviewLoading] = useState(false);
+  const [syncSubmitting, setSyncSubmitting] = useState(false);
+  const [syncPreviewError, setSyncPreviewError] = useState('');
   const analysisPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [schedulerStatus, setSchedulerStatus] = useState<{ last_tick_at: string | null; next_tick_in_sec: number | null; is_running: boolean } | null>(null);
 
@@ -216,6 +243,54 @@ export default function CardListPage() {
     } catch (err: any) {
       setAnalysisTask({ taskId: '', step: `Ошибка: ${err.message}`, progress: 0, status: 'failed' });
       setTimeout(() => setAnalysisTask(null), 5000);
+    }
+  };
+
+  const loadSyncPreview = async () => {
+    if (!activeStore) return;
+    setSyncPreviewLoading(true);
+    setSyncPreviewError('');
+    try {
+      const preview = await api.getSyncPreview(activeStore.id);
+      setSyncPreview(preview);
+    } catch (err: any) {
+      setSyncPreview(null);
+      setSyncPreviewError(err.message || 'Не удалось получить превью синхронизации');
+    } finally {
+      setSyncPreviewLoading(false);
+    }
+  };
+
+  const openSyncDialog = async () => {
+    if (!activeStore) return;
+    setSyncDialogOpen(true);
+    await loadSyncPreview();
+  };
+
+  const startIncrementalSync = async () => {
+    if (!activeStore || syncSubmitting) return;
+    setSyncSubmitting(true);
+    try {
+      const task = await api.startSync(activeStore.id, 'incremental');
+      saveSyncTask(activeStore.id, task.task_id);
+      toast.success('Синхронизация запущена');
+      setSyncDialogOpen(false);
+      await loadCards();
+    } catch (err: any) {
+      toast.error(err.message || 'Не удалось запустить синхронизацию');
+    } finally {
+      setSyncSubmitting(false);
+    }
+  };
+
+  const startSelectedCardSync = async (card: Card) => {
+    if (!activeStore) return;
+    try {
+      const task = await api.startSync(activeStore.id, 'manual', [card.nm_id]);
+      saveSyncTask(activeStore.id, task.task_id);
+      toast.success(`Карточка ${card.nm_id} поставлена в синхронизацию`);
+    } catch (err: any) {
+      toast.error(err.message || 'Не удалось синхронизировать карточку');
     }
   };
 
@@ -350,6 +425,16 @@ export default function CardListPage() {
           <div className="max-w-[1400px] mx-auto px-6 pt-4 pb-1 flex items-center justify-between">
             <h1 className="text-lg font-semibold text-foreground">Карточки товаров</h1>
             <div className="flex items-center gap-4">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void openSyncDialog()}
+                disabled={!activeStore || syncPreviewLoading || isAnalysisRunning}
+                className="gap-1.5 h-8 text-sm"
+              >
+                {syncPreviewLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                Сверить с WB
+              </Button>
               <Button
                 variant="outline"
                 size="sm"
@@ -751,6 +836,10 @@ export default function CardListPage() {
                                 </Button>
                               </DropdownMenuTrigger>
                               <DropdownMenuContent align="end" className="w-56">
+                                <DropdownMenuItem className="gap-2" onClick={() => void startSelectedCardSync(card)}>
+                                  <RefreshCw className="h-4 w-4" />
+                                  Синхронизировать карточку
+                                </DropdownMenuItem>
                                 <DropdownMenuItem className="gap-2" onClick={() => navigate('/ab-tests')}>
                                   <FlaskConical className="h-4 w-4" />
                                   Запустить A/B тест
@@ -802,6 +891,91 @@ export default function CardListPage() {
             )}
           </div>
         </div>
+
+        <Dialog open={syncDialogOpen} onOpenChange={setSyncDialogOpen}>
+          <DialogContent className="sm:max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>Сверка с Wildberries</DialogTitle>
+              <DialogDescription>
+                Превью показывает, сколько карточек реально изменились на стороне WB по `updatedAt`.
+              </DialogDescription>
+            </DialogHeader>
+
+            {syncPreviewLoading ? (
+              <div className="flex items-center justify-center py-10 text-sm text-muted-foreground">
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Считаем изменения...
+              </div>
+            ) : syncPreviewError ? (
+              <div className="rounded-lg border border-destructive/20 bg-destructive/5 p-4 text-sm text-destructive">
+                {syncPreviewError}
+              </div>
+            ) : syncPreview ? (
+              <div className="space-y-4">
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <div className="rounded-lg border border-border bg-muted/30 p-3">
+                    <div className="text-xs text-muted-foreground">Карточек в WB</div>
+                    <div className="mt-1 text-xl font-semibold">{syncPreview.total_wb}</div>
+                  </div>
+                  <div className="rounded-lg border border-border bg-muted/30 p-3">
+                    <div className="text-xs text-muted-foreground">Изменились / новые</div>
+                    <div className="mt-1 text-xl font-semibold text-primary">{syncPreview.changed_count}</div>
+                  </div>
+                  <div className="rounded-lg border border-border bg-muted/30 p-3">
+                    <div className="text-xs text-muted-foreground">Без изменений</div>
+                    <div className="mt-1 text-xl font-semibold text-muted-foreground">{syncPreview.unchanged_count}</div>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-border">
+                  <div className="border-b border-border px-4 py-3 text-sm font-medium">
+                    Что попадёт в синхронизацию
+                  </div>
+                  {syncPreview.changed.length === 0 ? (
+                    <div className="px-4 py-6 text-sm text-muted-foreground">
+                      Все карточки уже актуальны.
+                    </div>
+                  ) : (
+                    <div className="max-h-72 overflow-y-auto">
+                      {syncPreview.changed.slice(0, 12).map((entry) => (
+                        <div key={`${entry.nm_id}-${entry.status}`} className="flex items-start justify-between gap-3 border-b border-border/60 px-4 py-3 last:border-b-0">
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-medium text-foreground">
+                              {entry.title || `Карточка ${entry.nm_id}`}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              WB {entry.nm_id}
+                              {entry.vendor_code ? ` · ${entry.vendor_code}` : ''}
+                              {entry.subject ? ` · ${entry.subject}` : ''}
+                            </div>
+                          </div>
+                          <Badge variant={entry.status === 'new' ? 'default' : 'secondary'}>
+                            {entry.status === 'new' ? 'Новая' : 'Изменена'}
+                          </Badge>
+                        </div>
+                      ))}
+                      {syncPreview.changed.length > 12 && (
+                        <div className="px-4 py-3 text-xs text-muted-foreground">
+                          И ещё {syncPreview.changed.length - 12} карточек.
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : null}
+
+            <DialogFooter className="gap-2">
+              <Button variant="outline" onClick={() => void loadSyncPreview()} disabled={syncPreviewLoading || syncSubmitting}>
+                Обновить превью
+              </Button>
+              <Button onClick={() => void startIncrementalSync()} disabled={syncPreviewLoading || syncSubmitting || !syncPreview}>
+                {syncSubmitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Синхронизировать изменения
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         {/* Bottom analysis progress banner */}
         {analysisTask && (

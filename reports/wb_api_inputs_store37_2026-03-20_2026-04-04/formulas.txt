@@ -1,0 +1,260 @@
+КАК ЧИТАТЬ ЭТИ ФАЙЛЫ И КАК ИЗ НИХ СОБИРАЕТСЯ ЭКРАН НА САЙТЕ
+
+Главная мысль:
+сайт считает рекламу не из одного файла, а собирает 4 слоя данных вместе.
+Плюс есть еще себестоимость, но ее в этом простом export нет, потому что WB API ее не отдает.
+
+ЧТО ДЕЛАЕТ КАЖДЫЙ ФАЙЛ
+
+1. 01_promotion_count.csv
+Это технический файл.
+Он нужен только для того, чтобы получить список advert_id.
+Дальше по этим advert_id мы уже запрашиваем 02_fullstats.csv.
+На сайте этот файл почти не виден напрямую.
+
+2. 02_fullstats.csv
+Это главный рекламный файл.
+Из него сайт берет:
+- advert_id
+- название кампании
+- общий расход кампании
+- nm_id
+- показы
+- клики
+- рекламные заказы
+- рекламный GMV
+- расход по SKU
+
+Что из него показывается на сайте:
+- блок «Кампании»
+- расход по рекламе
+- показы / клики
+- заказы из рекламы
+- рекламный GMV
+- CTR
+- CR
+- CPC
+
+Как считается из 02_fullstats.csv:
+- exact_spend по SKU = сумма ad_spend по одному nm_id
+- если у кампании общий расход больше, чем сумма расходов по SKU, появляется остаток residual
+- этот residual распределяется между SKU
+- сначала по ad_orders
+- если заказов нет, по clicks
+- если кликов нет, по views
+- если и этого нет, поровну
+- этот распределенный остаток и есть estimated_spend
+
+Итог по рекламе:
+- ad_cost = exact_spend + estimated_spend
+
+3. 03_sales_funnel_products.csv
+Это файл воронки.
+Из него сайт берет:
+- открытия карточки
+- добавления в корзину
+- заказы
+- сумму заказов
+- выкупы
+- сумму выкупов
+
+Что из него показывается на сайте:
+- Open count
+- Cart count
+- Order count
+- Buyout count
+- конверсии воронки
+
+Что из него считается:
+- add_to_cart_percent = cart_count / open_count * 100
+- cart_to_order_percent = order_count / cart_count * 100
+
+Этот файл еще важен как запасной источник заказов и выручки, если финансовый слой пустой.
+
+4. 04_report_detail_by_period.csv
+Это финансовый файл.
+Из него сайт берет:
+- nm_id
+- quantity
+- тип документа
+- revenue
+- payout
+- дополнительные расходы WB
+
+Что из него показывается на сайте:
+- Revenue
+- WB costs
+- часть Orders
+
+Как считается финансовая часть:
+- если строка является возвратом, знак = минус
+- revenue_signed = revenue * sign
+- payout_signed = payout * sign
+- orders_signed = max(quantity * sign, 0)
+- revenue_total = сумма revenue_signed по SKU
+- payout_total = сумма payout_signed по SKU
+- wb_extra_total = сумма wb_extra_costs по SKU
+- wb_costs = max(wb_extra_total, 0) + max(revenue_total - payout_total, 0)
+
+ГДЕ ЗДЕСЬ СЕБЕСТОИМОСТЬ
+
+Себестоимость на сайте есть, но в этих 4 файлах ее нет.
+Она берется из отдельного Excel-файла.
+WB API себестоимость не возвращает.
+
+Если в Excel есть колонки:
+- Артикул Поставщика
+- Артикул ВБ
+- Себестоимость, руб
+
+то сайт использует их так:
+- Артикул ВБ = nm_id
+- Себестоимость, руб = unit_cost
+
+После этого сайт считает:
+- cost_price = unit_cost * total_orders
+
+Если себестоимости нет, тогда:
+- cost_price считается неточно
+- gross profit и net profit тоже будут неточными
+- max_cpo и profit_delta тоже будут неточными
+
+КАК САЙТ СОБИРАЕТ ИТОГ ПО SKU
+
+1. Сначала собирается реклама из 02_fullstats.csv
+- ad_cost
+- views
+- clicks
+- ad_orders
+- ad_gmv
+
+2. Потом добавляется воронка из 03_sales_funnel_products.csv
+- open_count
+- cart_count
+- order_count
+- order_sum
+- buyout_count
+
+3. Потом добавляется финансовый слой из 04_report_detail_by_period.csv
+- revenue
+- wb_costs
+- finance.orders
+
+4. Потом добавляется себестоимость из отдельного файла
+- unit_cost
+- cost_price
+
+ИТОГОВЫЕ ФОРМУЛЫ, КОТОРЫЕ ВЫ ВИДИТЕ НА САЙТЕ
+
+1. total_orders = max(finance.orders, funnel.order_count, advert.ad_orders)
+Это итоговое число заказов для SKU.
+Сайт берет максимум из трех источников, чтобы не занизить расчет.
+
+2. revenue_final
+Сайт берет выручку в таком порядке:
+- сначала finance.revenue
+- если его нет, тогда funnel.order_sum
+- если и его нет, тогда advert.ad_gmv
+
+3. ad_cost = exact_spend + estimated_spend
+Это расход на рекламу по SKU.
+
+4. cost_price = unit_cost * total_orders
+Это себестоимость проданных единиц.
+
+5. gross_profit_before_ads = revenue_final - wb_costs - cost_price
+Это прибыль до вычета рекламы.
+
+6. net_profit = gross_profit_before_ads - ad_cost
+Это уже чистая прибыль после рекламы.
+
+7. max_cpo
+Если total_orders > 0:
+- max_cpo = gross_profit_before_ads / total_orders
+Если total_orders = 0:
+- max_cpo = gross_profit_before_ads
+
+Это максимально допустимая стоимость заказа.
+
+8. actual_cpo
+Если advert.ad_orders > 0:
+- actual_cpo = ad_cost / advert.ad_orders
+Если advert.ad_orders = 0:
+- actual_cpo = ad_cost
+
+Это фактическая стоимость заказа из рекламы.
+
+9. profit_delta = max_cpo - actual_cpo
+Если число положительное, у SKU есть запас.
+Если число отрицательное, реклама уже слишком дорогая.
+
+КАК ПРОВЕРЯТЬ РУКАМИ
+
+1. Найдите нужный nm_id в Excel с себестоимостью
+2. Найдите этот же nm_id в 02_fullstats.csv
+3. Найдите этот же nm_id в 03_sales_funnel_products.csv
+4. Найдите этот же nm_id в 04_report_detail_by_period.csv
+5. Подставьте числа в формулы выше
+
+Так вы получите ту же математику, которую показывает сайт.
+
+КАКИЕ БЛОКИ САЙТА ИЗ ЧЕГО СЧИТАЮТСЯ
+
+Блок «Кампании»
+- почти полностью из 02_fullstats.csv
+- advert_id
+- название кампании
+- расход
+- GMV
+- DRR
+- число связанных SKU
+
+Метрики рекламы в строке SKU
+- из 02_fullstats.csv
+- views
+- clicks
+- ad_orders
+- ad_gmv
+- ad_cost
+- CTR
+- CR
+- CPC
+
+Метрики воронки
+- из 03_sales_funnel_products.csv
+- open_count
+- cart_count
+- order_count
+- buyout_count
+- конверсии
+
+Финансовые метрики
+- из 04_report_detail_by_period.csv
+- revenue
+- wb_costs
+- finance.orders
+
+Экономика SKU
+- из 02 + 03 + 04 + файла себестоимости
+- cost_price
+- gross_profit_before_ads
+- net_profit
+- max_cpo
+- actual_cpo
+- profit_delta
+
+DRR
+- DRR = ad_cost / revenue_final * 100
+- значит он считается сразу из рекламного слоя и слоя выручки
+
+Статусы типа «Остановить / Спасти / Растить»
+- считаются уже не из одного файла
+- они строятся из итоговых метрик:
+  net_profit, max_cpo, actual_cpo, profit_delta, CTR, CR и достаточности данных
+
+ВАЖНО
+
+- Этот export сохраняет только входные данные из WB API.
+- Себестоимость сюда не входит автоматически.
+- Для полной проверки математики нужно использовать еще Excel-файл себестоимости.
+- Колонка raw_json хранит исходную строку WB, чтобы можно было сверять руками.

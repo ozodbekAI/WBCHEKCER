@@ -47,6 +47,7 @@ import {
   Camera,
   Save,
 } from 'lucide-react';
+import { toast } from 'sonner';
 
 interface PhotoMedia {
   id: string;
@@ -108,7 +109,7 @@ interface QuickMenuAction {
   options: Array<{ id?: string; label: string; prompt: string; quickAction?: Record<string, any> }>;
 }
 
-const API_BASE = API_ORIGIN;
+const MEDIA_BASE = API_ORIGIN;
 
 const WELCOME_MSG: ChatMessage = {
   id: 'welcome',
@@ -198,11 +199,6 @@ const ENHANCE_MENU_OPTIONS: Array<{ id: string; label: string; prompt: string; q
   },
 ];
 
-function authHeaders(): Record<string, string> {
-  const token = localStorage.getItem('access_token');
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
 function uid(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -211,8 +207,8 @@ function toAbsoluteMediaUrl(url: string): string {
   if (!url) return '';
   if (url.startsWith('//')) return `https:${url}`;
   if (url.startsWith('http://') || url.startsWith('https://')) return url;
-  if (url.startsWith('/')) return `${API_BASE}${url}`;
-  return `${API_BASE}/${url}`;
+  if (url.startsWith('/')) return `${MEDIA_BASE}${url}`;
+  return `${MEDIA_BASE}/${url}`;
 }
 
 function fileNameFromUrl(url: string) {
@@ -391,11 +387,7 @@ export default function PhotoStudioPage() {
 
   const loadQuickCatalog = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/photo/catalog/all`, {
-        headers: authHeaders(),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      const data = await api.getPhotoCatalogAll();
 
       const scenes = (Array.isArray(data?.scenes) ? data.scenes : []).map((item: any) => ({
         id: `scene-${item?.id}`,
@@ -443,6 +435,7 @@ export default function PhotoStudioPage() {
       setQuickActive((prev) => (nextMenu.some((item) => item.id === prev) ? prev : nextMenu[0]?.id || 'change-background'));
     } catch (e) {
       console.error('Quick catalog load error', e);
+      toast.error('Не удалось загрузить каталог фотостудии');
       setQuickMenu(QUICK_MENU);
     }
   };
@@ -491,11 +484,7 @@ export default function PhotoStudioPage() {
   const loadGalleryAssets = async (type: 'scene' | 'model' = galleryType) => {
     setGalleryLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/photo-assets/catalog?asset_type=${type}`, {
-        headers: authHeaders(),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      const data = await api.getPhotoGalleryAssets(type);
       const mapped: GalleryAsset[] = (Array.isArray(data?.assets) ? data.assets : [])
         .map((a: any) => ({
           id: Number(a?.id || 0),
@@ -510,6 +499,7 @@ export default function PhotoStudioPage() {
       setGalleryAssets(mapped);
     } catch (e) {
       console.error('Gallery assets load error', e);
+      toast.error('Не удалось загрузить галерею образцов');
       setGalleryAssets([]);
     } finally {
       setGalleryLoading(false);
@@ -524,9 +514,7 @@ export default function PhotoStudioPage() {
   useEffect(() => {
     (async () => {
       try {
-        const res = await fetch(`${API_BASE}/api/photo/chat/history`, { headers: authHeaders() });
-        if (!res.ok) return;
-        const data = await res.json();
+        const data = await api.getPhotoChatHistory();
 
         const assets: any[] = data.assets || [];
         const rawMsgs: any[] = data.messages || [];
@@ -583,6 +571,7 @@ export default function PhotoStudioPage() {
         }
       } catch (e) {
         console.warn('Failed to load chat history', e);
+        toast.error('Не удалось восстановить историю фотостудии');
       }
     })();
   }, []);
@@ -635,26 +624,12 @@ export default function PhotoStudioPage() {
   };
 
   const uploadFile = async (file: File): Promise<{ assetId?: number; url?: string }> => {
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await fetch(`${API_BASE}/api/photo/assets/upload`, {
-      method: 'POST',
-      headers: authHeaders(),
-      body: fd,
-    });
-    if (!res.ok) throw new Error('Upload failed');
-    const data = await res.json();
+    const data = await api.uploadPhotoChatAsset(file);
     return { assetId: data.asset_id || data.id, url: toAbsoluteMediaUrl(data.file_url || data.url) };
   };
 
   const importUrlAsAsset = async (url: string): Promise<{ assetId?: number; url?: string }> => {
-    const res = await fetch(`${API_BASE}/api/photo/assets/import`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ source_url: url }),
-    });
-    if (!res.ok) throw new Error('Import failed');
-    const data = await res.json();
+    const data = await api.importPhotoChatAsset(url);
     return { assetId: data.asset_id || data.id, url: toAbsoluteMediaUrl(data.file_url || data.url) };
   };
 
@@ -724,15 +699,7 @@ export default function PhotoStudioPage() {
       if (fallbackPhotoUrls.length > 0) body.photo_urls = fallbackPhotoUrls;
       if (quickAction) body.quick_action = quickAction;
 
-      const res = await fetch(`${API_BASE}/api/photo/chat/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
+      const res = await api.streamPhotoChat(body);
 
       const reader = res.body?.getReader();
       const dec = new TextDecoder();
@@ -926,20 +893,15 @@ export default function PhotoStudioPage() {
     if (!file) return;
     setGalleryUploading(true);
     try {
-      const fd = new FormData();
-      fd.append('file', file);
-      fd.append('asset_type', galleryType);
-      fd.append('name', file.name.replace(/\.[^.]+$/, '') || 'Sample');
-      const res = await fetch(`${API_BASE}/photo-assets/user/upload`, {
-        method: 'POST',
-        headers: authHeaders(),
-        body: fd,
+      await api.uploadUserPhotoAsset(file, {
+        assetType: galleryType,
+        name: file.name.replace(/\.[^.]+$/, '') || 'Sample',
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await loadGalleryAssets(galleryType);
+      toast.success('Образец добавлен в галерею');
     } catch (err) {
       console.error('Gallery upload error:', err);
-      alert('Не удалось загрузить образец');
+      toast.error(err instanceof Error ? err.message : 'Не удалось загрузить образец');
     } finally {
       setGalleryUploading(false);
       e.target.value = '';
@@ -1076,15 +1038,13 @@ export default function PhotoStudioPage() {
   };
 
   const clearChat = async () => {
-    if (!confirm('Очистить всю историю чата?')) return;
     try {
-      await fetch(`${API_BASE}/api/photo/chat/clear`, {
-        method: 'POST',
-        headers: authHeaders(),
-      });
+      await api.clearPhotoChat();
       setMessages([WELCOME_MSG]);
+      toast.success('История чата очищена');
     } catch (e) {
       console.error('Clear chat error', e);
+      toast.error('Не удалось очистить историю чата');
     }
   };
 
@@ -1097,13 +1057,10 @@ export default function PhotoStudioPage() {
       .filter((id): id is number => id !== null);
     if (dbIds.length > 0) {
       try {
-        await fetch(`${API_BASE}/api/photo/chat/messages/delete`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeaders() },
-          body: JSON.stringify({ message_ids: dbIds }),
-        });
+        await api.deletePhotoChatMessages(dbIds);
       } catch (e) {
         console.error('Delete messages error', e);
+        toast.error('Не удалось удалить выбранные сообщения');
       }
     }
     setMessages((prev) => prev.filter((m) => !ids.has(m.id)));
@@ -1120,37 +1077,29 @@ export default function PhotoStudioPage() {
   const addPhotoToGallery = async (photo: PhotoMedia, assetType: 'scene' | 'model') => {
     setGalleryAdding(true);
     try {
-      // Import the image URL as a gallery asset
-      const res = await fetch(`${API_BASE}/photo-assets/user/import`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({
-          source_url: photo.url,
-          asset_type: assetType,
-          name: photo.prompt || photo.fileName || 'Generated',
-          prompt: photo.prompt || '',
-        }),
+      await api.importUserPhotoAssetFromUrl({
+        source_url: photo.url,
+        asset_type: assetType,
+        name: photo.prompt || photo.fileName || 'Generated',
+        prompt: photo.prompt || '',
       });
-      if (!res.ok) {
+      setGalleryAddPhoto(null);
+      toast.success(`Добавлено в ${assetType === 'scene' ? 'Локации' : 'Модели'}`);
+    } catch (e) {
+      try {
         // Fallback: download and upload as file
         const imgRes = await fetch(photo.url, { mode: 'cors' });
         const blob = await imgRes.blob();
-        const fd = new FormData();
-        fd.append('file', blob, photo.fileName || 'image.png');
-        fd.append('asset_type', assetType);
-        fd.append('name', photo.prompt || 'Generated');
-        const uploadRes = await fetch(`${API_BASE}/photo-assets/user/upload`, {
-          method: 'POST',
-          headers: authHeaders(),
-          body: fd,
+        await api.uploadUserPhotoAsset(new File([blob], photo.fileName || 'image.png', { type: blob.type || 'image/png' }), {
+          assetType,
+          name: photo.prompt || 'Generated',
         });
-        if (!uploadRes.ok) throw new Error('Upload failed');
+        setGalleryAddPhoto(null);
+        toast.success(`Добавлено в ${assetType === 'scene' ? 'Локации' : 'Модели'}`);
+      } catch (fallbackError) {
+        console.error('Gallery add error:', e, fallbackError);
+        toast.error('Не удалось добавить в галерею');
       }
-      setGalleryAddPhoto(null);
-      alert(`Добавлено в ${assetType === 'scene' ? 'Локации' : 'Модели'}`);
-    } catch (e) {
-      console.error('Gallery add error:', e);
-      alert('Не удалось добавить в галерею');
     } finally {
       setGalleryAdding(false);
     }
@@ -1159,7 +1108,7 @@ export default function PhotoStudioPage() {
   // Card photo management
   const handleCardPhotoDelete = (index: number) => {
     if (selectedProductPhotos.length <= 1) {
-      alert('Нельзя удалить последнее фото карточки');
+      toast.error('Нельзя удалить последнее фото карточки');
       return;
     }
     setSelectedProductPhotos((prev) => {
@@ -1197,7 +1146,7 @@ export default function PhotoStudioPage() {
       setCardPhotosDirty(true);
     } catch (err) {
       console.error('Card photo upload error:', err);
-      alert('Не удалось загрузить фото');
+      toast.error(err instanceof Error ? err.message : 'Не удалось загрузить фото');
     }
   };
 
@@ -1217,9 +1166,10 @@ export default function PhotoStudioPage() {
       setCardPhotosOriginal(nextPhotos);
       setCardPhotosDirty(false);
       await loadProducts();
+      toast.success('Фото карточки сохранены');
     } catch (err) {
       console.error('Save card photos error:', err);
-      alert('Не удалось сохранить изменения');
+      toast.error(err instanceof Error ? err.message : 'Не удалось сохранить изменения');
     } finally {
       setCardPhotosSaving(false);
     }
@@ -1363,7 +1313,7 @@ export default function PhotoStudioPage() {
 
     if (genTab === 'own-model') {
       if (!genGarmentPhoto || !genModelPhoto) {
-        alert('Перетащите 2 фото: изделие + фотомодель');
+        toast.error('Перетащите 2 фото: изделие + фотомодель');
         return;
       }
       photos = [genGarmentPhoto, genModelPhoto];
@@ -1371,7 +1321,7 @@ export default function PhotoStudioPage() {
       text = 'Нормализация: своя фотомодель';
     } else if (genTab === 'new-model') {
       if (!genGarmentPhoto) {
-        alert('Загрузите фото изделия');
+        toast.error('Загрузите фото изделия');
         return;
       }
       const modelOpt = catalogModels[0];
@@ -1384,7 +1334,7 @@ export default function PhotoStudioPage() {
       text = `На новую модель: ${genNewModelPrompt || 'авто'}`;
     } else if (genTab === 'custom-prompt') {
       if (!genCustomPrompt.trim()) {
-        alert('Введите промпт');
+        toast.error('Введите промпт');
         return;
       }
       if (genSourcePhoto) photos = [genSourcePhoto];
@@ -1394,11 +1344,11 @@ export default function PhotoStudioPage() {
       text = genCustomPrompt;
     } else if (genTab === 'scenes') {
       if (!genSourcePhoto) {
-        alert('Выберите исходное фото');
+        toast.error('Выберите исходное фото');
         return;
       }
       if (!genSelectedScene) {
-        alert('Выберите сцену');
+        toast.error('Выберите сцену');
         return;
       }
       photos = [genSourcePhoto];
@@ -1406,11 +1356,11 @@ export default function PhotoStudioPage() {
       text = `Сцена: ${genSelectedScene.label}`;
     } else if (genTab === 'poses') {
       if (!genSourcePhoto) {
-        alert('Выберите исходное фото');
+        toast.error('Выберите исходное фото');
         return;
       }
       if (!genSelectedPose) {
-        alert('Выберите позу');
+        toast.error('Выберите позу');
         return;
       }
       photos = [genSourcePhoto];
@@ -1418,7 +1368,7 @@ export default function PhotoStudioPage() {
       text = `Поза: ${genSelectedPose.label}`;
     } else if (genTab === 'video') {
       if (!genSourcePhoto) {
-        alert('Выберите исходное фото');
+        toast.error('Выберите исходное фото');
         return;
       }
       photos = [genSourcePhoto];

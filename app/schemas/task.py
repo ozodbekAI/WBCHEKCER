@@ -1,11 +1,13 @@
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 # === Task Schemas ===
 
 class TaskOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     store_id: int
     status: str
@@ -22,10 +24,6 @@ class TaskOut(BaseModel):
     completed_at: Optional[datetime] = None
     created_at: datetime
     
-    class Config:
-        from_attributes = True
-
-
 class TaskCreate(BaseModel):
     task_type: str  # full_analysis, quick_analysis, sync_cards
 

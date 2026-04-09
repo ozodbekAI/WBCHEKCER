@@ -7,6 +7,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from ..core.database import Base
+from app.core.time import utc_now
 
 
 class ApprovalStatus(str, enum.Enum):
@@ -48,7 +49,7 @@ class CardApproval(Base):
     # Reviewer's comment
     reviewer_comment = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     reviewed_at = Column(DateTime, nullable=True)
     applied_at = Column(DateTime, nullable=True)
 

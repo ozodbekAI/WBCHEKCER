@@ -8,7 +8,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from .core.config import settings
+from .core.database import async_engine
+from .models import StoreApiKey
 from .services.card_scheduler import card_scheduler
+from .services.task_service import recover_incomplete_tasks
 from .routers import (
     auth_router,
     stores_router,
@@ -27,13 +30,36 @@ from .routers import (
     sku_economics_router,
 )
 
+DEV_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+]
+
+
+def _get_cors_origins() -> list[str]:
+    configured = [origin for origin in settings.CORS_ALLOWED_ORIGINS if origin]
+    if configured:
+        return configured
+    if settings.DEBUG:
+        return DEV_CORS_ORIGINS
+    return []
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background schedulers on startup, stop on shutdown."""
-    card_scheduler.start_background()
+    scheduler_started = False
+    async with async_engine.begin() as conn:
+        await conn.run_sync(StoreApiKey.__table__.create, checkfirst=True)
+    await recover_incomplete_tasks()
+    if settings.CARD_SCHEDULER_ENABLED:
+        card_scheduler.start_background()
+        scheduler_started = True
     yield
-    card_scheduler.stop()
+    if scheduler_started:
+        card_scheduler.stop()
 
 
 app = FastAPI(
@@ -48,7 +74,7 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
+    allow_origins=_get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -86,6 +112,7 @@ async def health_check():
     return {
         "status": "healthy",
         "scheduler": {
+            "enabled": settings.CARD_SCHEDULER_ENABLED,
             "is_running": scheduler_status["is_running"],
             "last_tick": scheduler_status["last_tick_at"],
             "next_tick_in": scheduler_status["next_tick_in_sec"],

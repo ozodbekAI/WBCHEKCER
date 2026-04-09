@@ -18,6 +18,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.time import utc_now
 from app.models import (
     Card,
     CardIssue,
@@ -46,6 +47,7 @@ from app.schemas.sku_economics import (
     AdAnalysisUploadUnresolvedRowOut,
 )
 from app.services.wb_advert_repository import WBAdvertRepository
+from app.services.wb_token_access import get_store_feature_api_key
 
 
 _UNRESOLVED_ISSUE_STATUSES = {
@@ -417,7 +419,6 @@ class SkuEconomicsService:
                 store,
                 requested_period_start=requested_start,
                 requested_period_end=requested_end,
-                available_start=available_start,
             )
             available_start, available_end = await self._get_available_period(db, store.id)
             requested_start, requested_end, selected_preset = self._resolve_requested_period(
@@ -579,14 +580,10 @@ class SkuEconomicsService:
         *,
         requested_period_start: date,
         requested_period_end: date,
-        available_start: Optional[date],
     ) -> None:
         today = date.today()
         history_floor = today - timedelta(days=self.HISTORY_LOOKBACK_DAYS - 1)
-        if available_start:
-            refresh_start = max(min(requested_period_start, available_start), history_floor)
-        else:
-            refresh_start = history_floor
+        refresh_start = max(requested_period_start, history_floor)
         refresh_end = max(min(requested_period_end, today), refresh_start)
 
         existing_result = await db.execute(
@@ -701,7 +698,7 @@ class SkuEconomicsService:
         )
         self.invalidate_cache(store.id)
 
-        synced_at = datetime.utcnow()
+        synced_at = utc_now()
         for (metric_date, nm_id), bucket in sorted(buckets.items(), key=lambda item: (item[0][0], item[0][1])):
             if int(nm_id) > 0 and int(nm_id) in card_meta:
                 title, vendor_code = card_meta[int(nm_id)]
@@ -1820,7 +1817,7 @@ class SkuEconomicsService:
 
         previous_overview = AdAnalysisOverviewOut(
             store_id=int(store.id),
-            generated_at=previous_data.get("generated_at") or datetime.utcnow(),
+            generated_at=previous_data.get("generated_at") or utc_now(),
             snapshot_ready=True,
             period_start=previous_period_start,
             period_end=previous_period_end,
@@ -1833,7 +1830,7 @@ class SkuEconomicsService:
 
         overview = AdAnalysisOverviewOut(
             store_id=int(store.id),
-            generated_at=current_data.get("generated_at") or datetime.utcnow(),
+            generated_at=current_data.get("generated_at") or utc_now(),
             snapshot_ready=bool(all_items),
             period_start=period_start,
             period_end=period_end,
@@ -2078,7 +2075,7 @@ class SkuEconomicsService:
 
         return AdAnalysisOverviewOut(
             store_id=int(store_id),
-            generated_at=datetime.utcnow(),
+            generated_at=utc_now(),
             snapshot_ready=False,
             period_start=period_start,
             period_end=period_end,
@@ -2425,7 +2422,7 @@ class SkuEconomicsService:
 
         overview = AdAnalysisOverviewOut(
             store_id=int(store.id),
-            generated_at=datetime.utcnow(),
+            generated_at=utc_now(),
             snapshot_ready=True,
             period_start=period_start,
             period_end=period_end,
@@ -3250,8 +3247,10 @@ class SkuEconomicsService:
         )
 
     def _candidate_tokens(self, store: Store, *, prefer_advert: bool) -> List[str]:
+        feature_token = str(get_store_feature_api_key(store, "ad_analysis") or "").strip()
         preferred = [
-            settings.WB_ADVERT_API_KEY if prefer_advert else store.api_key,
+            feature_token,
+            settings.WB_ADVERT_API_KEY if prefer_advert else None,
             store.api_key,
             settings.WB_API_KEY,
             settings.WB_ADVERT_API_KEY,

@@ -11,10 +11,11 @@ import {
   MessageCircle, TrendingUp, Activity, ChevronDown, Settings, Clock,
   ChevronRight, AlertTriangle, CheckCircle2, Info, SlidersHorizontal,
   Sparkles, X, Check, Users, ClipboardCheck, Shield, LogOut, User,
-  Crown, Briefcase, Eye, Wrench, Zap, FileCheck,
+  Crown, Briefcase, Eye, Wrench, Zap, FileCheck, KeyRound,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { toast } from 'sonner';
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from '@/components/ui/dialog';
@@ -22,6 +23,8 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { getStoreFeatureMessage, isStoreFeatureAllowed, type StoreFeatureKey } from '../lib/storeAccess';
+import StoreKeyUpdateDialog from '../components/StoreKeyUpdateDialog';
 
 export default function WorkspacePage() {
   const navigate = useNavigate();
@@ -35,6 +38,8 @@ export default function WorkspacePage() {
   const [workMode, setWorkMode] = useState<'guided' | 'advanced'>('guided');
   const [startTarget, setStartTarget] = useState<'critical' | 'incoming' | 'cards' | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [keyDialogOpen, setKeyDialogOpen] = useState(false);
+  const [keyDialogFeature, setKeyDialogFeature] = useState<StoreFeatureKey | null>(null);
   const { todayStats, isActive, currentSessionTimeMs, logAction: doLogAction } = useWorkTracker();
   const [teamActivity, setTeamActivity] = useState<TeamActivity | null>(null);
   const [myPendingCount, setMyPendingCount] = useState(0);
@@ -93,6 +98,7 @@ export default function WorkspacePage() {
   };
 
   const canConnectStore = isRole('owner');
+  const canManageStoreKey = isRole('owner', 'admin');
 
   if (!activeStore && !loading && stores.length === 0) {
     return (
@@ -124,7 +130,27 @@ export default function WorkspacePage() {
   const criticalCount = stats?.critical_issues || 0;
   const warningsCount = stats?.warnings_count || 0;
 
+  const handleBlockedFeature = (featureKey: StoreFeatureKey) => {
+    toast.error(getStoreFeatureMessage(activeStore, featureKey));
+    if (canManageStoreKey) {
+      setKeyDialogFeature(featureKey);
+      setKeyDialogOpen(true);
+    }
+  };
+
+  const openFeature = (path: string, featureKey?: StoreFeatureKey) => {
+    if (featureKey && !isStoreFeatureAllowed(activeStore, featureKey)) {
+      handleBlockedFeature(featureKey);
+      return;
+    }
+    navigate(path);
+  };
+
   const openModeModal = (target: 'critical' | 'incoming' | 'cards') => {
+    if (!isStoreFeatureAllowed(activeStore, 'cards')) {
+      handleBlockedFeature('cards');
+      return;
+    }
     doLogAction('card_opened', `Открыт раздел: ${target}`);
     if (target === 'critical') { navigate('/workspace/fix/critical'); return; }
     if (target === 'incoming') { navigate('/workspace/incoming'); return; }
@@ -180,12 +206,20 @@ export default function WorkspacePage() {
                   </div>
                 </DropdownMenuItem>
               ))}
-              {canConnectStore && (
+              {(canManageStoreKey || canConnectStore) && (
                 <>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={() => navigate('/onboard')} className="text-primary font-medium">
-                    + Добавить магазин
-                  </DropdownMenuItem>
+                  {activeStore && canManageStoreKey && (
+                    <DropdownMenuItem onClick={() => setKeyDialogOpen(true)} className="gap-2">
+                      <KeyRound size={14} />
+                      Настройки WB-ключей
+                    </DropdownMenuItem>
+                  )}
+                  {canConnectStore && (
+                    <DropdownMenuItem onClick={() => navigate('/onboard')} className="text-primary font-medium">
+                      + Добавить магазин
+                    </DropdownMenuItem>
+                  )}
                 </>
               )}
             </DropdownMenuContent>
@@ -356,13 +390,16 @@ export default function WorkspacePage() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-7">
           <ToolItem icon={<FlaskConical size={20} />} name="A/B тесты" desc="Эксперименты с контентом"
             badge={dashboard.active_tests > 0 ? `${dashboard.active_tests} активных` : undefined}
-            onClick={() => navigate('/ab-tests')} />
+            storeFeature="ab_tests"
+            onClick={() => openFeature('/ab-tests', 'ab_tests')} />
           <ToolItem icon={<Camera size={20} />} name="Фотостудия" desc="Генерация и улучшение фото"
-            onClick={() => navigate('/photo-studio')} />
+            storeFeature="photo_studio"
+            onClick={() => openFeature('/photo-studio', 'photo_studio')} />
           <ToolItem icon={<MessageCircle size={20} />} name="Отзывы и вопросы" desc="Работа с обратной связью"
             badge={`${Math.max(warningsCount, 4)} новых`} />
           <ToolItem icon={<TrendingUp size={20} />} name="Анализ рекламы" desc="Оценка эффективности РК"
-            onClick={() => navigate('/workspace/ad-analysis')} />
+            storeFeature="ad_analysis"
+            onClick={() => openFeature('/workspace/ad-analysis', 'ad_analysis')} />
         </div>
 
         {/* ═══════════ Team Summary (compact) ═══════════ */}
@@ -461,6 +498,16 @@ export default function WorkspacePage() {
         </DialogContent>
       </Dialog>
 
+      <StoreKeyUpdateDialog
+        open={keyDialogOpen}
+        onOpenChange={(open) => {
+          setKeyDialogOpen(open);
+          if (!open) setKeyDialogFeature(null);
+        }}
+        store={activeStore}
+        featureKey={keyDialogFeature}
+      />
+
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
@@ -503,7 +550,7 @@ function TaskCard({ borderHover, iconBg, icon, stats, title, desc, btnVariant, b
   );
 }
 
-function ToolItem({ icon, iconClassName, name, desc, badge, badgeClassName, onClick }: {
+function ToolItem({ icon, iconClassName, name, desc, badge, badgeClassName, onClick, storeFeature }: {
   icon: React.ReactNode;
   iconClassName?: string;
   name: string;
@@ -511,11 +558,17 @@ function ToolItem({ icon, iconClassName, name, desc, badge, badgeClassName, onCl
   badge?: string;
   badgeClassName?: string;
   onClick?: () => void;
+  storeFeature?: StoreFeatureKey;
 }) {
+  const { activeStore } = useStore();
+  const blocked = storeFeature ? !isStoreFeatureAllowed(activeStore, storeFeature) : false;
+  const deniedMessage = storeFeature ? getStoreFeatureMessage(activeStore, storeFeature) : '';
+
   return (
     <div
-      className="flex items-center gap-3.5 bg-card border border-border rounded-xl px-5 py-4 cursor-pointer transition-all hover:shadow-sm hover:border-muted-foreground/30"
+      className={`flex items-center gap-3.5 bg-card border border-border rounded-xl px-5 py-4 cursor-pointer transition-all hover:shadow-sm hover:border-muted-foreground/30 ${blocked ? 'opacity-70' : ''}`}
       onClick={onClick}
+      title={blocked ? deniedMessage : undefined}
     >
       <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${iconClassName || 'bg-muted text-muted-foreground'}`}>
         {icon}
@@ -526,6 +579,11 @@ function ToolItem({ icon, iconClassName, name, desc, badge, badgeClassName, onCl
           {badge && (
             <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-lg ${badgeClassName || 'bg-primary/10 text-primary'}`}>
               {badge}
+            </span>
+          )}
+          {blocked && (
+            <span className="text-[11px] font-semibold px-2 py-0.5 rounded-lg bg-amber-100 text-amber-800">
+              Нет доступа
             </span>
           )}
         </div>

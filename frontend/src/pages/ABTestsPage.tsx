@@ -19,6 +19,8 @@ import {
   Image as ImageIcon,
   Info,
   Package,
+  PauseCircle,
+  Play,
   Plus,
   Rocket,
   Search,
@@ -31,9 +33,20 @@ import {
   XCircle,
   Zap,
 } from 'lucide-react';
+import { toast } from 'sonner';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import '../styles/index.css';
 
-type FilterTab = 'all' | 'running' | 'completed';
+type FilterTab = 'all' | 'running' | 'completed' | 'issues';
 
 interface ListItem {
   id_company: number;
@@ -46,6 +59,8 @@ interface ListItem {
   photos_count?: number;
   current_photo_order?: number;
   last_error?: string;
+  can_start?: boolean;
+  can_stop?: boolean;
   photos?: Array<{ order: number; file_url: string; wb_url?: string | null }>;
 }
 
@@ -71,7 +86,7 @@ interface WbCardOption {
   photos: string[];
 }
 
-const API_BASE = API_ORIGIN;
+const MEDIA_BASE = API_ORIGIN;
 const MIN_SLOTS = 5;
 
 const WIZARD_STEPS = [
@@ -85,24 +100,6 @@ const WIZARD_STEPS = [
   { id: 'summary', title: 'Сводка и запуск' },
 ] as const;
 
-function authHeaders(): Record<string, string> {
-  const token = localStorage.getItem('access_token');
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...opts,
-    headers: { 'Content-Type': 'application/json', ...authHeaders(), ...opts?.headers },
-  });
-  if (!res.ok) {
-    const e = await res.json().catch(() => ({ detail: `Error ${res.status}` }));
-    throw new Error(e.detail || `Error ${res.status}`);
-  }
-  const text = await res.text();
-  return text ? JSON.parse(text) : (null as unknown as T);
-}
-
 function uid() {
   return Math.random().toString(16).slice(2) + Date.now().toString(16);
 }
@@ -111,6 +108,7 @@ function normalizeStatus(raw?: string) {
   const s = (raw || '').toLowerCase();
   if (s.includes('running')) return 'running';
   if (s.includes('finished') || s.includes('completed')) return 'finished';
+  if (s.includes('stopped')) return 'stopped';
   if (s.includes('failed')) return 'failed';
   return 'pending';
 }
@@ -119,8 +117,15 @@ function statusLabel(raw?: string) {
   const s = normalizeStatus(raw);
   if (s === 'running') return 'Запущен';
   if (s === 'finished') return 'Завершён';
+  if (s === 'stopped') return 'Остановлен';
   if (s === 'failed') return 'Ошибка';
   return 'Ожидает';
+}
+
+function isAttentionItem(item: ListItem) {
+  const s = normalizeStatus(item.status);
+  if (s === 'failed' || s === 'stopped') return true;
+  return s === 'pending' && Boolean((item.last_error || '').trim());
 }
 
 function formatRub(n: number) {
@@ -132,8 +137,8 @@ function normalizeAssetUrl(url?: string | null) {
   if (!raw) return '';
   if (raw.startsWith('//')) return `https:${raw}`;
   if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
-  if (raw.startsWith('/')) return `${API_BASE}${raw}`;
-  return `${API_BASE}/${raw}`;
+  if (raw.startsWith('/')) return `${MEDIA_BASE}${raw}`;
+  return `${MEDIA_BASE}/${raw}`;
 }
 
 function fileNameFromUrl(url: string) {
@@ -157,8 +162,10 @@ export const ABTestsPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [items, setItems] = useState<ListItem[]>([]);
+  const [actionCompanyId, setActionCompanyId] = useState<number | null>(null);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [pickedThumb, setPickedThumb] = useState<Record<number, number>>({});
+  const [stopTarget, setStopTarget] = useState<ListItem | null>(null);
 
   const [stepIdx, setStepIdx] = useState(0);
   const [selectedNmId, setSelectedNmId] = useState<number | null>(null);
@@ -197,8 +204,10 @@ export const ABTestsPage: React.FC = () => {
   }, [activeStore, loadStores]);
 
   useEffect(() => {
-    void loadTests();
-  }, []);
+    if (activeStore) {
+      void loadTests();
+    }
+  }, [activeStore]);
 
   useEffect(() => {
     if (view !== 'wizard') return;
@@ -213,24 +222,38 @@ export const ABTestsPage: React.FC = () => {
     if (view === 'wizard' && WIZARD_STEPS[stepIdx]?.id === 'payment') {
       void loadBalance();
     }
-  }, [view, stepIdx]);
+  }, [view, stepIdx, activeStore]);
 
   const loadTests = async (refreshOnly = false) => {
     if (refreshOnly) setRefreshing(true);
     else setLoading(true);
 
     try {
-      const [running, pending, finished] = await Promise.all([
-        apiFetch<any>('/promotion/running?page=1&page_size=50').catch(() => ({ items: [] })),
-        apiFetch<any>('/promotion/pending?page=1&page_size=50').catch(() => ({ items: [] })),
-        apiFetch<any>('/promotion/finished?page=1&page_size=50').catch(() => ({ items: [] })),
+      if (!activeStore) {
+        setItems([]);
+        return;
+      }
+      const [running, pending, finished, failed] = await Promise.all([
+        api.getPromotionList(activeStore.id, 'running', { page: 1, page_size: 50 }).catch(() => ({ items: [] })),
+        api.getPromotionList(activeStore.id, 'pending', { page: 1, page_size: 50 }).catch(() => ({ items: [] })),
+        api.getPromotionList(activeStore.id, 'finished', { page: 1, page_size: 50 }).catch(() => ({ items: [] })),
+        api.getPromotionList(activeStore.id, 'failed', { page: 1, page_size: 50 }).catch(() => ({ items: [] })),
       ]);
 
-      const merged = [
+      const mergedRaw = [
         ...(running?.items || []),
         ...(pending?.items || []),
         ...(finished?.items || []),
-      ].sort((a: any, b: any) => {
+        ...(failed?.items || []),
+      ];
+      const merged = Array.from(
+        new Map(
+          mergedRaw.map((item: any) => {
+            const key = Number(item?.id_company || item?.company_id || 0);
+            return [key, item];
+          }),
+        ).values(),
+      ).sort((a: any, b: any) => {
         const aid = Number(a.id_company || a.company_id || 0);
         const bid = Number(b.id_company || b.company_id || 0);
         return bid - aid;
@@ -291,7 +314,11 @@ export const ABTestsPage: React.FC = () => {
 
   const loadBalance = async () => {
     try {
-      const b = await apiFetch<any>('/promotion/balance');
+      if (!activeStore) {
+        setBalance(null);
+        return;
+      }
+      const b = await api.getPromotionBalance(activeStore.id);
       if (typeof b === 'number') {
         setBalance({ balance: b, promo_bonus_rub: 0 });
       } else {
@@ -361,6 +388,7 @@ export const ABTestsPage: React.FC = () => {
     () => ({
       running: items.filter((x) => normalizeStatus(x.status) === 'running').length,
       finished: items.filter((x) => normalizeStatus(x.status) === 'finished').length,
+      issues: items.filter((x) => isAttentionItem(x)).length,
       total: items.length,
     }),
     [items],
@@ -371,8 +399,52 @@ export const ABTestsPage: React.FC = () => {
     if (activeTab === 'running') {
       return items.filter((x) => normalizeStatus(x.status) === 'running');
     }
-    return items.filter((x) => normalizeStatus(x.status) === 'finished');
+    if (activeTab === 'completed') {
+      return items.filter((x) => normalizeStatus(x.status) === 'finished');
+    }
+    return items.filter((x) => isAttentionItem(x));
   }, [items, activeTab]);
+
+  const handleStartNow = async (item: ListItem) => {
+    const companyId = Number(item.id_company || item.company_id || 0);
+    if (!companyId || !activeStore) return;
+    setActionCompanyId(companyId);
+    try {
+      const res = await api.startPromotionCompany(activeStore.id, companyId);
+      if (res?.started || res?.status === 'running') {
+        toast.success('Тест запущен');
+      } else if (res?.status === 'waiting_balance') {
+        toast.message('WB пока не видит бюджет кампании. Автозапуск включён, система попробует ещё раз сама.');
+      } else {
+        toast.error(res?.error || 'Не удалось запустить тест');
+      }
+      await loadTests(true);
+    } catch (e: any) {
+      toast.error(e?.message || 'Не удалось запустить тест');
+    } finally {
+      setActionCompanyId(null);
+    }
+  };
+
+  const handleStopNow = async (item: ListItem) => {
+    const companyId = Number(item.id_company || item.company_id || 0);
+    if (!companyId || !activeStore) return;
+    setActionCompanyId(companyId);
+    try {
+      const res = await api.stopPromotionCompany(activeStore.id, companyId);
+      if (res?.error) {
+        toast.warning(`Тест остановлен, но есть замечание: ${res.error}`);
+      } else {
+        toast.success('Тест остановлен, исходное главное фото восстановлено');
+      }
+      await loadTests(true);
+    } catch (e: any) {
+      toast.error(e?.message || 'Не удалось остановить тест');
+    } finally {
+      setActionCompanyId(null);
+      setStopTarget(null);
+    }
+  };
 
   const canProceed = useMemo(() => {
     const step = WIZARD_STEPS[stepIdx];
@@ -409,20 +481,11 @@ export const ABTestsPage: React.FC = () => {
   };
 
   const handleUploadSlot = async (slot: number, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    fd.append('asset_type', 'custom');
-    fd.append('name', file.name || `Slot ${slot}`);
-
     try {
-      const res = await fetch(`${API_BASE}/photo-assets/user/upload`, {
-        method: 'POST',
-        headers: authHeaders(),
-        body: fd,
+      const data = await api.uploadUserPhotoAsset(file, {
+        assetType: 'custom',
+        name: file.name || `Slot ${slot}`,
       });
-      if (!res.ok) throw new Error('upload error');
-
-      const data = await res.json();
       const resolvedUrl = normalizeAssetUrl(data.file_url || data.url || data.image_url);
       if (!resolvedUrl) throw new Error('upload returned empty URL');
 
@@ -439,8 +502,7 @@ export const ABTestsPage: React.FC = () => {
 
       setSlots((s) => Math.max(s, slot));
     } catch (e) {
-      console.error(e);
-      alert('Ошибка загрузки фото');
+      toast.error(e instanceof Error ? e.message : 'Ошибка загрузки фото');
     }
   };
 
@@ -454,7 +516,7 @@ export const ABTestsPage: React.FC = () => {
 
   const handlePickFromCard = (slot: number) => {
     if (selectedCardPhotos.length === 0) {
-      alert('У карточки нет фото для выбора');
+      toast.error('У карточки нет фото для выбора');
       return;
     }
     setPickSlot(slot);
@@ -505,7 +567,7 @@ export const ABTestsPage: React.FC = () => {
   };
 
   const submit = async () => {
-    if (!selectedNmId || submitting || totalVariants < 2) return;
+    if (!selectedNmId || submitting || totalVariants < 2 || !activeStore) return;
 
     setSubmitting(true);
     try {
@@ -546,39 +608,40 @@ export const ABTestsPage: React.FC = () => {
         photos: payloadPhotos,
       };
 
-      const created: any = await apiFetch('/promotion/create_company', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
+      const created: any = await api.createPromotionCompany(activeStore.id, payload);
 
       const companyId = created?.id_company ?? created?.company_id;
       if (!companyId) throw new Error('Не вернулся id компании');
 
-      await apiFetch('/promotion/update', {
-        method: 'POST',
-        body: JSON.stringify({
-          id_company: companyId,
-          company_id: companyId,
-          nm_id: selectedNmId,
-          card_id: selectedNmId,
-          title: finalTitle,
-          from_main: includeMain,
-          max_slots: totalSlots,
-          photos_count: totalSlots,
-          keep_winner_as_main: autoApplyWinner,
-          delete_test_photos: deleteTestPhotos,
-          use_promo_bonus: usePromoBonus,
-          views_per_photo: viewsPerPhoto,
-          cpm,
-          spend_rub: estimatedSpend,
-          photos: payloadPhotos,
-          payment_source: paymentSource,
-        }),
+      const started: any = await api.updatePromotionCompany(activeStore.id, {
+        id_company: companyId,
+        company_id: companyId,
+        nm_id: selectedNmId,
+        card_id: selectedNmId,
+        title: finalTitle,
+        from_main: includeMain,
+        max_slots: totalSlots,
+        photos_count: totalSlots,
+        keep_winner_as_main: autoApplyWinner,
+        delete_test_photos: deleteTestPhotos,
+        use_promo_bonus: usePromoBonus,
+        views_per_photo: viewsPerPhoto,
+        cpm,
+        spend_rub: estimatedSpend,
+        photos: payloadPhotos,
+        payment_source: paymentSource,
       });
 
+      if (started?.status === 'running' || started?.started) {
+        toast.success('A/B тест запущен');
+      } else if (started?.status === 'waiting_balance') {
+        toast.message('Тест поставлен в ожидание бюджета. Как только WB увидит пополнение, система попробует стартовать его сама.');
+      } else if (started?.status === 'failed') {
+        toast.error(started?.error || 'Тест создан, но старт завершился ошибкой');
+      }
       closeWizard();
     } catch (e: any) {
-      alert(e?.message || 'Ошибка создания теста');
+      toast.error(e?.message || 'Ошибка создания теста');
     } finally {
       setSubmitting(false);
     }
@@ -1096,6 +1159,7 @@ export const ABTestsPage: React.FC = () => {
           <div className="abt-hero-stats">
             <div className="abt-mini-stat"><b>{stats.running}</b><span>Активных</span></div>
             <div className="abt-mini-stat"><b>{stats.finished}</b><span>Завершено</span></div>
+            <div className="abt-mini-stat"><b>{stats.issues}</b><span>Требуют внимания</span></div>
           </div>
         </section>
 
@@ -1108,6 +1172,9 @@ export const ABTestsPage: React.FC = () => {
           </button>
           <button className={`abt-tab ${activeTab === 'completed' ? 'active' : ''}`} onClick={() => setActiveTab('completed')}>
             <CheckCircle2 size={12} /> Завершённые ({stats.finished})
+          </button>
+          <button className={`abt-tab ${activeTab === 'issues' ? 'active' : ''}`} onClick={() => setActiveTab('issues')}>
+            <AlertTriangle size={12} /> Ошибки и стоп ({stats.issues})
           </button>
         </div>
 
@@ -1197,9 +1264,10 @@ export const ABTestsPage: React.FC = () => {
                       </div>
                     </div>
 
-                    <div className={`abt-state-pill abt-state-pill--${status}`}>
+                      <div className={`abt-state-pill abt-state-pill--${status}`}>
                       {status === 'running' ? <CircleDot size={11} /> : null}
                       {status === 'finished' ? <CheckCircle2 size={11} /> : null}
+                      {status === 'stopped' ? <PauseCircle size={11} /> : null}
                       {status === 'failed' ? <XCircle size={11} /> : null}
                       {status === 'pending' ? <AlertCircle size={11} /> : null}
                       {statusLabel(item.status)}
@@ -1214,6 +1282,40 @@ export const ABTestsPage: React.FC = () => {
                     <div className="abt-item-details">
                       {item.current_photo_order != null ? <p>Текущее фото: <strong>#{item.current_photo_order}</strong></p> : null}
                       {item.last_error ? <p className="abt-error">Ошибка: {item.last_error}</p> : null}
+                      {normalizeStatus(item.status) === 'pending' && item.last_error ? (
+                        <p className="text-sm text-slate-500">Автозапуск включён. Система будет повторять запуск сама, когда WB увидит бюджет кампании.</p>
+                      ) : null}
+
+                      {(item.can_start || item.can_stop || isAttentionItem(item)) ? (
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 12 }}>
+                          {(item.can_start || isAttentionItem(item)) && normalizeStatus(item.status) !== 'running' ? (
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleStartNow(item);
+                              }}
+                              disabled={actionCompanyId === key}
+                            >
+                              <Play size={13} />
+                              {actionCompanyId === key ? 'Запуск...' : 'Запустить'}
+                            </button>
+                          ) : null}
+                          {(item.can_stop || normalizeStatus(item.status) === 'running') ? (
+                            <button
+                              className="btn btn-danger btn-sm"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setStopTarget(item);
+                              }}
+                              disabled={actionCompanyId === key}
+                            >
+                              <PauseCircle size={13} />
+                              {actionCompanyId === key ? 'Остановка...' : 'Остановить тест'}
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : null}
 
                       {item.photos && item.photos.length > 0 ? (
                         <div className="abt-item-photos">
@@ -1233,6 +1335,29 @@ export const ABTestsPage: React.FC = () => {
           )}
         </div>
       </div>
+
+      <AlertDialog open={!!stopTarget} onOpenChange={(open) => { if (!open) setStopTarget(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Остановить тест?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Система остановит кампанию и попытается вернуть исходное главное фото карточки.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Отмена</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (stopTarget) {
+                  void handleStopNow(stopTarget);
+                }
+              }}
+            >
+              Остановить тест
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 };

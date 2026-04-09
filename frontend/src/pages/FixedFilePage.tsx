@@ -5,6 +5,17 @@ import { useAuth } from '../contexts/AuthContext';
 import api from '../api/client';
 import type { FixedFileEntry, FixedFileMismatch } from '../types';
 import { Upload, Download, Trash2, Pencil, Check, X, RefreshCw, AlertTriangle, FileCheck, ChevronLeft, ChevronRight, Search } from 'lucide-react';
+import { toast } from 'sonner';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 
 const CARDS_PER_PAGE = 15;
 
@@ -44,6 +55,8 @@ export default function FixedFilePage() {
 
   // Delete state
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [confirmDeleteEntry, setConfirmDeleteEntry] = useState<FixedFileEntry | null>(null);
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
 
   // Search / filter
   const [searchNm, setSearchNm] = useState('');
@@ -98,7 +111,7 @@ export default function FixedFilePage() {
       const blob = await api.downloadFixedTemplate(activeStore.id);
       triggerDownload(blob, 'fixed_values_template.xlsx');
     } catch (e) {
-      alert('Ошибка скачивания шаблона');
+      toast.error('Ошибка скачивания шаблона');
     }
   };
 
@@ -118,36 +131,41 @@ export default function FixedFilePage() {
       // Offer recheck for this card
       setRecheckNmId(entry.nm_id);
     } catch (e) {
-      alert('Ошибка сохранения');
+      toast.error('Ошибка сохранения');
     } finally {
       setSaving(false);
     }
   };
 
   const handleDelete = async (entry: FixedFileEntry) => {
-    if (!activeStore || !confirm(`Удалить эталонное значение "${entry.char_name}" для карточки Артикул ${entry.nm_id}?`)) return;
+    if (!activeStore) return;
     setDeletingId(entry.id);
     try {
       await api.deleteFixedEntry(activeStore.id, entry.id);
       setEntries(prev => prev.filter(e => e.id !== entry.id));
       setTotalEntries(t => t - 1);
+      toast.success('Эталонное значение удалено');
     } catch {
-      alert('Ошибка удаления');
+      toast.error('Ошибка удаления');
     } finally {
       setDeletingId(null);
+      setConfirmDeleteEntry(null);
     }
   };
 
   const handleDeleteAll = async () => {
-    if (!activeStore || !confirm('Удалить ВСЕ эталонные значения для этого магазина?')) return;
+    if (!activeStore) return;
     try {
       await api.deleteAllFixedEntries(activeStore.id);
       setEntries([]);
       setTotalEntries(0);
       setHasFile(false);
       setUploadMsg(null);
+      toast.success('Все эталонные значения удалены');
     } catch {
-      alert('Ошибка удаления');
+      toast.error('Ошибка удаления');
+    } finally {
+      setConfirmDeleteAll(false);
     }
   };
 
@@ -159,7 +177,7 @@ export default function FixedFilePage() {
       const res = await api.recheckCardFixed(activeStore.id, nmId);
       setRecheckResult(res);
     } catch {
-      alert('Ошибка проверки');
+      toast.error('Ошибка проверки');
     } finally {
       setRechecking(false);
       setRecheckNmId(null);
@@ -262,7 +280,7 @@ export default function FixedFilePage() {
             </label>
             {entries.length > 0 && (
               <button
-                onClick={handleDeleteAll}
+                onClick={() => setConfirmDeleteAll(true)}
                 style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '7px 12px', background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 8, cursor: 'pointer', fontSize: 13, marginLeft: 'auto' }}
               >
                 <Trash2 size={14} /> Удалить все
@@ -427,7 +445,7 @@ export default function FixedFilePage() {
                                 {canManage && (
                                   <div style={{ display: 'flex', gap: 3, opacity: 0, flexShrink: 0, transition: 'opacity 0.15s' }} className="row-actions">
                                     <button onClick={() => handleEdit(entry)} title="Ред." style={{ padding: '3px 6px', background: 'none', border: '1px solid var(--border)', borderRadius: 4, cursor: 'pointer', color: '#6b7280' }}><Pencil size={11} /></button>
-                                    <button onClick={() => handleDelete(entry)} disabled={deletingId === entry.id} title="Удалить" style={{ padding: '3px 6px', background: 'none', border: '1px solid #fca5a5', borderRadius: 4, cursor: 'pointer', color: '#dc2626' }}><Trash2 size={11} /></button>
+                                    <button onClick={() => setConfirmDeleteEntry(entry)} disabled={deletingId === entry.id} title="Удалить" style={{ padding: '3px 6px', background: 'none', border: '1px solid #fca5a5', borderRadius: 4, cursor: 'pointer', color: '#dc2626' }}><Trash2 size={11} /></button>
                                   </div>
                                 )}
                               </div>
@@ -474,6 +492,42 @@ export default function FixedFilePage() {
           </button>
         </div>
       )}
+
+      <AlertDialog open={!!confirmDeleteEntry} onOpenChange={(open) => { if (!open) setConfirmDeleteEntry(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Удалить эталонное значение?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmDeleteEntry
+                ? `Будет удалено значение "${confirmDeleteEntry.char_name}" для карточки Артикул ${confirmDeleteEntry.nm_id}.`
+                : 'Подтвердите удаление.'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Отмена</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { if (confirmDeleteEntry) void handleDelete(confirmDeleteEntry); }}>
+              Удалить
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={confirmDeleteAll} onOpenChange={setConfirmDeleteAll}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Удалить все эталонные значения?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Действие очистит весь справочник для текущего магазина.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Отмена</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { void handleDeleteAll(); }}>
+              Удалить всё
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

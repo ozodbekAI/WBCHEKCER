@@ -1,6 +1,6 @@
 # backend/schemas/photo.py (UPDATED)
 from typing import List, Optional
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, ConfigDict, HttpUrl
 
 
 # ==== GENERATION REQUEST/RESPONSE ====
@@ -48,27 +48,25 @@ class VideoGenerateResponse(BaseModel):
 # ==== PUBLIC OUT MODELS ДЛЯ ШАБЛОНОВ ====
 
 class SceneCategoryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     name: str
     order_index: int
     is_active: bool
 
-    class Config:
-        from_attributes = True
-
-
 class SceneSubcategoryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     category_id: int
     name: str
     order_index: int
     is_active: bool
 
-    class Config:
-        from_attributes = True
-
-
 class SceneItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     subcategory_id: int
     name: str
@@ -76,42 +74,32 @@ class SceneItemOut(BaseModel):
     order_index: int
     is_active: bool
 
-    class Config:
-        from_attributes = True
-
-
 class PoseGroupOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     name: str
     order_index: int
     is_active: bool
 
-    class Config:
-        from_attributes = True
-
-
 class PoseSubgroupOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     group_id: int
     name: str
     order_index: int
     is_active: bool
 
-    class Config:
-        from_attributes = True
-
-
 class PosePromptOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     subgroup_id: int
     name: str
     prompt: str
     order_index: int
     is_active: bool
-
-    class Config:
-        from_attributes = True
-
 
 # ==== ADMIN CREATE / UPDATE СХЕМАЛАРИ ====
 

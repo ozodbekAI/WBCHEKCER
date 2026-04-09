@@ -1,5 +1,6 @@
 from .user import User, UserRole, Permission, ROLE_PERMISSIONS, PERMISSION_LABELS, PERMISSION_GROUPS, user_has_permission, get_user_permissions
 from .store import Store, StoreStatus
+from .store_api_key import StoreApiKey
 from .card import Card
 from .issue import CardIssue, IssueRule, IssueSeverity, IssueCategory, IssueStatus
 from .task import AnalysisTask, ActivityLog
@@ -44,6 +45,7 @@ __all__ = [
     "get_user_permissions",
     "Store",
     "StoreStatus",
+    "StoreApiKey",
     "Card",
     "CardIssue",
     "IssueRule",

@@ -9,6 +9,7 @@ from sqlalchemy import Column, Integer, String, Boolean, DateTime, Enum as SQLEn
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+from app.core.time import utc_now
 
 
 class PromotionStatus(enum.Enum):
@@ -68,8 +69,8 @@ class PromotionCompany(Base):
     # Current uploaded test photo URL on WB card (not part of original_media_json). Used to delete on switch/finish.
     current_uploaded_wb_url = Column(String(1024), nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     photos = relationship("PromotionPhoto", back_populates="company", cascade="all, delete-orphan", order_by="PromotionPhoto.order")
 
@@ -93,6 +94,6 @@ class PromotionPhoto(Base):
 
     is_winner = Column(Boolean, default=False, nullable=False)
 
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     company = relationship("PromotionCompany", back_populates="photos")

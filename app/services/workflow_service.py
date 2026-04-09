@@ -8,8 +8,10 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..core.time import utc_now
 from ..models import (
     ActivityLog,
+    Card,
     CardConfirmedSection,
     CardDraft,
     CardIssue,
@@ -44,7 +46,7 @@ CARD_WORKFLOW_SECTIONS = (
 
 
 def _utc_now() -> datetime:
-    return datetime.utcnow()
+    return utc_now()
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -618,7 +620,9 @@ async def build_team_worklog(
 
     fixes_r = await db.execute(
         select(CardIssue)
+        .join(Card, Card.id == CardIssue.card_id)
         .where(
+            Card.store_id == store_id,
             CardIssue.fixed_by_id.in_(user_ids),
             CardIssue.status.in_([IssueStatus.FIXED, IssueStatus.AUTO_FIXED]),
             CardIssue.fixed_at >= start_date,

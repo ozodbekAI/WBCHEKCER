@@ -15,7 +15,7 @@ const ROLE_LABELS: Record<string, string> = {
 export default function AcceptInvitePage() {
   const [params] = useSearchParams();
   const navigate = useNavigate();
-  const { login } = useAuth();
+  const { refreshUser } = useAuth();
   const token = params.get('token') || '';
 
   const [inviteInfo, setInviteInfo] = useState<{ email: string; first_name: string | null; role: string } | null>(null);
@@ -57,10 +57,8 @@ export default function AcceptInvitePage() {
     setError('');
     setSubmitting(true);
     try {
-      const data = await api.acceptInvite(token, password, firstName || undefined);
-      // Auto-login
-      api.setToken(data.access_token);
-      localStorage.setItem('refresh_token', data.refresh_token);
+      await api.acceptInvite(token, password, firstName || undefined);
+      await refreshUser();
       setDone(true);
       setTimeout(() => navigate('/workspace'), 1800);
     } catch (e: any) {

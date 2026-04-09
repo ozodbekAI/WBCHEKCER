@@ -7,21 +7,9 @@ import {
   AlertCircle, AlertTriangle, Eye, MoveUpRight, Zap, Camera, FileText,
   ClipboardCheck, Clock, User as UserIcon, Send, ArrowLeft, Trash2, ChevronDown
 } from 'lucide-react';
-import type { IssuesGrouped, CardApproval, IssueWithCard, TeamTicket } from '../types';
+import type { IssuesGrouped, CardApproval, TeamTicket } from '../types';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-
-const MEDIA_CODES = new Set(['no_photos', 'few_photos', 'add_more_photos', 'no_video']);
-function isMediaIssue(issue: IssueWithCard): boolean {
-  const code = String(issue.code || '').toLowerCase();
-  const category = String(issue.category || '').toLowerCase();
-  const fieldPath = String(issue.field_path || '').toLowerCase();
-  return MEDIA_CODES.has(code) || category === 'photos' || category === 'video' || fieldPath.startsWith('photos') || fieldPath.startsWith('videos');
-}
-
-function isDedicatedMediaIssue(issue: IssueWithCard): boolean {
-  return isMediaIssue(issue) && String(issue.severity || '').toLowerCase() !== 'critical';
-}
 
 export default function IncomingPage() {
   const navigate = useNavigate();
@@ -76,15 +64,12 @@ export default function IncomingPage() {
     );
   }
 
-  // Separate media issues from severity groups
-  const mediaFromWarnings = grouped.warnings.filter(isDedicatedMediaIssue);
-  const mediaFromImprovements = grouped.improvements.filter(isDedicatedMediaIssue);
-  const allMediaIssues = [...mediaFromWarnings, ...mediaFromImprovements];
+  const allMediaIssues = grouped.media || [];
   const mediaCards = new Set(allMediaIssues.map(i => i.card_id)).size;
 
   const criticalIssues = grouped.critical || [];
-  const nonMediaWarnings = grouped.warnings.filter(i => !isDedicatedMediaIssue(i));
-  const nonMediaImprovements = grouped.improvements.filter(i => !isDedicatedMediaIssue(i));
+  const nonMediaWarnings = grouped.warnings || [];
+  const nonMediaImprovements = grouped.improvements || [];
 
   const criticalCards = new Set(criticalIssues.map(i => i.card_id)).size;
   const criticalProblems = new Set(criticalIssues.map(i => i.code)).size;

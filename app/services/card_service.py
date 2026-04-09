@@ -9,6 +9,7 @@ from sqlalchemy import select, update, delete, func, and_, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import settings
+from ..core.time import utc_now
 from ..models import Card, CardConfirmedSection, CardIssue, IssueSeverity, IssueCategory, IssueStatus
 from ..services.analyzer import card_analyzer
 from ..services.wb_validator import validate_card_characteristics, get_catalog, find_best_match, calculate_card_fcs
@@ -18,7 +19,9 @@ from ..services.title_policy import validate_title
 from ..services.text_policy import validate_description
 from ..services.super_validator import super_validator_service
 from ..services import fixed_file_service as ffs
+from ..services.issue_service import calculate_visible_issue_counts
 from ..services.workflow_service import CARD_WORKFLOW_SECTIONS
+from ..services.wb_cards import parse_wb_timestamp
 
 # Max retries for AI fix validation loop
 MAX_FIX_RETRIES = 2
@@ -1372,16 +1375,23 @@ async def sync_cards_from_wb(
         "total": len(wb_cards),
     }
     
+    nm_ids = [int(wb_card.get("nmID")) for wb_card in wb_cards if wb_card.get("nmID")]
+    existing_by_nm_id: dict[int, Card] = {}
+    if nm_ids:
+        existing_rows = await db.execute(
+            select(Card).where(
+                Card.store_id == store_id,
+                Card.nm_id.in_(nm_ids),
+            )
+        )
+        existing_by_nm_id = {card.nm_id: card for card in existing_rows.scalars().all()}
+
     for wb_card in wb_cards:
         nm_id = wb_card.get("nmID")
         if not nm_id:
             continue
-        
-        # Check if card exists
-        existing = await db.execute(
-            select(Card).where(Card.store_id == store_id, Card.nm_id == nm_id)
-        )
-        card = existing.scalar_one_or_none()
+
+        card = existing_by_nm_id.get(int(nm_id))
         
         # Extract card data from WB response
         card_data = _parse_wb_card(wb_card)
@@ -1390,7 +1400,7 @@ async def sync_cards_from_wb(
             # Update existing
             for key, value in card_data.items():
                 setattr(card, key, value)
-            card.updated_at = datetime.utcnow()
+            card.updated_at = utc_now()
             result["updated"] += 1
         else:
             # Create new
@@ -1442,6 +1452,7 @@ def _parse_wb_card(wb_card: dict) -> dict:
         "characteristics": chars,
         "dimensions": dimensions,
         "raw_data": wb_card,
+        "wb_updated_at": parse_wb_timestamp(wb_card.get("updatedAt")),
     }
 
 
@@ -2435,10 +2446,11 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     )
     card.score = int(sv_breakdown.get("final_score", sv_breakdown.get("total_score", 0)))
     card.score_breakdown = sv_breakdown
-    card.critical_issues_count = sum(1 for i in issues if i.severity == IssueSeverity.CRITICAL)
-    card.warnings_count = sum(1 for i in issues if i.severity == IssueSeverity.WARNING)
-    card.improvements_count = sum(1 for i in issues if i.severity == IssueSeverity.IMPROVEMENT)
-    card.last_analysis_at = datetime.utcnow()
+    visible_counts = calculate_visible_issue_counts(issues)
+    card.critical_issues_count = visible_counts[IssueSeverity.CRITICAL.value]
+    card.warnings_count = visible_counts[IssueSeverity.WARNING.value]
+    card.improvements_count = visible_counts[IssueSeverity.IMPROVEMENT.value]
+    card.last_analysis_at = utc_now()
 
     # ── Normalize score_impact so all pending issues sum to (100 - card.score) ──
     # This ensures: fixing all issues brings the card exactly to 100.
@@ -2931,22 +2943,12 @@ async def get_card_by_id(db: AsyncSession, card_id: int) -> Optional[Card]:
 
 
 def _pending_issue_counts_from_card(card: Card) -> dict[str, int]:
-    counts = {
-        "critical": 0,
-        "warning": 0,
-        "improvement": 0,
-    }
-
+    pending_issues = []
     for issue in getattr(card, "issues", None) or []:
         status = issue.status.value if hasattr(issue.status, "value") else str(issue.status or "")
-        if status != IssueStatus.PENDING.value:
-            continue
-
-        severity = issue.severity.value if hasattr(issue.severity, "value") else str(issue.severity or "")
-        if severity in counts:
-            counts[severity] += 1
-
-    return counts
+        if status == IssueStatus.PENDING.value:
+            pending_issues.append(issue)
+    return calculate_visible_issue_counts(pending_issues)
 
 
 async def ensure_card_issue_consistency(

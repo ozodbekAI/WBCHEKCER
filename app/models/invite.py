@@ -4,6 +4,7 @@ from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, J
 from sqlalchemy.orm import relationship
 
 from ..core.database import Base
+from app.core.time import utc_now
 
 
 class UserInvite(Base):
@@ -19,7 +20,7 @@ class UserInvite(Base):
     invited_by_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     is_used = Column(Boolean, default=False)
     expires_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     store = relationship("Store")
     invited_by = relationship("User", foreign_keys=[invited_by_id])

@@ -5,8 +5,10 @@ from datetime import datetime, timedelta
 import json
 from typing import List, Optional
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.time import utc_now
 from app.models.promotion import PromotionCompany, PromotionPhoto, PromotionStatus
 
 
@@ -245,8 +247,10 @@ class PromotionRepository:
 
     def mark_started(self, company: PromotionCompany) -> None:
         company.status = PromotionStatus.RUNNING
+        company.error_message = None
+        company.finished_at = None
         if not company.started_at:
-            company.started_at = datetime.utcnow()
+            company.started_at = utc_now()
         self.db.add(company)
         self.db.commit()
         self.db.refresh(company)
@@ -260,7 +264,7 @@ class PromotionRepository:
     def update_last_totals(self, company: PromotionCompany, shows: int, clicks: int) -> None:
         company.last_total_shows = int(shows)
         company.last_total_clicks = int(clicks)
-        company.last_polled_at = datetime.utcnow()
+        company.last_polled_at = utc_now()
         self.db.add(company)
         self.db.commit()
 
@@ -289,7 +293,8 @@ class PromotionRepository:
     def finish_with_winner(self, company: PromotionCompany, winner_order: int) -> None:
         company.status = PromotionStatus.FINISHED
         company.winner_photo_order = int(winner_order)
-        company.finished_at = datetime.utcnow()
+        company.finished_at = utc_now()
+        company.error_message = None
 
         photos = self.db.query(PromotionPhoto).filter(PromotionPhoto.company_id == company.id).all()
         for p in photos:
@@ -299,11 +304,19 @@ class PromotionRepository:
         self.db.add(company)
         self.db.commit()
     
-    def mark_pending_start(self, company, *, error: str, delay_sec: int = 30) -> None:
+    def mark_pending_start(self, company: PromotionCompany, *, error: str, delay_sec: int = 30) -> None:
         company.status = PromotionStatus.CREATED
-        company.last_start_error = error
-        company.start_attempts = int(getattr(company, "start_attempts", 0) or 0) + 1
-        company.next_start_at = datetime.utcnow() + timedelta(seconds=int(delay_sec))
+        company.error_message = (error or "")[:1000]
+        company.finished_at = None
+        company.last_polled_at = utc_now() + timedelta(seconds=max(int(delay_sec), 0))
+        self.db.add(company)
+        self.db.commit()
+
+    def mark_stopped(self, company: PromotionCompany, *, reason: str | None = None) -> None:
+        company.status = PromotionStatus.STOPPED
+        company.error_message = (str(reason or "").strip() or None)
+        company.finished_at = utc_now()
+        self.db.add(company)
         self.db.commit()
 
     def list_active_for_scheduler(self):
@@ -312,6 +325,80 @@ class PromotionRepository:
             .filter(PromotionCompany.status.in_([PromotionStatus.RUNNING, PromotionStatus.CREATED]))
             .all()
         )
+
+    def count_attention(self, user_id: int) -> int:
+        return (
+            self.db.query(PromotionCompany)
+            .filter(
+                PromotionCompany.user_id == int(user_id),
+                or_(
+                    PromotionCompany.status.in_([PromotionStatus.FAILED, PromotionStatus.STOPPED]),
+                    and_(
+                        PromotionCompany.status == PromotionStatus.CREATED,
+                        PromotionCompany.error_message.is_not(None),
+                        PromotionCompany.error_message != "",
+                    ),
+                ),
+            )
+            .count()
+        )
+
+    def list_attention(self, user_id: int, limit: int | None = None, offset: int | None = None):
+        q = (
+            self.db.query(PromotionCompany)
+            .options(joinedload(PromotionCompany.photos))
+            .filter(
+                PromotionCompany.user_id == int(user_id),
+                or_(
+                    PromotionCompany.status.in_([PromotionStatus.FAILED, PromotionStatus.STOPPED]),
+                    and_(
+                        PromotionCompany.status == PromotionStatus.CREATED,
+                        PromotionCompany.error_message.is_not(None),
+                        PromotionCompany.error_message != "",
+                    ),
+                ),
+            )
+            .order_by(PromotionCompany.id.desc())
+        )
+        if offset:
+            q = q.offset(offset)
+        if limit:
+            q = q.limit(limit)
+        return q.all()
+
+    def count_pending_clean(self, user_id: int) -> int:
+        return (
+            self.db.query(PromotionCompany)
+            .filter(
+                PromotionCompany.user_id == int(user_id),
+                PromotionCompany.status == PromotionStatus.CREATED,
+                or_(
+                    PromotionCompany.error_message.is_(None),
+                    PromotionCompany.error_message == "",
+                ),
+            )
+            .count()
+        )
+
+    def list_pending_clean(self, user_id: int, limit: int | None = None, offset: int | None = None):
+        q = (
+            self.db.query(PromotionCompany)
+            .options(joinedload(PromotionCompany.photos))
+            .filter(
+                PromotionCompany.user_id == int(user_id),
+                PromotionCompany.status == PromotionStatus.CREATED,
+                or_(
+                    PromotionCompany.error_message.is_(None),
+                    PromotionCompany.error_message == "",
+                ),
+            )
+            .order_by(PromotionCompany.id.desc())
+        )
+        if offset:
+            q = q.offset(offset)
+        if limit:
+            q = q.limit(limit)
+        return q.all()
     
     def get_company_by_wb_id(self, wb_company_id: int, user_id: int) -> PromotionCompany | None:
         return (

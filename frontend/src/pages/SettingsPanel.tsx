@@ -17,6 +17,16 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Cell,
 } from 'recharts';
 
@@ -108,6 +118,7 @@ export function ActivityContent() {
 
   const [chartRange, setChartRange] = useState<7 | 30>(7);
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [clearDialogOpen, setClearDialogOpen] = useState(false);
 
   const dailyStats = useMemo(() => getDailyStats(chartRange), [getDailyStats, chartRange]);
 
@@ -130,9 +141,8 @@ export function ActivityContent() {
   }, [allSessions, selectedDate]);
 
   const handleClear = useCallback(() => {
-    if (confirm('Очистить всю историю активности?')) {
-      clearHistory();
-    }
+    clearHistory();
+    setClearDialogOpen(false);
   }, [clearHistory]);
 
   const handleBarClick = useCallback((data: any) => {
@@ -249,11 +259,26 @@ export function ActivityContent() {
       </div>
 
       {allSessions.length > 0 && (
-        <Button variant="ghost" size="sm" className="mx-auto mt-4 text-muted-foreground hover:text-destructive gap-2" onClick={handleClear}>
+        <Button variant="ghost" size="sm" className="mx-auto mt-4 text-muted-foreground hover:text-destructive gap-2" onClick={() => setClearDialogOpen(true)}>
           <Trash2 size={14} />
           Очистить историю
         </Button>
       )}
+
+      <AlertDialog open={clearDialogOpen} onOpenChange={setClearDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Очистить историю активности?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Будут удалены локальные записи о рабочих сессиях и действиях.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Отмена</AlertDialogCancel>
+            <AlertDialogAction onClick={handleClear}>Очистить</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

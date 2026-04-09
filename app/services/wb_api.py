@@ -2,10 +2,28 @@ import asyncio
 import re
 from typing import Optional, Dict, Any, List
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse
 
 from ..core.config import settings
+
+WB_PING_CATEGORY_BY_API_TYPE: Dict[str, str] = {
+    "content": "content",
+    "analytics": "analytics",
+    "prices": "prices",
+    "marketplace": "marketplace",
+    "statistics": "statistics",
+    "advert": "promotion",
+    "feedbacks": "feedbacks",
+    "buyers_chat": "buyers_chat",
+    "supplies": "supplies",
+    "buyers_returns": "buyers_returns",
+    "documents": "documents",
+    "finance": "finance",
+    "users": "users",
+}
+
+WB_ALL_PING_API_TYPES: List[str] = list(WB_PING_CATEGORY_BY_API_TYPE.keys())
 
 
 class WildberriesAPI:
@@ -31,6 +49,17 @@ class WildberriesAPI:
             "Content-Type": "application/json",
         }
         self.timeout = httpx.Timeout(30.0)
+
+    @staticmethod
+    def _normalize_api_types(api_types: Optional[List[str]]) -> List[str]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for raw in api_types or []:
+            key = str(raw or "").strip().lower()
+            if key and key not in seen:
+                normalized.append(key)
+                seen.add(key)
+        return normalized
 
     @staticmethod
     def _extract_wb_photo_urls(raw_photos: Any) -> List[str]:
@@ -144,6 +173,12 @@ class WildberriesAPI:
             "marketplace": settings.WB_MARKETPLACE_API_URL,
             "advert": settings.WB_ADVERT_API_URL,
             "feedbacks": settings.WB_FEEDBACKS_API_URL,
+            "buyers_chat": "https://buyer-chat-api.wildberries.ru",
+            "supplies": "https://supplies-api.wildberries.ru",
+            "buyers_returns": "https://returns-api.wildberries.ru",
+            "documents": "https://documents-api.wildberries.ru",
+            "finance": "https://finance-api.wildberries.ru",
+            "users": "https://user-management-api.wildberries.ru",
         }
         
         base_url = api_urls.get(api_type, settings.WB_COMMON_API_URL)
@@ -177,12 +212,108 @@ class WildberriesAPI:
                     return {
                         "success": False,
                         "error": f"API error: {response.status_code}",
+                        "status_code": response.status_code,
                     }
         except Exception as e:
             return {
                 "success": False,
                 "error": str(e),
             }
+
+    async def validate_ping_access(
+        self,
+        api_types: List[str],
+        *,
+        require_all: bool = True,
+    ) -> Dict[str, Any]:
+        normalized = self._normalize_api_types(api_types)
+
+        if not normalized:
+            return {"success": True, "results": {}}
+
+        results_list = await asyncio.gather(
+            *(self.ping(api_type) for api_type in normalized),
+            return_exceptions=True,
+        )
+
+        results: Dict[str, Dict[str, Any]] = {}
+        success_map: Dict[str, bool] = {}
+        for api_type, item in zip(normalized, results_list):
+            if isinstance(item, Exception):
+                payload = {"success": False, "error": str(item)}
+            else:
+                payload = dict(item or {})
+            results[api_type] = payload
+            success_map[api_type] = bool(payload.get("success"))
+
+        overall_success = all(success_map.values()) if require_all else any(success_map.values())
+        if overall_success:
+            return {"success": True, "results": results}
+
+        failed = [api_type for api_type, ok in success_map.items() if not ok]
+        details = {
+            api_type: results[api_type].get("error") or "Access denied"
+            for api_type in failed
+        }
+        return {
+            "success": False,
+            "error": "Not enough access for required WB API categories",
+            "failed_api_types": failed,
+            "details": details,
+            "results": results,
+        }
+
+    async def collect_ping_access(
+        self,
+        api_types: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        normalized = self._normalize_api_types(api_types or WB_ALL_PING_API_TYPES)
+        if not normalized:
+            return {
+                "checked_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                "results": {},
+                "allowed_api_types": [],
+                "denied_api_types": [],
+                "allowed_categories": [],
+                "denied_categories": [],
+            }
+
+        results_list = await asyncio.gather(
+            *(self.ping(api_type) for api_type in normalized),
+            return_exceptions=True,
+        )
+
+        results: Dict[str, Dict[str, Any]] = {}
+        allowed_api_types: List[str] = []
+        denied_api_types: List[str] = []
+        allowed_categories: List[str] = []
+        denied_categories: List[str] = []
+
+        for api_type, item in zip(normalized, results_list):
+            if isinstance(item, Exception):
+                payload = {"success": False, "error": str(item)}
+            else:
+                payload = dict(item or {})
+            results[api_type] = payload
+
+            category = WB_PING_CATEGORY_BY_API_TYPE.get(api_type)
+            if payload.get("success"):
+                allowed_api_types.append(api_type)
+                if category and category not in allowed_categories:
+                    allowed_categories.append(category)
+            else:
+                denied_api_types.append(api_type)
+                if category and category not in denied_categories:
+                    denied_categories.append(category)
+
+        return {
+            "checked_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            "results": results,
+            "allowed_api_types": allowed_api_types,
+            "denied_api_types": denied_api_types,
+            "allowed_categories": allowed_categories,
+            "denied_categories": denied_categories,
+        }
     
     async def validate_api_key(self) -> Dict[str, Any]:
         """Validate API key and get supplier info
@@ -191,6 +322,13 @@ class WildberriesAPI:
         Docs: https://dev.wildberries.ru/docs/openapi/api-information#tag/Informaciya-o-prodavce
         """
         try:
+            ping_result = await self.ping("common")
+            if not ping_result.get("success"):
+                return {
+                    "is_valid": False,
+                    "error": ping_result.get("error", "Common API ping failed"),
+                }
+
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 # Get seller info from common-api
                 response = await client.get(

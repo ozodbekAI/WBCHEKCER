@@ -7,6 +7,7 @@ from typing import Optional
 import enum
 
 from app.core.database import Base
+from app.core.time import utc_now
 
 
 class AssetType(enum.Enum):
@@ -69,8 +70,8 @@ class PhotoAsset(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     
     # Metadata
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
     
     def __repr__(self):
         return f"<PhotoAsset(id={self.id}, type={self.asset_type.value}, name={self.name})>"

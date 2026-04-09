@@ -133,6 +133,14 @@ export interface TokenResponse {
   user: User;
 }
 
+export type AsyncTaskStatus =
+  | 'pending'
+  | 'running'
+  | 'cancelling'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
 // ==================== Store ====================
 export interface Store {
   id: number;
@@ -148,6 +156,59 @@ export interface Store {
   last_sync_at: string | null;
   last_analysis_at: string | null;
   created_at: string;
+  wb_token_access: StoreWbTokenAccess;
+}
+
+export interface StoreWbFeatureAccess {
+  label: string;
+  allowed: boolean;
+  reason: string | null;
+  message: string;
+  required_categories: string[];
+  required_categories_labels: string[];
+  missing_categories: string[];
+  missing_categories_labels: string[];
+  requires_write: boolean;
+  source_slot: string | null;
+  source_label: string | null;
+  using_specific_key: boolean;
+  recommended_slots: string[];
+  recommended_slot_labels: string[];
+}
+
+export interface StoreWbTokenSnapshot {
+  decoded: boolean;
+  decode_error: string | null;
+  token_type: string | null;
+  scope_mask: number | null;
+  categories: string[];
+  category_labels: string[];
+  read_only: boolean;
+  expires_at: string | null;
+}
+
+export interface StoreWbKeySlot {
+  slot_key: string;
+  label: string;
+  configured: boolean;
+  is_default: boolean;
+  feature_keys: string[];
+  feature_labels: string[];
+  token_access: StoreWbTokenSnapshot;
+  updated_at: string | null;
+}
+
+export interface StoreWbTokenAccess {
+  decoded: boolean;
+  decode_error: string | null;
+  token_type: string | null;
+  scope_mask: number | null;
+  categories: string[];
+  category_labels: string[];
+  read_only: boolean;
+  expires_at: string | null;
+  features: Record<string, StoreWbFeatureAccess>;
+  key_slots: StoreWbKeySlot[];
 }
 
 export interface StoreStats {
@@ -171,6 +232,24 @@ export interface OnboardResult {
   cards_analyzed: number;
   issues_found: number;
   ai_enabled: boolean;
+  wb_token_access: StoreWbTokenAccess | null;
+}
+
+export interface OnboardStartResponse {
+  task_id: string;
+  status: string;
+}
+
+export interface OnboardingTaskStatus {
+  task_id: string;
+  status: AsyncTaskStatus;
+  step: string;
+  progress: number;
+  store_id: number | null;
+  result: OnboardResult | null;
+  error: string | null;
+  created_at: string | null;
+  completed_at: string | null;
 }
 
 // ==================== Card ====================
@@ -277,10 +356,12 @@ export interface IssuesGrouped {
   critical: IssueWithCard[];
   warnings: IssueWithCard[];
   improvements: IssueWithCard[];
+  media: IssueWithCard[];
   postponed: IssueWithCard[];
   critical_count: number;
   warnings_count: number;
   improvements_count: number;
+  media_count: number;
   postponed_count: number;
 }
 
@@ -621,6 +702,20 @@ export interface AdAnalysisOverview {
   critical_preview: AdAnalysisItem[];
   growth_preview: AdAnalysisItem[];
   items: AdAnalysisItem[];
+}
+
+export interface AdAnalysisBootstrapStatus {
+  task_id: number | null;
+  store_id: number;
+  status: 'idle' | 'pending' | 'running' | 'completed' | 'failed';
+  progress: number;
+  step: string;
+  ready: boolean;
+  error: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  period_start: string | null;
+  period_end: string | null;
 }
 
 export interface AdAnalysisUploadUnresolvedRow {

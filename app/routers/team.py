@@ -6,13 +6,14 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm import selectinload
 
 from ..core.database import get_db
 from ..core.security import (
     get_current_user, require_permission,
 )
+from ..core.time import utc_now
 from ..models import (
     User, UserRole, Store, CardApproval, ApprovalStatus,
     CardIssue, IssueStatus, Card, get_user_permissions,
@@ -33,7 +34,8 @@ from ..services.approval_service import (
     get_user_approval_stats, mark_approval_applied,
 )
 from ..services.card_service import analyze_card
-from ..services.issue_service import get_fixed_issues_for_store, mark_applied_to_wb
+from ..services.issue_service import calculate_visible_issue_counts_from_rows, get_fixed_issues_for_store, mark_applied_to_wb
+from ..services.wb_token_access import ensure_store_feature_access, get_store_feature_api_key
 from ..services.workflow_service import (
     build_team_worklog,
     create_team_ticket,
@@ -57,12 +59,58 @@ async def get_user_store(
     store = await get_store_by_id(db, store_id)
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
-    # Admin / owner can always access
-    if current_user.role not in ("admin",) and store.owner_id != current_user.id:
-        # Check if user has any role that grants access to this store
-        # For now all users in the system can access stores they're linked to
-        pass
+    is_owner = store.owner_id == current_user.id
+    role_value = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    is_admin = role_value == "admin"
+    is_member = getattr(current_user, "store_id", None) == store.id
+    if not (is_owner or is_admin or is_member):
+        raise HTTPException(status_code=403, detail="Access denied")
     return store
+
+
+def _store_member_clause(store: Store):
+    return or_(User.id == store.owner_id, User.store_id == store.id)
+
+
+async def _get_store_member(db: AsyncSession, store: Store, user_id: int) -> User:
+    member_r = await db.execute(
+        select(User).where(
+            User.id == user_id,
+            User.role != UserRole.ADMIN,
+            _store_member_clause(store),
+        )
+    )
+    member = member_r.scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="User not found")
+    return member
+
+
+async def _get_store_card(db: AsyncSession, store_id: int, card_id: int) -> Card:
+    card_r = await db.execute(select(Card).where(Card.id == card_id, Card.store_id == store_id))
+    card = card_r.scalar_one_or_none()
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+    return card
+
+
+async def _get_store_issue(db: AsyncSession, store_id: int, issue_id: int) -> CardIssue:
+    issue_r = await db.execute(
+        select(CardIssue)
+        .join(Card, Card.id == CardIssue.card_id)
+        .where(CardIssue.id == issue_id, Card.store_id == store_id)
+    )
+    issue = issue_r.scalar_one_or_none()
+    if not issue:
+        raise HTTPException(status_code=404, detail="Issue not found")
+    return issue
+
+
+async def _get_store_approval(db: AsyncSession, store_id: int, approval_id: int) -> CardApproval:
+    approval = await get_approval_by_id(db, approval_id)
+    if not approval or approval.store_id != store_id:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    return approval
 
 
 def _approval_to_out(a: CardApproval) -> ApprovalOut:
@@ -96,7 +144,7 @@ def _approval_to_out(a: CardApproval) -> ApprovalOut:
 async def list_roles(
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("team.view", "team.manage")),
 ):
     """List available roles and their permissions."""
     role_meta = {
@@ -109,7 +157,11 @@ async def list_roles(
     # Count users per role
     counts_r = await db.execute(
         select(User.role, func.count())
-        .where(User.is_active == True)
+        .where(
+            User.is_active == True,
+            User.role != UserRole.ADMIN,
+            _store_member_clause(store),
+        )
         .group_by(User.role)
     )
     counts = {r: c for r, c in counts_r.all()}
@@ -122,7 +174,7 @@ async def list_roles(
             name=name,
             description=desc,
             permissions=perms,
-            user_count=counts.get(role_id, 0) + counts.get(UserRole(role_id) if role_id in [e.value for e in UserRole] else None, 0),
+            user_count=counts.get(role_id, 0),
         ))
     return result
 
@@ -141,15 +193,15 @@ async def list_team_members(
     """List all team members with their activity stats."""
     users_r = await db.execute(
         select(User).where(
-            User.is_active == True,
-            User.role != UserRole.ADMIN
-        ).order_by(User.created_at.desc())
+            User.role != UserRole.ADMIN,
+            _store_member_clause(store),
+        ).order_by(User.is_active.desc(), User.created_at.desc())
     )
     users = list(users_r.scalars().all())
 
     result = []
     for u in users:
-        stats = await get_user_approval_stats(db, u.id)
+        stats = await get_user_approval_stats(db, u.id, store.id)
         result.append(TeamMemberOut(
             id=u.id,
             email=u.email,
@@ -175,10 +227,7 @@ async def update_team_member(
     current_user: User = Depends(require_permission("team.manage")),
 ):
     """Update a team member's role or active status (owner/admin only)."""
-    target_r = await db.execute(select(User).where(User.id == user_id))
-    target = target_r.scalar_one_or_none()
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
+    target = await _get_store_member(db, store, user_id)
 
     if target.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot modify your own role")
@@ -204,11 +253,11 @@ async def update_team_member(
                 raise HTTPException(status_code=400, detail=f"Invalid permissions: {invalid}")
             target.custom_permissions = data.custom_permissions
 
-    target.updated_at = datetime.utcnow()
+    target.updated_at = utc_now()
     await db.commit()
     await db.refresh(target)
 
-    stats = await get_user_approval_stats(db, target.id)
+    stats = await get_user_approval_stats(db, target.id, store.id)
     return TeamMemberOut(
         id=target.id,
         email=target.email,
@@ -275,7 +324,7 @@ async def invite_team_member(
         first_name=data.first_name,
         store_id=store.id,
         invited_by_id=current_user.id,
-        expires_at=datetime.utcnow() + timedelta(hours=72),
+        expires_at=utc_now() + timedelta(hours=72),
     )
     db.add(invite)
     await db.commit()
@@ -333,20 +382,16 @@ async def submit_card_for_review(
     Submit a card's fixed issues for Head-Manager review.
     Creates an approval request with a snapshot of all changes.
     """
+    card = await _get_store_card(db, store.id, data.card_id)
     try:
         approval = await submit_for_review(
-            db, store.id, data.card_id, current_user.id, data.note
+            db, store.id, card.id, current_user.id, data.note
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     reviewer_ids = list(dict.fromkeys(data.reviewer_ids or []))
     if reviewer_ids:
-        card_result = await db.execute(select(Card).where(Card.id == data.card_id))
-        card = card_result.scalar_one_or_none()
-        if not card:
-            raise HTTPException(status_code=404, detail="Card not found")
-
         members_r = await db.execute(
             select(User).where(
                 User.id.in_(reviewer_ids),
@@ -392,6 +437,7 @@ async def review_card_approval(
     """
     Approve or reject a card approval (Head-Manager / Owner only).
     """
+    await _get_store_approval(db, store.id, approval_id)
     if data.action not in ("approve", "reject"):
         raise HTTPException(status_code=400, detail="Action must be 'approve' or 'reject'")
 
@@ -417,9 +463,7 @@ async def apply_approved_to_wb(
     Apply an approved card's fixes to WB.
     Only approved approvals can be applied.
     """
-    approval = await get_approval_by_id(db, approval_id)
-    if not approval:
-        raise HTTPException(status_code=404, detail="Approval not found")
+    approval = await _get_store_approval(db, store.id, approval_id)
     if approval.status != ApprovalStatus.APPROVED:
         raise HTTPException(status_code=400, detail="Approval must be in 'approved' status")
 
@@ -435,7 +479,11 @@ async def apply_approved_to_wb(
 
     update_payload, next_raw_data = build_card_update_payload(card, changes)
 
-    wb_api = WildberriesAPI(store.api_key)
+    ensure_store_feature_access(store, "cards_write")
+    feature_api_key = get_store_feature_api_key(store, "cards_write")
+    if not feature_api_key:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
+    wb_api = WildberriesAPI(feature_api_key)
     wb_result = await wb_api.update_card(update_payload)
 
     if wb_result.get("success"):
@@ -451,17 +499,20 @@ async def apply_approved_to_wb(
             await analyze_card(db, card)
         except Exception:
             pending_by_severity = await db.execute(
-                select(CardIssue.severity, func.count())
+                select(
+                    CardIssue.severity,
+                    CardIssue.code,
+                    CardIssue.category,
+                    CardIssue.field_path,
+                    func.count(),
+                )
                 .where(
                     CardIssue.card_id == card.id,
                     CardIssue.status == IssueStatus.PENDING,
                 )
-                .group_by(CardIssue.severity)
+                .group_by(CardIssue.severity, CardIssue.code, CardIssue.category, CardIssue.field_path)
             )
-            counts = {
-                str(severity.value if hasattr(severity, "value") else severity): count
-                for severity, count in pending_by_severity.all()
-            }
+            counts = calculate_visible_issue_counts_from_rows(pending_by_severity.all())
             card.critical_issues_count = int(counts.get("critical", 0) or 0)
             card.warnings_count = int(counts.get("warning", 0) or 0)
             card.improvements_count = int(counts.get("improvement", 0) or 0)
@@ -488,9 +539,7 @@ async def cancel_card_approval(
     """
     Cancel a pending approval (only submitter can cancel, only if still pending).
     """
-    approval = await get_approval_by_id(db, approval_id)
-    if not approval:
-        raise HTTPException(status_code=404, detail="Approval not found")
+    approval = await _get_store_approval(db, store.id, approval_id)
     if approval.prepared_by_id != current_user.id and not current_user.has_permission("cards.approve"):
         raise HTTPException(status_code=403, detail="Not your approval")
     if approval.status != ApprovalStatus.PENDING:
@@ -543,6 +592,13 @@ async def create_ticket_endpoint(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if data.card_id is not None:
+        await _get_store_card(db, store.id, data.card_id)
+    if data.issue_id is not None:
+        await _get_store_issue(db, store.id, data.issue_id)
+    if data.approval_id is not None:
+        await _get_store_approval(db, store.id, data.approval_id)
+
     assignee_r = await db.execute(select(User).where(User.id == data.to_user_id, User.is_active == True))
     assignee = assignee_r.scalar_one_or_none()
     if not assignee:
@@ -628,13 +684,13 @@ async def get_team_worklog(
 async def team_activity(
     store: Store = Depends(get_user_store),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("team.view", "team.manage")),
 ):
     """Return team activity summary for workspace dashboard."""
     from datetime import timedelta
     from sqlalchemy import func as sqlfunc
 
-    now = datetime.utcnow()
+    now = utc_now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = today_start - timedelta(days=today_start.weekday())
 
@@ -652,7 +708,9 @@ async def team_activity(
     # Fixes by user (this week)
     fixes_week = await db.execute(
         select(CardIssue.fixed_by_id, func.count())
+        .join(Card, Card.id == CardIssue.card_id)
         .where(
+            Card.store_id == store.id,
             CardIssue.status == IssueStatus.FIXED,
             CardIssue.fixed_at >= week_start,
         )
@@ -663,7 +721,9 @@ async def team_activity(
     # Fixes today
     fixes_today_r = await db.execute(
         select(CardIssue.fixed_by_id, func.count())
+        .join(Card, Card.id == CardIssue.card_id)
         .where(
+            Card.store_id == store.id,
             CardIssue.status == IssueStatus.FIXED,
             CardIssue.fixed_at >= today_start,
         )
@@ -674,7 +734,11 @@ async def team_activity(
     # All-time fixes per user
     fixes_all_r = await db.execute(
         select(CardIssue.fixed_by_id, func.count())
-        .where(CardIssue.status.in_([IssueStatus.FIXED, IssueStatus.AUTO_FIXED]))
+        .join(Card, Card.id == CardIssue.card_id)
+        .where(
+            Card.store_id == store.id,
+            CardIssue.status.in_([IssueStatus.FIXED, IssueStatus.AUTO_FIXED]),
+        )
         .group_by(CardIssue.fixed_by_id)
     )
     fixes_all_map = {uid: cnt for uid, cnt in fixes_all_r.all() if uid}
@@ -686,7 +750,9 @@ async def team_activity(
             sqlfunc.min(CardIssue.fixed_at).label("work_start"),
             sqlfunc.max(CardIssue.fixed_at).label("work_end"),
         )
+        .join(Card, Card.id == CardIssue.card_id)
         .where(
+            Card.store_id == store.id,
             CardIssue.fixed_by_id.in_(user_ids),
             CardIssue.status == IssueStatus.FIXED,
             CardIssue.fixed_at >= today_start,
@@ -698,7 +764,9 @@ async def team_activity(
     # Last fixed issue description per user (for "last action")
     last_action_r = await db.execute(
         select(CardIssue.fixed_by_id, CardIssue.title, CardIssue.fixed_at)
+        .join(Card, Card.id == CardIssue.card_id)
         .where(
+            Card.store_id == store.id,
             CardIssue.fixed_by_id.in_(user_ids),
             CardIssue.status == IssueStatus.FIXED,
         )

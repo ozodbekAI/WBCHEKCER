@@ -13,6 +13,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+from app.core.time import utc_now
 
 
 class PromptTemplate(Base):
@@ -28,11 +29,11 @@ class PromptTemplate(Base):
     version = Column(Integer, default=1)
     is_active = Column(Boolean, default=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     updated_at = Column(
         DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=utc_now,
+        onupdate=utc_now,
     )
 
     created_by_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
@@ -62,7 +63,7 @@ class PromptVersion(Base):
     examples = Column(Text, nullable=True)
     version = Column(Integer, nullable=False)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     created_by = Column(String(100), nullable=True)
     change_reason = Column(Text, nullable=True)
 

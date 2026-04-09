@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import Column, DateTime, Integer, String
 
 from ..core.database import Base
+from app.core.time import utc_now
 
 
 class RegistrationAccessRequest(Base):
@@ -21,5 +22,5 @@ class RegistrationAccessRequest(Base):
     expires_at = Column(DateTime, nullable=False)
     cooldown_until = Column(DateTime, nullable=False)
     sent_count = Column(Integer, nullable=False, default=1)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)

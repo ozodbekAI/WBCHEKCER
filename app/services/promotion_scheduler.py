@@ -9,9 +9,11 @@ from typing import Any, List
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
+from app.core.time import utc_now
+from app.models.promotion import PromotionPhoto, PromotionStatus
 from app.services.promotion_repository import PromotionRepository
 from app.services.promotion_service import PromotionService
-from app.models.promotion import PromotionPhoto
+from app.services.wb_advert_repository import WBAdvertRepository
 
 
 logger = logging.getLogger(__name__)
@@ -55,9 +57,32 @@ class PromotionScheduler:
         db: Session = SessionLocal()
         try:
             repo = PromotionRepository(db)
-            companies = repo.list_running()
+            companies = repo.list_active_for_scheduler()
             if not companies:
                 logger.debug("[scheduler] no running companies")
+                return
+
+            for company in companies:
+                if company.status != PromotionStatus.CREATED:
+                    continue
+                if int(getattr(company, "photos_count", 0) or 0) < 2:
+                    continue
+                if int(getattr(company, "views_per_photo", 0) or 0) <= 0:
+                    continue
+                if int(getattr(company, "cpm", 0) or 0) <= 0:
+                    continue
+                retry_after = getattr(company, "last_polled_at", None)
+                if retry_after and retry_after > utc_now():
+                    continue
+                try:
+                    result = self.service.start_company(db=db, user_id=int(company.user_id), company_id=int(company.id))
+                    logger.info("[scheduler] autostart company=%s status=%s", company.id, result.get("status"))
+                except Exception:
+                    logger.exception("[scheduler] autostart failed company=%s", getattr(company, "id", None))
+
+            companies = repo.list_running()
+            if not companies:
+                logger.debug("[scheduler] no running companies after autostart pass")
                 return
 
             begin_date = date.today().isoformat()
@@ -65,65 +90,68 @@ class PromotionScheduler:
 
             logger.info("[scheduler] running=%s beginDate=%s endDate=%s", len(companies), begin_date, end_date)
 
-            for batch in _chunk(companies, 50):
-                ids = [int(c.wb_company_id) for c in batch if getattr(c, "wb_company_id", None)]
-                if not ids:
-                    continue
+            companies_by_token: dict[str, list[Any]] = {}
+            for company in companies:
+                token = self.service._resolve_advert_token(db, int(company.user_id))
+                companies_by_token.setdefault(token, []).append(company)
 
-                logger.info("[scheduler] fullstats ids=%s", ids)
-                stats = self.service.wb_advert.get_fullstats(ids, begin_date=begin_date, end_date=end_date)
+            for token, token_companies in companies_by_token.items():
+                wb_advert = WBAdvertRepository(token=token)
+                for batch in _chunk(token_companies, 50):
+                    ids = [int(c.wb_company_id) for c in batch if getattr(c, "wb_company_id", None)]
+                    if not ids:
+                        continue
 
-                for c in batch:
-                    try:
-                        wb_id = int(c.wb_company_id)
-                        total_shows, total_clicks = self.service.parse_stats_totals(stats, advert_id=wb_id)
+                    logger.info("[scheduler] fullstats ids=%s", ids)
+                    stats = wb_advert.get_fullstats(ids, begin_date=begin_date, end_date=end_date)
 
-                        last_shows = int(getattr(c, "last_total_shows", 0) or 0)
-                        last_clicks = int(getattr(c, "last_total_clicks", 0) or 0)
+                    for c in batch:
+                        try:
+                            wb_id = int(c.wb_company_id)
+                            total_shows, total_clicks = self.service.parse_stats_totals(stats, advert_id=wb_id)
 
-                        delta_shows = max(int(total_shows) - last_shows, 0)
-                        delta_clicks = max(int(total_clicks) - last_clicks, 0)
+                            last_shows = int(getattr(c, "last_total_shows", 0) or 0)
+                            last_clicks = int(getattr(c, "last_total_clicks", 0) or 0)
 
-                        logger.info(
-                            "[scheduler] company=%s wb=%s totals(shows=%s clicks=%s) delta(shows=%s clicks=%s) current_order=%s",
-                            c.id,
-                            wb_id,
-                            total_shows,
-                            total_clicks,
-                            delta_shows,
-                            delta_clicks,
-                            int(getattr(c, "current_photo_order", 1) or 1),
-                        )
+                            delta_shows = max(int(total_shows) - last_shows, 0)
+                            delta_clicks = max(int(total_clicks) - last_clicks, 0)
 
-                        # accumulate delta into current photo
-                        if delta_shows or delta_clicks:
-                            repo.add_delta_to_current_photo(c, delta_shows=delta_shows, delta_clicks=delta_clicks)
+                            logger.info(
+                                "[scheduler] company=%s wb=%s totals(shows=%s clicks=%s) delta(shows=%s clicks=%s) current_order=%s",
+                                c.id,
+                                wb_id,
+                                total_shows,
+                                total_clicks,
+                                delta_shows,
+                                delta_clicks,
+                                int(getattr(c, "current_photo_order", 1) or 1),
+                            )
 
-                        # update baseline totals for next tick
-                        repo.update_last_totals(c, shows=total_shows, clicks=total_clicks)
+                            if delta_shows or delta_clicks:
+                                repo.add_delta_to_current_photo(c, delta_shows=delta_shows, delta_clicks=delta_clicks)
 
-                        # threshold check (reload photo from DB for fresh shows)
-                        current_photo = (
-                            db.query(PromotionPhoto)
-                            .filter(PromotionPhoto.company_id == c.id, PromotionPhoto.order == int(c.current_photo_order or 1))
-                            .first()
-                        )
-                        if not current_photo:
-                            continue
+                            repo.update_last_totals(c, shows=total_shows, clicks=total_clicks)
 
-                        threshold = int(getattr(c, "views_per_photo", 0) or 0)
-                        if threshold > 0 and int(getattr(current_photo, "shows", 0) or 0) >= threshold:
-                            # switch or finalize
-                            if int(c.current_photo_order or 1) < int(getattr(c, "photos_count", 0) or 0):
-                                logger.info("[scheduler] SWITCH company=%s -> next photo", c.id)
-                                self.service.switch_to_next_photo(db=db, company=c)
-                            else:
-                                logger.info("[scheduler] FINISH company=%s -> finalize winner", c.id)
-                                self.service.finalize_winner(db=db, company=c, stop_campaign=True)
+                            current_photo = (
+                                db.query(PromotionPhoto)
+                                .filter(PromotionPhoto.company_id == c.id, PromotionPhoto.order == int(c.current_photo_order or 1))
+                                .first()
+                            )
+                            if not current_photo:
+                                continue
 
-                    except Exception as e:
-                        logger.exception("[scheduler] company tick failed company=%s", getattr(c, "id", None))
-                        repo.mark_failed(c, f"tick error: {e}")
+                            threshold = int(getattr(c, "views_per_photo", 0) or 0)
+                            if threshold > 0 and int(getattr(current_photo, "shows", 0) or 0) >= threshold:
+                                if int(c.current_photo_order or 1) < int(getattr(c, "photos_count", 0) or 0):
+                                    logger.info("[scheduler] SWITCH company=%s -> next photo", c.id)
+                                    self.service.switch_to_next_photo(db=db, company=c)
+                                else:
+                                    logger.info("[scheduler] FINISH company=%s -> finalize winner", c.id)
+                                    self.service.finalize_winner(db=db, company=c, stop_campaign=True)
+
+                        except Exception as e:
+                            logger.exception("[scheduler] company tick failed company=%s", getattr(c, "id", None))
+                            repo.mark_failed(c, f"tick error: {e}")
 
         finally:
             db.close()

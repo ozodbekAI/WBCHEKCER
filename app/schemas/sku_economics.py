@@ -201,3 +201,17 @@ class AdAnalysisUploadResultOut(BaseModel):
     resolved_by_vendor_code: int = 0
     unresolved_count: int = 0
     unresolved_preview: List[AdAnalysisUploadUnresolvedRowOut] = Field(default_factory=list)
+
+
+class AdAnalysisBootstrapStatusOut(BaseModel):
+    task_id: Optional[int] = None
+    store_id: int
+    status: Literal["idle", "pending", "running", "completed", "failed"] = "idle"
+    progress: int = 0
+    step: str = ""
+    ready: bool = False
+    error: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    period_start: Optional[date] = None
+    period_end: Optional[date] = None

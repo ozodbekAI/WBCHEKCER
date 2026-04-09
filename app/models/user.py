@@ -7,6 +7,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from ..core.database import Base
+from app.core.time import utc_now
 
 
 class UserRole(str, enum.Enum):
@@ -136,8 +137,8 @@ class User(Base):
     is_verified = Column(Boolean, default=False)
     store_id = Column(Integer, ForeignKey("stores.id", ondelete="SET NULL"), nullable=True)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     last_login = Column(DateTime, nullable=True)
     last_active_at = Column(DateTime, nullable=True)
     

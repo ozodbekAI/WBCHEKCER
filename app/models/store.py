@@ -7,6 +7,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from ..core.database import Base
+from app.core.time import utc_now
 
 
 class StoreStatus(str, enum.Enum):
@@ -36,6 +37,8 @@ class Store(Base):
     # WB Store info (populated after validation)
     wb_supplier_id = Column(String(100), nullable=True)
     wb_supplier_name = Column(String(255), nullable=True)
+    wb_ping_access = Column(JSON, nullable=True)
+    wb_ping_checked_at = Column(DateTime, nullable=True)
     
     # Statistics (cached)
     total_cards = Column(Integer, default=0)
@@ -46,14 +49,21 @@ class Store(Base):
     last_sync_at = Column(DateTime, nullable=True)
     last_analysis_at = Column(DateTime, nullable=True)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     
     # Relationships
     owner = relationship("User", back_populates="stores", foreign_keys=[owner_id])
     cards = relationship("Card", back_populates="store", cascade="all, delete-orphan")
-    
+    feature_api_keys = relationship("StoreApiKey", back_populates="store", cascade="all, delete-orphan")
+
     __table_args__ = (
         Index("idx_stores_owner_id", "owner_id"),
         Index("idx_stores_status", "status"),
     )
+
+    @property
+    def wb_token_access(self) -> dict:
+        from ..services.wb_token_access import summarize_store_wb_token_access
+
+        return summarize_store_wb_token_access(self)

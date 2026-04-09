@@ -6,6 +6,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from ..core.database import Base
+from app.core.time import utc_now
 
 
 class Card(Base):
@@ -58,6 +59,7 @@ class Card(Base):
     
     # Raw WB data
     raw_data = Column(JSON, default=dict)
+    wb_updated_at = Column(DateTime, nullable=True)
 
     # Product DNA — detailed technical description generated from photo ONCE,
     # reused in all subsequent AI calls (audit, title, description generation).
@@ -65,8 +67,8 @@ class Card(Base):
     
     # Timestamps
     last_analysis_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     
     # After applying our own fix to WB, skip the next scheduler re-analysis
     # (WB updates updatedAt after our fix, which would otherwise trigger re-analysis)
@@ -80,5 +82,6 @@ class Card(Base):
         Index("idx_cards_store_id", "store_id"),
         Index("idx_cards_nm_id", "nm_id"),
         Index("idx_cards_score", "score"),
+        Index("idx_cards_wb_updated_at", "wb_updated_at"),
         Index("idx_cards_store_nm", "store_id", "nm_id", unique=True),
     )

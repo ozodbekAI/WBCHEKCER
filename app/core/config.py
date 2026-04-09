@@ -1,14 +1,18 @@
 from functools import lru_cache
+import json
 from pathlib import Path
+from typing import Any
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     # Application
     APP_NAME: str = "WB Card Optimizer"
     APP_VERSION: str = "1.0.0"
@@ -89,7 +93,11 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:3001"
 
     # Scheduler settings
+    CARD_SCHEDULER_ENABLED: bool = True
     CARD_SCHEDULER_INTERVAL_SEC: int = 600  # 10 minutes
+
+    # CORS
+    CORS_ALLOWED_ORIGINS: list[str] = []
 
     # SMTP Email settings (leave empty to use console logging instead of real email)
     SMTP_HOST: str = ""
@@ -98,10 +106,6 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM: str = "noreply@wb-optimizer.local"
     SMTP_TLS: bool = True
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
 
     @field_validator("DEBUG", mode="before")
     @classmethod
@@ -115,6 +119,27 @@ class Settings(BaseSettings):
             if vv in {"0", "false", "no", "off", "release", "prod", "production"}:
                 return False
         return False
+
+    @field_validator("CORS_ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def _parse_cors_allowed_origins(cls, value: Any) -> list[str]:
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        raise TypeError("Invalid CORS_ALLOWED_ORIGINS value")
 
 
 @lru_cache()

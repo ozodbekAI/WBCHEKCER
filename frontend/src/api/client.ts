@@ -1,13 +1,37 @@
 const DEFAULT_API_BASE = '/api';
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
-const API_BASE = RAW_API_BASE || DEFAULT_API_BASE;
-export const API_ORIGIN = new URL(API_BASE, window.location.origin).origin;
+const LOCAL_API_BASE_RE = /^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3})(?::\d+)?(?:\/.*)?$/i;
+const API_BASE =
+  RAW_API_BASE && !(import.meta.env.PROD && LOCAL_API_BASE_RE.test(RAW_API_BASE))
+    ? RAW_API_BASE
+    : DEFAULT_API_BASE;
+const API_URL = new URL(API_BASE, window.location.origin);
+export const API_ROOT = API_URL.toString().replace(/\/+$/, '');
+export const API_ORIGIN = API_URL.origin;
 
 class ApiClient {
   private token: string | null = null;
+  private refreshPromise: Promise<string | null> | null = null;
 
   constructor() {
     this.token = localStorage.getItem('access_token');
+  }
+
+  private setRefreshToken(token: string | null) {
+    if (token) {
+      localStorage.setItem('refresh_token', token);
+    } else {
+      localStorage.removeItem('refresh_token');
+    }
+  }
+
+  private applyAuthPayload(data: any) {
+    if (data?.access_token) {
+      this.setToken(data.access_token);
+    }
+    if (Object.prototype.hasOwnProperty.call(data || {}, 'refresh_token')) {
+      this.setRefreshToken(data?.refresh_token || null);
+    }
   }
 
   setToken(token: string | null) {
@@ -24,7 +48,151 @@ class ApiClient {
   }
 
   buildUrl(path: string): string {
-    return new URL(`${API_BASE}${path}`, window.location.origin).toString();
+    return new URL(path.replace(/^\//, ''), `${API_ROOT}/`).toString();
+  }
+
+  private isAuthEndpoint(path: string): boolean {
+    return (
+      path === '/auth/login' ||
+      path === '/auth/register' ||
+      path === '/auth/refresh' ||
+      path.startsWith('/auth/accept-invite/')
+    );
+  }
+
+  private withHeaders(
+    headers?: HeadersInit,
+    options?: { auth?: boolean; storeId?: number; contentType?: string | null },
+  ): Headers {
+    const next = new Headers(headers || {});
+    const auth = options?.auth !== false;
+
+    if (options?.contentType && !next.has('Content-Type')) {
+      next.set('Content-Type', options.contentType);
+    }
+    if (auth && this.token && !next.has('Authorization')) {
+      next.set('Authorization', `Bearer ${this.token}`);
+    }
+    if (options?.storeId && !next.has('X-Store-Id')) {
+      next.set('X-Store-Id', String(options.storeId));
+    }
+
+    return next;
+  }
+
+  private async refreshSession(): Promise<string | null> {
+    if (this.refreshPromise) {
+      return this.refreshPromise;
+    }
+
+    const refreshToken = localStorage.getItem('refresh_token');
+    if (!refreshToken) {
+      this.logout();
+      return null;
+    }
+
+    this.refreshPromise = (async () => {
+      const res = await fetch(this.buildUrl('/auth/refresh'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+
+      if (!res.ok) {
+        this.logout();
+        return null;
+      }
+
+      const data = await res.json().catch(() => null);
+      if (!data?.access_token) {
+        this.logout();
+        return null;
+      }
+
+      this.applyAuthPayload(data);
+      return data.access_token as string;
+    })().finally(() => {
+      this.refreshPromise = null;
+    });
+
+    return this.refreshPromise;
+  }
+
+  private async fetchWithSession(
+    path: string,
+    init: RequestInit = {},
+    options?: { auth?: boolean; storeId?: number; retryOn401?: boolean; contentType?: string | null },
+  ): Promise<Response> {
+    const auth = options?.auth !== false;
+    const retryOn401 = options?.retryOn401 !== false;
+    const execute = () =>
+      fetch(this.buildUrl(path), {
+        ...init,
+        headers: this.withHeaders(init.headers, options),
+      });
+
+    let res = await execute();
+    if (res.status === 401 && auth && retryOn401 && !this.isAuthEndpoint(path)) {
+      const refreshed = await this.refreshSession();
+      if (refreshed) {
+        res = await execute();
+      }
+    }
+
+    if (res.status === 401 && auth && !this.isAuthEndpoint(path)) {
+      this.logout();
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login';
+      }
+    }
+
+    return res;
+  }
+
+  private async buildError(res: Response): Promise<Error> {
+    const err = await res.json().catch(() => ({ detail: `Error ${res.status}` }));
+    const detail = err?.detail;
+    if (typeof detail === 'string') {
+      return new Error(detail);
+    }
+    if (detail && typeof detail === 'object') {
+      const e = new Error((detail.message as string) || `Error ${res.status}`) as Error & {
+        code?: string;
+        email?: string;
+        detail?: any;
+        status?: number;
+      };
+      e.code = detail.code;
+      e.email = detail.email;
+      e.detail = detail;
+      e.status = res.status;
+      return e;
+    }
+    return new Error(`Error ${res.status}`);
+  }
+
+  async requestRaw(
+    path: string,
+    init: RequestInit = {},
+    options?: { auth?: boolean; storeId?: number; retryOn401?: boolean; contentType?: string | null },
+  ): Promise<Response> {
+    const res = await this.fetchWithSession(path, init, options);
+    if (!res.ok) {
+      throw await this.buildError(res);
+    }
+    return res;
+  }
+
+  async requestJson<T>(
+    path: string,
+    init: RequestInit = {},
+    options?: { auth?: boolean; storeId?: number; retryOn401?: boolean; contentType?: string | null },
+  ): Promise<T> {
+    const res = await this.requestRaw(path, init, options);
+    if (res.status === 204) return null as T;
+    const text = await res.text();
+    if (!text) return null as T;
+    return JSON.parse(text);
   }
 
   private async request<T>(
@@ -42,73 +210,23 @@ class ApiClient {
       });
     }
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-
-    if (this.token) {
-      headers['Authorization'] = `Bearer ${this.token}`;
-    }
-
-    const res = await fetch(url.toString(), {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-    });
-
-    if (res.status === 401) {
-      const isAuthEndpoint =
-        path === '/auth/login' ||
-        path === '/auth/register' ||
-        path.startsWith('/auth/accept-invite/');
-
-      const err = await res.json().catch(() => ({ detail: 'Unauthorized' }));
-
-      if (!isAuthEndpoint) {
-        this.setToken(null);
-        localStorage.removeItem('refresh_token');
-        if (window.location.pathname !== '/login') {
-          window.location.href = '/login';
-        }
-      }
-
-      throw new Error(err.detail || 'Unauthorized');
-    }
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: 'Network error' }));
-      const detail = err?.detail;
-      if (typeof detail === 'string') {
-        throw new Error(detail);
-      }
-      if (detail && typeof detail === 'object') {
-        const e = new Error((detail.message as string) || `Error ${res.status}`) as Error & {
-          code?: string;
-          email?: string;
-          detail?: any;
-          status?: number;
-        };
-        e.code = detail.code;
-        e.email = detail.email;
-        e.detail = detail;
-        e.status = res.status;
-        throw e;
-      }
-      throw new Error(`Error ${res.status}`);
-    }
-
-    if (res.status === 204) return null as T;
-
-    const text = await res.text();
-    if (!text) return null as T;
-    return JSON.parse(text);
+    const relativePath = `${path}${url.search}`;
+    return this.requestJson<T>(
+      relativePath,
+      {
+        method,
+        body: body ? JSON.stringify(body) : undefined,
+      },
+      {
+        contentType: 'application/json',
+      },
+    );
   }
 
   // ============ Auth ============
   async login(email: string, password: string) {
     const data = await this.request<any>('POST', '/auth/login', { email, password });
-    this.setToken(data.access_token);
-    localStorage.setItem('refresh_token', data.refresh_token);
+    this.applyAuthPayload(data);
     return data;
   }
 
@@ -134,8 +252,7 @@ class ApiClient {
 
   async verifyRegisterCode(email: string, code: string) {
     const data = await this.request<any>('POST', '/auth/register/verify-code', { email, code });
-    this.setToken(data.access_token);
-    localStorage.setItem('refresh_token', data.refresh_token);
+    this.applyAuthPayload(data);
     return data;
   }
 
@@ -157,15 +274,10 @@ class ApiClient {
   async uploadMyAvatar(file: File) {
     const form = new FormData();
     form.append('file', file);
-    const resp = await fetch(this.buildUrl('/auth/me/avatar'), {
+    const resp = await this.requestRaw('/auth/me/avatar', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${this.token || ''}` },
       body: form,
     });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || 'Avatar upload failed');
-    }
     return resp.json();
   }
 
@@ -175,7 +287,7 @@ class ApiClient {
 
   logout() {
     this.setToken(null);
-    localStorage.removeItem('refresh_token');
+    this.setRefreshToken(null);
   }
 
   // ============ Stores ============
@@ -187,6 +299,18 @@ class ApiClient {
     return this.request<any>('GET', `/stores/${storeId}`);
   }
 
+  async updateStore(storeId: number, data: { name?: string; api_key?: string }) {
+    return this.request<any>('PATCH', `/stores/${storeId}`, data);
+  }
+
+  async updateStoreFeatureKey(storeId: number, slotKey: string, apiKey: string) {
+    return this.request<any>('PUT', `/stores/${storeId}/keys/${slotKey}`, { api_key: apiKey });
+  }
+
+  async deleteStoreFeatureKey(storeId: number, slotKey: string) {
+    return this.request<any>('DELETE', `/stores/${storeId}/keys/${slotKey}`);
+  }
+
   async getStoreStats(storeId: number) {
     return this.request<any>('GET', `/stores/${storeId}/stats`);
   }
@@ -195,6 +319,20 @@ class ApiClient {
     return this.request<any>('POST', '/stores/onboard', {
       api_key: apiKey, name: name || undefined, use_ai: useAi,
     });
+  }
+
+  async startOnboarding(apiKey: string, name?: string, useAi: boolean = true) {
+    return this.request<import('../types').OnboardStartResponse>('POST', '/stores/onboard/start', {
+      api_key: apiKey, name: name || undefined, use_ai: useAi,
+    });
+  }
+
+  async getOnboardingStatus(taskId: string) {
+    return this.request<import('../types').OnboardingTaskStatus>('GET', `/stores/onboard/status/${taskId}`);
+  }
+
+  async cancelOnboarding(taskId: string) {
+    return this.request<import('../types').OnboardingTaskStatus>('POST', `/stores/onboard/status/${taskId}/cancel`);
   }
 
   async syncCards(storeId: number) {
@@ -225,6 +363,10 @@ class ApiClient {
     return this.request<any>('GET', `/stores/${storeId}/sync/status/${taskId}`);
   }
 
+  async cancelSyncTask(storeId: number, taskId: string) {
+    return this.request<any>('POST', `/stores/${storeId}/sync/status/${taskId}/cancel`);
+  }
+
   async getSchedulerStatus() {
     return this.request<{
       is_running: boolean;
@@ -237,6 +379,55 @@ class ApiClient {
 
   async getSyncPreview(storeId: number) {
     return this.request<any>('GET', `/stores/${storeId}/sync/preview`);
+  }
+
+  // ============ Promotion / A/B tests ============
+  async getPromotionList(
+    storeId: number,
+    status: 'running' | 'pending' | 'finished' | 'failed',
+    params?: { page?: number; page_size?: number },
+  ) {
+    const search = new URLSearchParams();
+    if (params?.page !== undefined) search.set('page', String(params.page));
+    if (params?.page_size !== undefined) search.set('page_size', String(params.page_size));
+    const path = search.size ? `/promotion/${status}?${search.toString()}` : `/promotion/${status}`;
+    return this.requestStoreJson<any>(storeId, path);
+  }
+
+  async getPromotionBalance(storeId: number) {
+    return this.requestStoreJson<any>(storeId, '/promotion/balance');
+  }
+
+  async createPromotionCompany(storeId: number, payload: Record<string, any>) {
+    return this.requestStoreJson<any>(
+      storeId,
+      '/promotion/create_company',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      { contentType: 'application/json' },
+    );
+  }
+
+  async updatePromotionCompany(storeId: number, payload: Record<string, any>) {
+    return this.requestStoreJson<any>(
+      storeId,
+      '/promotion/update',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      { contentType: 'application/json' },
+    );
+  }
+
+  async startPromotionCompany(storeId: number, companyId: number) {
+    return this.requestStoreJson<any>(storeId, `/promotion/company/${companyId}/start`, { method: 'POST' });
+  }
+
+  async stopPromotionCompany(storeId: number, companyId: number) {
+    return this.requestStoreJson<any>(storeId, `/promotion/company/${companyId}/stop`, { method: 'POST' });
   }
 
   // ============ Ad Analysis / SKU Economics ============
@@ -254,18 +445,23 @@ class ApiClient {
     return this.request<import('../types').AdAnalysisOverview>('GET', `/stores/${storeId}/ad-analysis/overview`, undefined, params);
   }
 
+  async startAdAnalysisBootstrap(storeId: number, force: boolean = false) {
+    return this.request<import('../types').AdAnalysisBootstrapStatus>('POST', `/stores/${storeId}/ad-analysis/bootstrap/start`, undefined, {
+      force: force || undefined,
+    });
+  }
+
+  async getAdAnalysisBootstrapStatus(storeId: number) {
+    return this.request<import('../types').AdAnalysisBootstrapStatus>('GET', `/stores/${storeId}/ad-analysis/bootstrap/status`);
+  }
+
   async uploadAdAnalysisCosts(storeId: number, file: File) {
     const form = new FormData();
     form.append('file', file);
-    const resp = await fetch(this.buildUrl(`/stores/${storeId}/ad-analysis/costs/upload`), {
+    const resp = await this.requestRaw(`/stores/${storeId}/ad-analysis/costs/upload`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${this.token || ''}` },
       body: form,
     });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || 'Upload failed');
-    }
     return resp.json() as Promise<import('../types').AdAnalysisUploadResult>;
   }
 
@@ -274,15 +470,10 @@ class ApiClient {
     form.append('file', file);
     form.append('period_start', periodStart);
     form.append('period_end', periodEnd);
-    const resp = await fetch(this.buildUrl(`/stores/${storeId}/ad-analysis/manual-spend/upload`), {
+    const resp = await this.requestRaw(`/stores/${storeId}/ad-analysis/manual-spend/upload`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${this.token || ''}` },
       body: form,
     });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || 'Upload failed');
-    }
     return resp.json() as Promise<import('../types').AdAnalysisUploadResult>;
   }
 
@@ -291,15 +482,10 @@ class ApiClient {
     form.append('file', file);
     form.append('period_start', periodStart);
     form.append('period_end', periodEnd);
-    const resp = await fetch(this.buildUrl(`/stores/${storeId}/ad-analysis/finance/upload`), {
+    const resp = await this.requestRaw(`/stores/${storeId}/ad-analysis/finance/upload`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${this.token || ''}` },
       body: form,
     });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || 'Upload failed');
-    }
     return resp.json() as Promise<import('../types').AdAnalysisUploadResult>;
   }
 
@@ -370,18 +556,89 @@ class ApiClient {
     if (options?.assetType) form.append('asset_type', options.assetType);
     if (options?.name) form.append('name', options.name);
 
-    const resp = await fetch(this.buildUrl('/photo-assets/user/upload'), {
+    const resp = await this.requestRaw('/photo-assets/user/upload', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${this.token || ''}` },
       body: form,
     });
-
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || 'Photo upload failed');
-    }
-
     return resp.json();
+  }
+
+  async importUserPhotoAssetFromUrl(data: {
+    asset_type: string;
+    source_url: string;
+    name?: string;
+    description?: string;
+    prompt?: string;
+    category?: string;
+    subcategory?: string;
+  }) {
+    return this.requestJson<any>(
+      '/photo-assets/user/import',
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+      },
+      { contentType: 'application/json' },
+    );
+  }
+
+  async getPhotoCatalogAll() {
+    return this.requestJson<any>('/api/photo/catalog/all');
+  }
+
+  async getPhotoGalleryAssets(assetType: 'scene' | 'model') {
+    return this.requestJson<any>(`/photo-assets/catalog?asset_type=${encodeURIComponent(assetType)}`);
+  }
+
+  async getPhotoChatHistory() {
+    return this.requestJson<any>('/api/photo/chat/history');
+  }
+
+  async uploadPhotoChatAsset(file: File) {
+    const form = new FormData();
+    form.append('file', file);
+    const resp = await this.requestRaw('/api/photo/assets/upload', {
+      method: 'POST',
+      body: form,
+    });
+    return resp.json();
+  }
+
+  async importPhotoChatAsset(sourceUrl: string) {
+    return this.requestJson<any>(
+      '/api/photo/assets/import',
+      {
+        method: 'POST',
+        body: JSON.stringify({ source_url: sourceUrl }),
+      },
+      { contentType: 'application/json' },
+    );
+  }
+
+  async streamPhotoChat(payload: Record<string, any>) {
+    return this.requestRaw(
+      '/api/photo/chat/stream',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      { contentType: 'application/json' },
+    );
+  }
+
+  async clearPhotoChat() {
+    return this.requestJson<any>('/api/photo/chat/clear', { method: 'POST' });
+  }
+
+  async deletePhotoChatMessages(messageIds: number[]) {
+    return this.requestJson<any>(
+      '/api/photo/chat/messages/delete',
+      {
+        method: 'POST',
+        body: JSON.stringify({ message_ids: messageIds }),
+      },
+      { contentType: 'application/json' },
+    );
   }
 
   async getCardIssues(storeId: number, cardId: number, status?: string) {
@@ -479,7 +736,9 @@ class ApiClient {
   }
 
   async acceptInvite(token: string, password: string, first_name?: string) {
-    return this.request<any>('POST', `/auth/accept-invite/${token}`, { password, first_name });
+    const data = await this.request<any>('POST', `/auth/accept-invite/${token}`, { password, first_name });
+    this.applyAuthPayload(data);
+    return data;
   }
 
   async getRoles(storeId: number) {
@@ -559,10 +818,7 @@ class ApiClient {
   }
 
   async downloadFixedTemplate(storeId: number): Promise<Blob> {
-    const resp = await fetch(this.buildUrl(`/stores/${storeId}/fixed-file/template`), {
-      headers: { Authorization: `Bearer ${this.token || ''}` },
-    });
-    if (!resp.ok) throw new Error('Template download failed');
+    const resp = await this.requestRaw(`/stores/${storeId}/fixed-file/template`);
     return resp.blob();
   }
 
@@ -570,15 +826,10 @@ class ApiClient {
     const form = new FormData();
     form.append('file', file);
     const url = `/stores/${storeId}/fixed-file/upload?replace_all=${replaceAll}`;
-    const resp = await fetch(this.buildUrl(url), {
+    const resp = await this.requestRaw(url, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${this.token || ''}` },
       body: form,
     });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || 'Upload failed');
-    }
     return resp.json();
   }
 
@@ -632,6 +883,24 @@ class ApiClient {
 
   async applyCard(storeId: number, cardId: number): Promise<import('../types').CardDetail> {
     return this.request<import('../types').CardDetail>('POST', `/stores/${storeId}/cards/${cardId}/apply`);
+  }
+
+  async requestStoreJson<T>(
+    storeId: number,
+    path: string,
+    init: RequestInit = {},
+    options?: { retryOn401?: boolean; contentType?: string | null },
+  ) {
+    return this.requestJson<T>(path, init, { ...options, storeId });
+  }
+
+  async requestStoreRaw(
+    storeId: number,
+    path: string,
+    init: RequestInit = {},
+    options?: { retryOn401?: boolean; contentType?: string | null },
+  ) {
+    return this.requestRaw(path, init, { ...options, storeId });
   }
 }
 

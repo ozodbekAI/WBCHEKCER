@@ -2,6 +2,8 @@ import React, { createContext, useContext, useState, useCallback, useEffect, use
 import api from '../api/client';
 import { useAuth } from './AuthContext';
 import type { Store } from '../types';
+import { isStoreFeatureAllowed } from '../lib/storeAccess';
+import { toast } from 'sonner';
 
 interface StoreContextType {
   stores: Store[];
@@ -23,6 +25,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(false);
   const [storesReady, setStoresReady] = useState(false);
   const loadedOnce = useRef(false);
+  const adAnalysisBootstrapStartedForStore = useRef<number | null>(null);
 
   const loadStores = useCallback(async () => {
     setLoading(true);
@@ -41,6 +44,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
     } catch (e) {
       console.error('Failed to load stores:', e);
+      toast.error('Не удалось загрузить список магазинов');
     } finally {
       setLoading(false);
       setStoresReady(true);
@@ -65,6 +69,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setStoresReady(false);
     }
   }, [isAuthenticated, authLoading, loadStores]);
+
+  useEffect(() => {
+    if (!activeStore) return;
+    if (!isStoreFeatureAllowed(activeStore, 'ad_analysis')) return;
+    if (adAnalysisBootstrapStartedForStore.current === activeStore.id) return;
+
+    adAnalysisBootstrapStartedForStore.current = activeStore.id;
+    void api.startAdAnalysisBootstrap(activeStore.id).catch(() => {
+      // Ad analysis warms up in the background; route gate will surface errors if needed.
+    });
+  }, [activeStore?.id, activeStore?.wb_token_access]);
 
   const selectStore = useCallback((storeId: number) => {
     const store = stores.find(s => s.id === storeId);

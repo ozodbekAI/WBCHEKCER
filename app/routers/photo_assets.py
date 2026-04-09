@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -26,6 +26,8 @@ router = APIRouter(prefix="/photo-assets", tags=["Photo Assets"])
 # ==================== Schemas ====================
 
 class PhotoAssetResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     asset_type: str
     owner_type: str
@@ -42,10 +44,6 @@ class PhotoAssetResponse(BaseModel):
     order_index: int
     is_active: bool
     
-    class Config:
-        from_attributes = True
-
-
 class PhotoAssetCreate(BaseModel):
     asset_type: str  # model, scene, pose, custom
     name: str
