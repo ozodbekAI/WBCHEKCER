@@ -26,7 +26,10 @@ router = APIRouter(prefix="/stores/{store_id}/ad-analysis", tags=["Ad Analysis"]
 AD_ANALYSIS_BOOTSTRAP_TASK_TYPE = "ad_analysis_bootstrap"
 AD_ANALYSIS_BOOTSTRAP_DAYS = 14
 AD_ANALYSIS_BOOTSTRAP_PRESET = "14d"
-AD_ANALYSIS_BOOTSTRAP_STALE_AFTER = timedelta(minutes=5)
+AD_ANALYSIS_BOOTSTRAP_STALE_AFTER = timedelta(minutes=20)
+AD_ANALYSIS_BOOTSTRAP_TIMEOUT_SEC = 900
+BOOTSTRAP_SOURCE_MODES = {"ok", "partial", "manual", "manual_required", "error", "empty"}
+BOOTSTRAP_FAILED_SOURCES = {"advert", "finance", "funnel", "snapshot", "unknown"}
 
 
 async def _get_accessible_store(
@@ -79,15 +82,56 @@ def _bootstrap_progress(task: AnalysisTask | None) -> int:
     return max(5, min(int(processed_items / total_items * 100), 95))
 
 
+def _failed_source_from_stage(stage: str | None) -> str:
+    normalized = str(stage or "").strip()
+    if normalized == "fetching_advert":
+        return "advert"
+    if normalized == "fetching_finance":
+        return "finance"
+    if normalized == "fetching_funnel":
+        return "funnel"
+    if normalized == "building_snapshot":
+        return "snapshot"
+    return "unknown"
+
+
 def _serialize_bootstrap_task(task: AnalysisTask | None, *, store_id: int) -> AdAnalysisBootstrapStatusOut:
     payload = task.result if isinstance(getattr(task, "result", None), dict) else {}
     status_value = str(getattr(task, "status", "idle") or "idle")
     if status_value not in {"idle", "pending", "running", "completed", "failed"}:
         status_value = "idle"
+    current_stage = str(payload.get("current_stage") or "").strip() or None
+    if current_stage not in {
+        "queued",
+        "fetching_advert",
+        "fetching_finance",
+        "fetching_funnel",
+        "building_snapshot",
+        "completed_partial",
+        "completed",
+        "failed",
+    }:
+        current_stage = None
+    source_statuses_raw = payload.get("source_statuses")
+    source_statuses: dict[str, str] = {}
+    if isinstance(source_statuses_raw, dict):
+        for source_id, mode in source_statuses_raw.items():
+            source_key = str(source_id or "").strip()
+            mode_value = str(mode or "").strip()
+            if source_key and mode_value in BOOTSTRAP_SOURCE_MODES:
+                source_statuses[source_key] = mode_value
+    stage_progress = int(payload.get("stage_progress") or 0)
+    if stage_progress <= 0:
+        stage_progress = _bootstrap_progress(task)
+    stage_progress = max(0, min(stage_progress, 100))
+    is_partial = bool(payload.get("is_partial"))
+    failed_source = str(payload.get("failed_source") or "").strip() or None
+    if failed_source not in BOOTSTRAP_FAILED_SOURCES:
+        failed_source = None
     step = str(payload.get("step") or "").strip()
     if not step:
         if status_value == "completed":
-            step = "Данные для анализа рекламы готовы"
+            step = "Данные для анализа рекламы готовы" if not is_partial else "Данные собраны частично, можно работать и дозагрузить вручную."
         elif status_value == "failed":
             step = "Не удалось подготовить анализ рекламы"
         elif status_value in {"pending", "running"}:
@@ -100,6 +144,11 @@ def _serialize_bootstrap_task(task: AnalysisTask | None, *, store_id: int) -> Ad
         status=status_value,
         progress=_bootstrap_progress(task),
         step=step,
+        current_stage=current_stage,
+        stage_progress=stage_progress,
+        source_statuses=source_statuses,
+        is_partial=is_partial,
+        failed_source=failed_source,
         ready=status_value == "completed",
         error=getattr(task, "error_message", None) or payload.get("error"),
         started_at=getattr(task, "started_at", None),
@@ -139,6 +188,8 @@ async def _run_ad_analysis_bootstrap(task_id: int, store_id: int) -> None:
         task = await db.get(AnalysisTask, int(task_id))
         if task is None:
             return
+        current_stage = "queued"
+        source_statuses: dict[str, str] = {}
 
         try:
             task.status = "running"
@@ -151,6 +202,11 @@ async def _run_ad_analysis_bootstrap(task_id: int, store_id: int) -> None:
                 "step": "Сохраняем базовые слои рекламы, финансов и воронки из Wildberries...",
                 "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
                 "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
+                "current_stage": "queued",
+                "stage_progress": 5,
+                "source_statuses": source_statuses,
+                "is_partial": False,
+                "failed_source": None,
             })
             await db.commit()
 
@@ -165,6 +221,59 @@ async def _run_ad_analysis_bootstrap(task_id: int, store_id: int) -> None:
 
             ensure_store_feature_access(store, "ad_analysis")
 
+            current_stage = "fetching_advert"
+            task.result = jsonable_encoder({
+                "step": "Загружаем рекламные кампании и расход из WB Advert...",
+                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
+                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
+                "current_stage": current_stage,
+                "stage_progress": 20,
+                "source_statuses": source_statuses,
+                "is_partial": False,
+                "failed_source": None,
+            })
+            await db.commit()
+
+            current_stage = "fetching_finance"
+            task.result = jsonable_encoder({
+                "step": "Загружаем финансовый слой из WB Statistics...",
+                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
+                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
+                "current_stage": current_stage,
+                "stage_progress": 35,
+                "source_statuses": source_statuses,
+                "is_partial": False,
+                "failed_source": None,
+            })
+            await db.commit()
+
+            current_stage = "fetching_funnel"
+            task.result = jsonable_encoder({
+                "step": "Загружаем воронку продаж из WB Analytics...",
+                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
+                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
+                "current_stage": current_stage,
+                "stage_progress": 45,
+                "source_statuses": source_statuses,
+                "is_partial": False,
+                "failed_source": None,
+            })
+            await db.commit()
+
+            task.processed_items = 2
+            current_stage = "building_snapshot"
+            task.result = jsonable_encoder({
+                "step": "Загружаем источники WB и строим витрину анализа...",
+                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
+                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
+                "current_stage": current_stage,
+                "stage_progress": 60,
+                "source_statuses": source_statuses,
+                "is_partial": False,
+                "failed_source": None,
+            })
+            await db.commit()
+
             overview = await asyncio.wait_for(
                 sku_economics_service.build_overview(
                     db,
@@ -173,14 +282,34 @@ async def _run_ad_analysis_bootstrap(task_id: int, store_id: int) -> None:
                     preset=AD_ANALYSIS_BOOTSTRAP_PRESET,
                     force=True,
                 ),
-                timeout=180,
+                timeout=AD_ANALYSIS_BOOTSTRAP_TIMEOUT_SEC,
+            )
+
+            source_statuses = {str(src.id): str(src.mode) for src in (overview.source_statuses or [])}
+            finance_failed = source_statuses.get("finance") in {"manual_required", "error"}
+            advert_or_funnel_ready = any(
+                source_statuses.get(source_id) in {"ok", "partial", "manual"}
+                for source_id in ("advert", "funnel")
+            )
+            force_partial = finance_failed and advert_or_funnel_ready
+            is_partial = any(
+                mode in {"partial", "manual_required", "error"}
+                for mode in source_statuses.values()
+            ) or force_partial
+            current_stage = "completed_partial" if is_partial else "completed"
+            completion_step = (
+                "Финансы WB недоступны: анализ собран частично по рекламе и воронке, можно дозагрузить финансы вручную."
+                if force_partial
+                else "Данные собраны частично: можно работать и дозагрузить недостающие источники вручную."
+                if is_partial
+                else "Данные для анализа рекламы готовы"
             )
 
             task.status = "completed"
             task.processed_items = task.total_items
             task.completed_at = utc_now()
             task.result = jsonable_encoder({
-                "step": "Данные для анализа рекламы готовы",
+                "step": completion_step,
                 "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
                 "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
                 "period_start": overview.period_start,
@@ -188,10 +317,18 @@ async def _run_ad_analysis_bootstrap(task_id: int, store_id: int) -> None:
                 "snapshot_ready": overview.snapshot_ready,
                 "available_period_start": overview.available_period_start,
                 "available_period_end": overview.available_period_end,
+                "current_stage": current_stage,
+                "stage_progress": 100,
+                "source_statuses": source_statuses,
+                "is_partial": is_partial,
+                "failed_source": None,
             })
             await db.commit()
         except Exception as exc:
             await db.rollback()
+            failed_source = _failed_source_from_stage(current_stage)
+            if failed_source in {"advert", "finance", "funnel"}:
+                source_statuses[failed_source] = "error"
             task.status = "failed"
             task.completed_at = utc_now()
             task.error_message = str(exc)
@@ -200,6 +337,11 @@ async def _run_ad_analysis_bootstrap(task_id: int, store_id: int) -> None:
                 "error": str(exc),
                 "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
                 "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
+                "current_stage": "failed",
+                "stage_progress": 100,
+                "source_statuses": source_statuses,
+                "is_partial": False,
+                "failed_source": failed_source,
             })
             await db.commit()
 
@@ -227,6 +369,11 @@ async def _start_or_get_bootstrap_task(
             "error": latest_task.error_message,
             "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
             "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
+            "current_stage": "failed",
+            "stage_progress": 100,
+            "source_statuses": {},
+            "is_partial": False,
+            "failed_source": "unknown",
         })
         await db.commit()
 
@@ -240,6 +387,11 @@ async def _start_or_get_bootstrap_task(
             "step": "Ставим подготовку анализа рекламы в очередь...",
             "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
             "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
+            "current_stage": "queued",
+            "stage_progress": 0,
+            "source_statuses": {},
+            "is_partial": False,
+            "failed_source": None,
         }),
     )
     db.add(task)

@@ -26,6 +26,7 @@ from app.models.photo_chat import PhotoChatSession, PhotoChatMedia
 from app.services.scence_repositories import SceneCategoryRepository, PoseRepository
 from app.services.model_repository import ModelRepository
 from app.services.kie_service.kie_services import kie_service, KIEInsufficientCreditsError
+from app.services.photo_error_mapper import map_photo_error
 from app.services.media_storage import save_generated_file
 
 logger = logging.getLogger("photo.chat.controller")
@@ -383,8 +384,27 @@ class PhotoChatController:
         """
 
         action_type = (quick_action.get("type") or quick_action.get("action") or "").strip()
+        def _emit_error(raw_error: Any) -> str:
+            mapped = map_photo_error(raw_error, context=f"quick_action:{action_type or 'unknown'}")
+            logger.warning(
+                "photo quick_action mapped error | action=%s code=%s raw=%s",
+                action_type or "unknown",
+                mapped.get("code"),
+                str(raw_error or ""),
+            )
+            return _sse(
+                "message",
+                {
+                    "type": "error",
+                    "message": mapped.get("message"),
+                    "code": mapped.get("code"),
+                    "retryable": bool(mapped.get("retryable", True)),
+                    "error": mapped,
+                },
+            )
+
         if not action_type:
-            yield _sse("error", {"message": "quick_action.type is required"})
+            yield _emit_error("quick_action.type is required")
             return
 
         # Choose source image(s). Prefer explicit ids, otherwise use the most recent
@@ -493,13 +513,13 @@ class PhotoChatController:
                 except Exception:
                     prompt_id = 0
                 if not prompt_id:
-                    yield _sse("error", {"message": "pose_prompt_id is required"})
+                    yield _emit_error("pose_prompt_id is required")
                     return
 
                 pose_repo = PoseRepository(db)
                 pose_prompt = pose_repo.get_prompt(prompt_id)
                 if not pose_prompt:
-                    yield _sse("error", {"message": "Pose prompt not found"})
+                    yield _emit_error("Pose prompt not found")
                     return
 
                 prompt_text = getattr(pose_prompt, "name", None) or getattr(pose_prompt, "prompt", "") or "Сменить позу"
@@ -508,7 +528,7 @@ class PhotoChatController:
                 result = await kie_service.change_pose(src_url, pose_prompt.prompt)
                 out_bytes = result.get("image")
                 if not out_bytes:
-                    yield _sse("error", {"message": "No image in result"})
+                    yield _emit_error("No image in result")
                     return
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
@@ -522,13 +542,13 @@ class PhotoChatController:
                 except Exception:
                     item_id = 0
                 if not item_id:
-                    yield _sse("error", {"message": "scene_item_id is required"})
+                    yield _emit_error("scene_item_id is required")
                     return
 
                 scene_repo = SceneCategoryRepository(db)
                 item = scene_repo.get_item(item_id)
                 if not item:
-                    yield _sse("error", {"message": "Scene item not found"})
+                    yield _emit_error("Scene item not found")
                     return
                 sub = scene_repo.get_subcategory(item.subcategory_id)
                 cat = scene_repo.get_category(sub.category_id) if sub else None
@@ -547,7 +567,7 @@ class PhotoChatController:
                 result = await kie_service.change_scene(src_url, full_prompt)
                 out_bytes = result.get("image")
                 if not out_bytes:
-                    yield _sse("error", {"message": "No image in result"})
+                    yield _emit_error("No image in result")
                     return
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
@@ -573,7 +593,7 @@ class PhotoChatController:
 
                 final_prompt = (model_prompt or new_model_prompt or "").strip()
                 if not final_prompt:
-                    yield _sse("error", {"message": "new_model_prompt or model_item_id is required"})
+                    yield _emit_error("new_model_prompt or model_item_id is required")
                     return
 
                 yield _sse("generation_start", {"prompt": "Надеть на модель"})
@@ -585,7 +605,7 @@ class PhotoChatController:
                 )
                 out_bytes = result.get("image")
                 if not out_bytes:
-                    yield _sse("error", {"message": "No image in result"})
+                    yield _emit_error("No image in result")
                     return
 
                 async for chunk in _persist_and_emit(out_bytes, final_prompt):
@@ -602,7 +622,7 @@ class PhotoChatController:
                 result = await kie_service.enhance_photo(src_url, level)
                 out_bytes = result.get("image")
                 if not out_bytes:
-                    yield _sse("error", {"message": "No image in result"})
+                    yield _emit_error("No image in result")
                     return
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
@@ -622,7 +642,7 @@ class PhotoChatController:
                 model_media_item = media_map.get(int(selected_ids[1]))
 
                 if not garment_media or not model_media_item:
-                    yield _sse("error", {"message": "Не найдены загруженные фото"})
+                    yield _emit_error("Не найдены загруженные фото")
                     return
 
                 garment_url = get_file_url(garment_media.relpath)
@@ -636,7 +656,7 @@ class PhotoChatController:
                 )
                 out_bytes = result.get("image")
                 if not out_bytes:
-                    yield _sse("error", {"message": "No image in result"})
+                    yield _emit_error("No image in result")
                     return
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
@@ -646,7 +666,7 @@ class PhotoChatController:
             if action_type == "custom-generation":
                 custom_prompt = (quick_action.get("prompt") or message or "").strip()
                 if not custom_prompt:
-                    yield _sse("error", {"message": "Промпт не указан"})
+                    yield _emit_error("Промпт не указан")
                     return
                 prompt_text = custom_prompt[:100]
 
@@ -654,7 +674,7 @@ class PhotoChatController:
                 result = await kie_service.custom_generation(src_url, custom_prompt)
                 out_bytes = result.get("image")
                 if not out_bytes:
-                    yield _sse("error", {"message": "No image in result"})
+                    yield _emit_error("No image in result")
                     return
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
@@ -678,7 +698,7 @@ class PhotoChatController:
                 )
                 out_bytes = result.get("video") or result.get("image")
                 if not out_bytes:
-                    yield _sse("error", {"message": "No video in result"})
+                    yield _emit_error("No video in result")
                     return
 
                 rel_path = save_generated_file(out_bytes, kind="video")
@@ -735,10 +755,12 @@ class PhotoChatController:
             return
 
         except KIEInsufficientCreditsError as e:
-            yield _sse("error", {"message": str(e)})
+            logger.warning("quick_action insufficient credits action=%s err=%s", action_type, str(e))
+            yield _emit_error(str(e))
             return
         except Exception as e:
-            yield _sse("error", {"message": f"Ошибка quick_action: {e}"})
+            logger.exception("quick_action unexpected failure action=%s", action_type)
+            yield _emit_error(f"Ошибка quick_action: {e}")
             return
 
     async def _planner(
@@ -848,7 +870,17 @@ class PhotoChatController:
     async def chat_stream(self, *, user: Any, db, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
         uid = _user_id(user)
         if uid is None:
-            yield _sse("message", {"type": "error", "message": "Unauthorized"})
+            mapped = map_photo_error("Unauthorized", context="chat_stream")
+            yield _sse(
+                "message",
+                {
+                    "type": "error",
+                    "message": mapped.get("message"),
+                    "code": mapped.get("code"),
+                    "retryable": bool(mapped.get("retryable", False)),
+                    "error": mapped,
+                },
+            )
             return
 
         message = (payload.get("message") or "").strip()
@@ -1363,6 +1395,21 @@ class PhotoChatController:
                 pose_text=poses[_i],
             )
 
+            def _emit_stream_error(raw_error: Any) -> str:
+                mapped = map_photo_error(raw_error, context="chat_stream:generation")
+                return _sse(
+                    "message",
+                    {
+                        "type": "error",
+                        "message": mapped.get("message"),
+                        "code": mapped.get("code"),
+                        "retryable": bool(mapped.get("retryable", True)),
+                        "error": mapped,
+                        "index": _i + 1,
+                        "total": image_count,
+                    },
+                )
+
             try:
                 assistant_text, out_bytes, out_mime = await self._agent.edit_or_generate_image(
                     prompt=per_image_prompt,
@@ -1370,17 +1417,17 @@ class PhotoChatController:
                     aspect_ratio=aspect_ratio,
                 )
             except GeminiApiError as e:
-                err_msg = str(e).strip() or "Ошибка генерации: пустой ответ от модели"
-                logger.error("edit_or_generate_image failed: %s", err_msg)
-                yield _sse("message", {"type": "error", "message": err_msg, "index": _i + 1, "total": image_count})
+                logger.error("edit_or_generate_image failed: %s", str(e).strip() or "GeminiApiError")
+                yield _emit_stream_error(e)
                 return
             except Exception as e:
                 logger.exception("edit_or_generate_image failed with unexpected error")
-                yield _sse("message", {"type": "error", "message": f"Ошибка генерации: {e}", "index": _i + 1, "total": image_count})
+                yield _emit_stream_error(e)
                 return
 
             if not out_bytes:
-                yield _sse("message", {"type": "error", "message": "Gemini вернул пустой результат", "index": _i + 1, "total": image_count})
+                logger.warning("edit_or_generate_image returned empty output bytes")
+                yield _emit_stream_error("generation returned empty result")
                 return
 
             ext = ".png"

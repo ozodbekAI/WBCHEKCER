@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -11,6 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import settings
+from ..core.time import utc_now
 from ..core.database import get_db
 from ..core.security import get_current_user, require_permission
 from ..models import User, Store, Card, CardIssue, StoreStatus, IssueStatus
@@ -30,6 +33,7 @@ from ..services.approval_service import (
 from ..services.issue_service import calculate_visible_issue_counts_from_rows, mark_applied_to_wb
 from ..services.wb_api import WildberriesAPI
 from ..services.wb_cards import parse_wb_timestamp
+from ..services.photo_error_mapper import map_photo_error
 from ..services.workflow_service import (
     CARD_WORKFLOW_SECTIONS,
     confirm_card_section,
@@ -42,14 +46,93 @@ from ..services.workflow_service import (
 )
 
 router = APIRouter(prefix="/stores/{store_id}/cards", tags=["Cards"])
+logger = logging.getLogger("photo.studio.cards.router")
 
 MAX_REMOTE_BYTES = 15 * 1024 * 1024
+MEDIA_APPLY_HISTORY_LIMIT = 20
 ALLOWED_REMOTE_HOST_SUFFIXES = (
     "wbbasket.ru",
     "wbstatic.net",
     "wildberries.ru",
     "wb.ru",
 )
+
+
+def _photo_http_exception(raw_error: Any, *, context: str, default_status: int = 400) -> HTTPException:
+    mapped = map_photo_error(raw_error, context=context)
+    status_code = int(mapped.get("http_status") or default_status)
+    return HTTPException(status_code=status_code, detail=mapped)
+
+
+def _normalize_media_urls(urls: Any) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in (urls or []):
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        normalized = WildberriesAPI.strip_url_query(value)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(value)
+    return out
+
+
+def _build_media_apply_snapshot_record(
+    *,
+    card_id: int,
+    nm_id: int,
+    before_snapshot: List[str],
+    requested_after_snapshot: List[str],
+    actual_after_snapshot: List[str],
+    created_at: str,
+    verification: Optional[Dict[str, Any]] = None,
+    matched: Optional[bool] = None,
+    stabilized: Optional[bool] = None,
+    source: str = "wb_sync_photos",
+) -> Dict[str, Any]:
+    before = _normalize_media_urls(before_snapshot)
+    requested = _normalize_media_urls(requested_after_snapshot)
+    actual = _normalize_media_urls(actual_after_snapshot)
+    verification_payload = verification if isinstance(verification, dict) else None
+
+    result_matched = bool(
+        matched
+        if matched is not None
+        else (verification_payload or {}).get("matched", False)
+    )
+
+    record: Dict[str, Any] = {
+        "operation_id": str(uuid.uuid4()),
+        "source": source,
+        "card_id": int(card_id),
+        "nm_id": int(nm_id),
+        "created_at": str(created_at),
+        "before_snapshot": before,
+        "requested_after_snapshot": requested,
+        "actual_after_snapshot": actual,
+        # Backward-compatible aliases for existing readers.
+        "before": before,
+        "requested": requested,
+        "actual": actual,
+        "matched": result_matched,
+        "stabilized": bool(stabilized) if stabilized is not None else None,
+        "verification": verification_payload,
+    }
+    return record
+
+
+def _append_media_apply_history(raw_data: Dict[str, Any], snapshot_record: Dict[str, Any]) -> Dict[str, Any]:
+    history_raw = raw_data.get("media_apply_history")
+    history = list(history_raw) if isinstance(history_raw, list) else []
+    history.append(snapshot_record)
+    if len(history) > MEDIA_APPLY_HISTORY_LIMIT:
+        history = history[-MEDIA_APPLY_HISTORY_LIMIT:]
+    raw_data["media_apply_history"] = history
+    raw_data["media_apply_snapshot"] = snapshot_record
+    raw_data["media_apply_last_operation_id"] = snapshot_record.get("operation_id")
+    return raw_data
 
 
 def _is_admin_user(user: User) -> bool:
@@ -484,12 +567,13 @@ async def replace_wb_card_photo(
 
     source_url = (payload.source_url or "").strip()
     if not source_url:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="source_url is required")
+        raise _photo_http_exception("source_url is required", context="wb_replace_photo", default_status=400)
 
     try:
         content, content_type, ext = await _load_image_bytes_from_source(source_url)
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Cannot load source image: {e}")
+        logger.warning("replace_wb_card_photo source load failed nm_id=%s source_url=%s err=%s", nm_id, source_url, str(e))
+        raise _photo_http_exception(f"Cannot load source image: {e}", context="wb_replace_photo", default_status=400)
 
     wb_api = WildberriesAPI(feature_api_key)
     result = await wb_api.upload_card_photo(
@@ -501,9 +585,16 @@ async def replace_wb_card_photo(
     )
 
     if not result.get("success"):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"WB photo replace failed: {result.get('error', 'Unknown error')}",
+        logger.warning(
+            "replace_wb_card_photo WB upload failed nm_id=%s slot=%s err=%s",
+            nm_id,
+            int(payload.slot),
+            result.get("error", "Unknown error"),
+        )
+        raise _photo_http_exception(
+            f"WB photo replace failed: {result.get('error', 'Unknown error')}",
+            context="wb_replace_photo",
+            default_status=502,
         )
 
     local_card = await _refresh_local_card_from_wb(db, store_id=store.id, nm_id=int(nm_id), wb_api=wb_api)
@@ -759,10 +850,10 @@ async def sync_card_photos_endpoint(
     for raw_url in payload.photos:
         source_url = str(raw_url or "").strip()
         if not source_url:
-            raise HTTPException(status_code=400, detail="Photo URLs must be non-empty")
+            raise _photo_http_exception("source_url is required", context="wb_sync_photos", default_status=400)
         normalized = WildberriesAPI.strip_url_query(source_url)
         if normalized in seen_sources:
-            raise HTTPException(status_code=400, detail="Duplicate photo URLs are not allowed")
+            raise _photo_http_exception("Duplicate photo URLs are not allowed", context="wb_sync_photos", default_status=400)
         seen_sources.add(normalized)
         desired_sources.append(source_url)
 
@@ -780,7 +871,8 @@ async def sync_card_photos_endpoint(
         try:
             content, content_type, ext = await _load_image_bytes_from_source(source_url)
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Cannot load source image: {exc}")
+            logger.warning("sync_card_photos source load failed card_id=%s source_url=%s err=%s", card.id, source_url, str(exc))
+            raise _photo_http_exception(f"Cannot load source image: {exc}", context="wb_sync_photos", default_status=400)
 
         upload_result = await wb_api.upload_card_photo(
             nm_id=card.nm_id,
@@ -789,13 +881,24 @@ async def sync_card_photos_endpoint(
             filename=f"card_{card.nm_id}_{idx + 1}{ext}",
         )
         if not upload_result.get("success"):
-            raise HTTPException(
-                status_code=502,
-                detail=f"WB photo upload failed: {upload_result.get('error', 'Unknown error')}",
+            logger.warning(
+                "sync_card_photos WB upload failed card_id=%s nm_id=%s err=%s",
+                card.id,
+                card.nm_id,
+                upload_result.get("error", "Unknown error"),
+            )
+            raise _photo_http_exception(
+                f"WB photo upload failed: {upload_result.get('error', 'Unknown error')}",
+                context="wb_sync_photos",
+                default_status=502,
             )
         uploaded_url = str(upload_result.get("photo_url") or "").strip()
         if not uploaded_url:
-            raise HTTPException(status_code=502, detail="WB photo upload did not return a photo URL")
+            raise _photo_http_exception(
+                "WB photo upload did not return a photo URL",
+                context="wb_sync_photos",
+                default_status=502,
+            )
         uploaded_by_index[idx] = uploaded_url
 
     latest_urls = await wb_api.get_card_photo_urls(card.nm_id)
@@ -810,20 +913,43 @@ async def sync_card_photos_endpoint(
         if not resolved:
             resolved = uploaded_by_index.get(idx)
         if not resolved:
-            raise HTTPException(status_code=400, detail=f"Photo not found on WB card: {source_url}")
+            raise _photo_http_exception(
+                f"Photo not found on WB card: {source_url}",
+                context="wb_sync_photos",
+                default_status=400,
+            )
 
         normalized = WildberriesAPI.strip_url_query(resolved)
         if normalized in seen_final:
-            raise HTTPException(status_code=400, detail="Resolved photo list contains duplicates")
+            raise _photo_http_exception("Resolved photo list contains duplicates", context="wb_sync_photos", default_status=400)
         seen_final.add(normalized)
         final_urls.append(resolved)
 
     save_result = await wb_api.save_card_media_state(nm_id=card.nm_id, urls=final_urls)
     if not save_result.get("success"):
-        raise HTTPException(
-            status_code=502,
-            detail=f"WB media save failed: {save_result.get('error', 'Unknown error')}",
+        logger.warning(
+            "sync_card_photos WB media save failed card_id=%s nm_id=%s err=%s",
+            card.id,
+            card.nm_id,
+            save_result.get("error", "Unknown error"),
         )
+        raise _photo_http_exception(
+            f"WB media save failed: {save_result.get('error', 'Unknown error')}",
+            context="wb_sync_photos",
+            default_status=502,
+        )
+    verification = save_result.get("verification") if isinstance(save_result.get("verification"), dict) else {}
+    before_order = list(save_result.get("before_order") or current_urls or [])
+    apply_summary = {
+        "requested_order": list(verification.get("requested_order") or save_result.get("requested_order") or final_urls),
+        "actual_order": list(verification.get("actual_order") or save_result.get("actual_order") or []),
+        "matched": bool(verification.get("matched", save_result.get("matched", False))),
+        "missing_urls": list(verification.get("missing_urls") or save_result.get("missing_urls") or []),
+        "unexpected_urls": list(verification.get("unexpected_urls") or save_result.get("unexpected_urls") or []),
+        "stabilized": bool(save_result.get("stabilized", False)),
+        "verification": verification or None,
+        "applied_at": utc_now().isoformat(),
+    }
 
     refreshed_card = await _refresh_local_card_from_wb(db, store_id=store.id, nm_id=card.nm_id, wb_api=wb_api)
     if refreshed_card:
@@ -836,6 +962,26 @@ async def sync_card_photos_endpoint(
         card.raw_data = raw_data
         await db.commit()
         await db.refresh(card)
+
+    raw_data = dict(card.raw_data or {})
+    raw_data["media_apply_result"] = apply_summary
+    snapshot_record = _build_media_apply_snapshot_record(
+        card_id=int(card.id),
+        nm_id=int(card.nm_id),
+        before_snapshot=before_order,
+        requested_after_snapshot=list(apply_summary.get("requested_order") or final_urls or []),
+        actual_after_snapshot=list(card.photos or apply_summary.get("actual_order") or []),
+        created_at=str(apply_summary["applied_at"]),
+        verification=verification or None,
+        matched=bool(apply_summary["matched"]),
+        stabilized=bool(apply_summary.get("stabilized", False)),
+        source="wb_sync_photos",
+    )
+    # Keep latest snapshot + bounded history for future rollback endpoint/button.
+    raw_data = _append_media_apply_history(raw_data, snapshot_record)
+    card.raw_data = raw_data
+    await db.commit()
+    await db.refresh(card)
 
     card.skip_next_reanalyze = True
     await db.commit()

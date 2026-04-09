@@ -26,10 +26,16 @@ class PromotionController:
             raise HTTPException(status_code=401, detail="Invalid user context")
 
     async def create_company(self, payload: dict, db: Session, user: Any, store_id: int | None = None) -> dict:
-        return self.service.create_company(db=db, user_id=self._extract_user_id(user), payload=payload, store_id=store_id)
+        try:
+            return self.service.create_company(db=db, user_id=self._extract_user_id(user), payload=payload, store_id=store_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     async def update_company(self, payload: dict, db: Session, user: Any, store_id: int | None = None) -> dict:
-        return self.service.update_company_and_start(db=db, user_id=self._extract_user_id(user), payload=payload, store_id=store_id)
+        try:
+            return self.service.update_company_and_start(db=db, user_id=self._extract_user_id(user), payload=payload, store_id=store_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     async def get_balance(self, db: Session, user: Any, store_id: int | None = None) -> dict:
         return self.service.get_balance(db=db, user_id=self._extract_user_id(user), store_id=store_id)

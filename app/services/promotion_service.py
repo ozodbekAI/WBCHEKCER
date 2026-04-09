@@ -25,6 +25,7 @@ from app.services.wb_repository import WBRepository
 from app.services.wb_advert_repository import WBAdvertRepository
 from app.services.promotion_repository import PromotionRepository
 from app.models.promotion import PromotionCompany, PromotionPhoto, PromotionStatus
+from app.models.card import Card
 from app.models.store import Store, StoreStatus
 from app.models.user import User
 from app.services.wb_token_access import get_store_feature_api_key
@@ -48,6 +49,14 @@ def _guess_content_type(url: str) -> str:
 class PromotionService:
     _media_locks: Dict[int, threading.Lock] = {}
     _media_locks_guard = threading.Lock()
+    WINNER_MIN_VARIANTS = 2
+    WINNER_MIN_IMPRESSIONS = 300
+    WINNER_MIN_CTR_DELTA = 0.35
+    WINNER_MIN_SCORE_DELTA = 0.06
+    WINNER_WEIGHT_CTR = 0.55
+    WINNER_WEIGHT_CONVERSION = 0.25
+    WINNER_WEIGHT_CONFIDENCE = 0.20
+    WINNER_PROXY_CLICKS_SHARE = 0.03
 
     def __init__(self) -> None:
         self.wb_repo = WBRepository()
@@ -123,15 +132,149 @@ class PromotionService:
             return c
         raise ValueError(f"Company not found: {company_id}")
 
+    def _candidate_store_ids_for_user(self, db: Session, user_id: int, preferred_store_id: int | None = None) -> list[int]:
+        candidate_store_ids: list[int] = []
+        if preferred_store_id is not None:
+            candidate_store_ids.append(int(preferred_store_id))
+
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if user and getattr(user, "store_id", None):
+            candidate_store_ids.append(int(user.store_id))
+
+        owned_ids = [
+            int(store_id)
+            for (store_id,) in db.query(Store.id)
+            .filter(Store.owner_id == int(user_id))
+            .order_by(Store.id.asc())
+            .all()
+        ]
+        candidate_store_ids.extend(owned_ids)
+
+        if not candidate_store_ids:
+            active_store_ids = [
+                int(store_id)
+                for (store_id,) in db.query(Store.id)
+                .filter(Store.status == StoreStatus.ACTIVE)
+                .order_by(Store.id.asc())
+                .all()
+            ]
+            candidate_store_ids.extend(active_store_ids)
+
+        out: list[int] = []
+        seen: set[int] = set()
+        for sid in candidate_store_ids:
+            if sid in seen:
+                continue
+            seen.add(sid)
+            out.append(int(sid))
+        return out
+
+    def _normalize_promotion_card_identity(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        nm_id: int,
+        raw_card_id: Any,
+        store_id: int | None = None,
+    ) -> tuple[int, int]:
+        try:
+            normalized_nm_id = int(nm_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("nm_id must be an integer") from exc
+        if normalized_nm_id <= 0:
+            raise ValueError("nm_id must be positive")
+
+        explicit_card_id: int | None = None
+        if raw_card_id not in {None, ""}:
+            try:
+                explicit_card_id = int(raw_card_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("card_id must be an integer") from exc
+            if explicit_card_id <= 0:
+                raise ValueError("card_id must be positive")
+
+        scoped_store_ids = self._candidate_store_ids_for_user(db, user_id, preferred_store_id=store_id)
+        has_scope = bool(scoped_store_ids)
+
+        def _scope_query(query):
+            if store_id is not None:
+                return query.filter(Card.store_id == int(store_id))
+            if has_scope:
+                return query.filter(Card.store_id.in_(scoped_store_ids))
+            return query.filter(Card.store_id == -1)
+
+        if explicit_card_id is not None:
+            card_by_id = _scope_query(db.query(Card).filter(Card.id == int(explicit_card_id))).first()
+            if card_by_id is not None:
+                card_nm_id = int(getattr(card_by_id, "nm_id", 0) or 0)
+                if card_nm_id != normalized_nm_id:
+                    raise ValueError(
+                        f"card_id/nm_id mismatch: card_id={explicit_card_id} belongs to nm_id={card_nm_id}, payload nm_id={normalized_nm_id}"
+                    )
+                return normalized_nm_id, int(card_by_id.id)
+
+            # Backward compatibility: some clients sent nm_id into card_id.
+            if int(explicit_card_id) != int(normalized_nm_id):
+                raise ValueError(f"card_id not found in accessible scope: {explicit_card_id}")
+
+        if has_scope or store_id is not None:
+            card_by_nm = _scope_query(db.query(Card).filter(Card.nm_id == int(normalized_nm_id))).order_by(Card.id.asc()).first()
+            if card_by_nm is not None:
+                resolved_card_id = int(card_by_nm.id)
+                if explicit_card_id is not None and int(explicit_card_id) == int(normalized_nm_id) and resolved_card_id != int(explicit_card_id):
+                    logger.info(
+                        "[promo-card-normalize] interpreted legacy card_id-as-nm_id user=%s store=%s nm_id=%s resolved_card_id=%s",
+                        int(user_id),
+                        int(store_id) if store_id is not None else None,
+                        int(normalized_nm_id),
+                        resolved_card_id,
+                    )
+                return normalized_nm_id, resolved_card_id
+
+        # Final fallback for old clients/old records without local card linkage.
+        logger.warning(
+            "[promo-card-normalize] no local card mapping found user=%s store=%s nm_id=%s; fallback card_id=nm_id",
+            int(user_id),
+            int(store_id) if store_id is not None else None,
+            int(normalized_nm_id),
+        )
+        return normalized_nm_id, int(normalized_nm_id)
+
     @staticmethod
     def _serialize_company_list_item(c: PromotionCompany) -> dict:
+        spend_value = int(c.spend_rub or 0)
+        winner_decision = PromotionService._winner_decision_from_company(c)
+        variant_scores = PromotionService._build_variant_scores(c.photos or [])
+        photos_payload: List[dict[str, Any]] = []
+        for p in (c.photos or []):
+            p_order = int(getattr(p, "order", 0) or 0)
+            score_meta = variant_scores.get(p_order) or {}
+            photos_payload.append(
+                {
+                    "order": p_order,
+                    "file_url": p.file_url,
+                    "wb_url": p.wb_url,
+                    "shows": int(p.shows),
+                    "clicks": int(p.clicks),
+                    "ctr": float(p.ctr),
+                    "is_winner": bool(p.is_winner),
+                    "winner_score": score_meta.get("score"),
+                    "winner_score_confidence": score_meta.get("confidence"),
+                    "winner_score_conversion_source": score_meta.get("conversion_source"),
+                    "winner_score_reason": score_meta.get("reason"),
+                }
+            )
         return {
             "id_company": c.id,
             "company_id": int(c.wb_company_id),
             "nm_id": int(c.nm_id),
+            "card_id": int(getattr(c, "card_id", 0) or 0),
             "title": c.title,
             "status": c.status.value,
-            "spend_rub": int(c.spend_rub or 0),
+            "spend_rub": spend_value,
+            "estimated_spend_rub": spend_value,
+            "winner_decision": winner_decision,
             "views_per_photo": int(c.views_per_photo or 0),
             "photos_count": int(c.photos_count or 0),
             "current_photo_order": int(getattr(c, "current_photo_order", 1) or 1),
@@ -141,19 +284,113 @@ class PromotionService:
             "can_stop": c.status == PromotionStatus.RUNNING,
             "started_at": getattr(c, "started_at", None).isoformat() if getattr(c, "started_at", None) else None,
             "finished_at": getattr(c, "finished_at", None).isoformat() if getattr(c, "finished_at", None) else None,
-            "photos": [
-                {
-                    "order": int(p.order),
-                    "file_url": p.file_url,
-                    "wb_url": p.wb_url,
-                    "shows": int(p.shows),
-                    "clicks": int(p.clicks),
-                    "ctr": float(p.ctr),
-                    "is_winner": bool(p.is_winner),
-                }
-                for p in (c.photos or [])
-            ],
+            "photos": photos_payload,
         }
+
+    @staticmethod
+    def _extract_orders_signal(photo: PromotionPhoto) -> tuple[int | None, str | None]:
+        candidates = (
+            "orders",
+            "order_count",
+            "conversions",
+            "conversions_count",
+            "add_to_cart",
+            "add_to_carts",
+        )
+        for attr in candidates:
+            raw = getattr(photo, attr, None)
+            if raw is None:
+                continue
+            try:
+                value = int(float(raw))
+            except (TypeError, ValueError):
+                continue
+            if value >= 0:
+                return value, attr
+        return None, None
+
+    @classmethod
+    def _build_variant_scores(cls, photos: List[PromotionPhoto]) -> Dict[int, Dict[str, Any]]:
+        if not photos:
+            return {}
+
+        prepared: List[Dict[str, Any]] = []
+        proxy_click_target = max(int(round(float(cls.WINNER_MIN_IMPRESSIONS) * float(cls.WINNER_PROXY_CLICKS_SHARE))), 1)
+
+        for photo in photos:
+            order_value = int(getattr(photo, "order", 0) or 0)
+            shows = max(int(getattr(photo, "shows", 0) or 0), 0)
+            clicks = max(int(getattr(photo, "clicks", 0) or 0), 0)
+            raw_ctr = float(getattr(photo, "ctr", 0.0) or 0.0)
+            ctr = raw_ctr if raw_ctr > 0 else ((clicks / shows) * 100.0 if shows > 0 else 0.0)
+            confidence = min(shows / float(max(int(cls.WINNER_MIN_IMPRESSIONS), 1)), 1.0)
+
+            orders_value, orders_source = cls._extract_orders_signal(photo)
+            conversion_source = "clicks_proxy"
+            if orders_value is not None and shows > 0:
+                conversion_signal = orders_value / float(shows)
+                conversion_source = orders_source or "orders"
+            else:
+                conversion_signal = min(clicks / float(proxy_click_target), 1.0)
+
+            prepared.append(
+                {
+                    "order": order_value,
+                    "shows": shows,
+                    "clicks": clicks,
+                    "ctr": max(ctr, 0.0),
+                    "confidence": confidence,
+                    "conversion_signal": max(float(conversion_signal), 0.0),
+                    "conversion_source": conversion_source,
+                }
+            )
+
+        max_ctr = max((item["ctr"] for item in prepared), default=0.0)
+        max_conversion = max((item["conversion_signal"] for item in prepared), default=0.0)
+
+        score_map: Dict[int, Dict[str, Any]] = {}
+        for item in prepared:
+            ctr_norm = (item["ctr"] / max_ctr) if max_ctr > 0 else 0.0
+            conversion_norm = (item["conversion_signal"] / max_conversion) if max_conversion > 0 else 0.0
+            score = (
+                float(cls.WINNER_WEIGHT_CTR) * ctr_norm
+                + float(cls.WINNER_WEIGHT_CONVERSION) * conversion_norm
+                + float(cls.WINNER_WEIGHT_CONFIDENCE) * item["confidence"]
+            )
+            reason = (
+                f"score={score:.4f} "
+                f"(ctr_norm={ctr_norm:.4f}*{float(cls.WINNER_WEIGHT_CTR):.2f}, "
+                f"conversion_norm={conversion_norm:.4f}*{float(cls.WINNER_WEIGHT_CONVERSION):.2f}, "
+                f"confidence={item['confidence']:.4f}*{float(cls.WINNER_WEIGHT_CONFIDENCE):.2f}; "
+                f"conversion_source={item['conversion_source']})"
+            )
+            score_map[int(item["order"])] = {
+                "score": round(score, 6),
+                "confidence": round(item["confidence"], 6),
+                "conversion_source": item["conversion_source"],
+                "reason": reason,
+            }
+        return score_map
+
+    @staticmethod
+    def _winner_decision_from_company(company: PromotionCompany) -> str | None:
+        if int(getattr(company, "winner_photo_order", 0) or 0) > 0:
+            return "winner_found"
+        status_raw = str(getattr(company, "status", "") or "").lower()
+        if "stopped" in status_raw:
+            return "test_interrupted"
+        msg = str(getattr(company, "error_message", "") or "").strip().lower()
+        if "insufficient_data" in msg:
+            return "insufficient_data"
+        if "test_interrupted" in msg:
+            return "test_interrupted"
+        if "no_clear_winner" in msg:
+            return "no_clear_winner"
+        if "failed" in status_raw:
+            return "test_interrupted"
+        if status_raw.endswith("finished"):
+            return "no_clear_winner"
+        return None
 
     @staticmethod
     def _is_retryable_start_error(error: str) -> bool:
@@ -1054,7 +1291,14 @@ class PromotionService:
         wb_advert = self._get_wb_advert(db, user_id, store_id=store_id)
 
         nm_id = int(payload["nm_id"])
-        card_id = int(payload.get("card_id") or nm_id)
+        raw_card_id = payload.get("card_id")
+        nm_id, card_id = self._normalize_promotion_card_identity(
+            db,
+            user_id=int(user_id),
+            nm_id=int(nm_id),
+            raw_card_id=raw_card_id,
+            store_id=store_id,
+        )
         title = str(payload["title"])
         from_main = bool(payload.get("from_main", False))
         max_slots = int(payload.get("max_slots", 4))
@@ -1093,6 +1337,7 @@ class PromotionService:
             "id_company": company.id,
             "company_id": wb_company_id,
             "nm_id": nm_id,
+            "card_id": int(card_id),
             "title": title,
             "min_bids": {
                 "min_combined_rub": int(getattr(wb_min_bids, "min_combined_rub", 0) or 0),
@@ -1118,7 +1363,30 @@ class PromotionService:
         t0 = time.perf_counter()
 
         # 1) Validate + normalize payload
-        nm_id = int(payload.get("nm_id") or company.nm_id)
+        nm_id_input = int(payload.get("nm_id") or company.nm_id)
+        payload_card_id = payload.get("card_id")
+        nm_id, resolved_card_id = self._normalize_promotion_card_identity(
+            db,
+            user_id=int(user_id),
+            nm_id=int(nm_id_input),
+            raw_card_id=payload_card_id if payload_card_id not in {None, ""} else int(getattr(company, "card_id", 0) or 0),
+            store_id=store_id,
+        )
+        company_nm_id = int(getattr(company, "nm_id", 0) or 0)
+        if company_nm_id > 0 and int(nm_id) != company_nm_id:
+            raise ValueError(f"nm_id mismatch for company: expected {company_nm_id}, got {int(nm_id)}")
+
+        stored_card_id = int(getattr(company, "card_id", 0) or 0)
+        if stored_card_id > 0 and stored_card_id not in {int(company_nm_id), int(resolved_card_id)}:
+            raise ValueError(
+                f"card_id mismatch for company: expected {stored_card_id}, got {int(resolved_card_id)}"
+            )
+        if stored_card_id != int(resolved_card_id):
+            company.card_id = int(resolved_card_id)
+            db.add(company)
+            db.commit()
+            db.refresh(company)
+
         title = str(payload.get("title") or company.title)
         title_changed = bool(payload.get("title_changed", False))
         from_main = bool(payload.get("from_main", company.from_main))
@@ -1247,12 +1515,14 @@ class PromotionService:
             "id_company": company.id,
             "company_id": int(company.wb_company_id),
             "nm_id": nm_id,
+            "card_id": int(getattr(company, "card_id", resolved_card_id)),
             "title": title,
             "cpm": cpm,
             "min_cpm": int(min_bid_rub),
             "views_per_photo": int(views_per_photo),
             "photos_count": int(photos_count),
             "spend_rub": int(spend_total),
+            "estimated_spend_rub": int(spend_total),
             **start_result,
         }
 
@@ -1275,15 +1545,37 @@ class PromotionService:
         company = self._load_company_any_id(db, repo, user_id, int(company_id))
 
         photos = db.query(PromotionPhoto).filter(PromotionPhoto.company_id == company.id).order_by(PromotionPhoto.order.asc()).all()
+        variant_scores = self._build_variant_scores(photos)
+        photos_payload: List[dict[str, Any]] = []
+        for p in photos:
+            p_order = int(getattr(p, "order", 0) or 0)
+            score_meta = variant_scores.get(p_order) or {}
+            photos_payload.append(
+                {
+                    "order": p_order,
+                    "file_url": str(getattr(p, "file_url", "") or ""),
+                    "wb_url": str(getattr(p, "wb_url", "") or ""),
+                    "shows": int(getattr(p, "shows", 0) or 0),
+                    "clicks": int(getattr(p, "clicks", 0) or 0),
+                    "ctr": float(getattr(p, "ctr", 0) or 0),
+                    "winner_score": score_meta.get("score"),
+                    "winner_score_confidence": score_meta.get("confidence"),
+                    "winner_score_conversion_source": score_meta.get("conversion_source"),
+                    "winner_score_reason": score_meta.get("reason"),
+                }
+            )
 
         return {
             "id_company": int(company.id),
             "company_id": int(company.wb_company_id),
             "nm_id": int(company.nm_id),
+            "card_id": int(getattr(company, "card_id", 0) or 0),
             "title": str(company.title),
             "status": str(company.status),
             "last_error": str(getattr(company, "error_message", "") or "").strip() or None,
             "spend_rub": int(getattr(company, "spend_rub", 0) or 0),
+            "estimated_spend_rub": int(getattr(company, "spend_rub", 0) or 0),
+            "winner_decision": self._winner_decision_from_company(company),
             "views_per_photo": int(getattr(company, "views_per_photo", 0) or 0),
             "photos_count": int(getattr(company, "photos_count", 0) or 0),
             "current_photo_order": int(getattr(company, "current_photo_order", 1) or 1),
@@ -1291,17 +1583,7 @@ class PromotionService:
                 "shows": int(getattr(company, "last_total_shows", 0) or 0),
                 "clicks": int(getattr(company, "last_total_clicks", 0) or 0),
             },
-            "photos": [
-                {
-                    "order": int(p.order),
-                    "file_url": str(getattr(p, "file_url", "") or ""),
-                    "wb_url": str(getattr(p, "wb_url", "") or ""),
-                    "shows": int(getattr(p, "shows", 0) or 0),
-                    "clicks": int(getattr(p, "clicks", 0) or 0),
-                    "ctr": float(getattr(p, "ctr", 0) or 0),
-                }
-                for p in photos
-            ],
+            "photos": photos_payload,
         }
 
     def company_debug(self, db: Session, user_id: int, company_id: int, store_id: int | None = None) -> dict:
@@ -1354,13 +1636,15 @@ class PromotionService:
             logger.warning("[promo-stop] restore failed company=%s err=%s", company.id, restore_error)
 
         reason_parts = [part for part in [stop_error, restore_error] if part]
-        repo.mark_stopped(company, reason="; ".join(reason_parts) if reason_parts else None)
+        stop_reason = "; ".join(reason_parts) if reason_parts else "test_interrupted: stopped_by_user"
+        repo.mark_stopped(company, reason=stop_reason)
 
         return {
             "id_company": company.id,
             "company_id": int(company.wb_company_id),
             "stopped": True,
             "status": "stopped",
+            "winner_decision": "test_interrupted",
             "error": "; ".join(reason_parts) if reason_parts else None,
         }
 
@@ -1517,15 +1801,68 @@ class PromotionService:
 
         photos = db.query(PromotionPhoto).filter(PromotionPhoto.company_id == company.id).all()
         if not photos:
-            raise ValueError("No photos for company")
+            repo.finish_without_winner(company, reason="insufficient_data: no_photos")
+            return 0
+
+        variant_scores = self._build_variant_scores(photos)
+
+        def _score(photo: PromotionPhoto) -> Tuple[float, float, int, int, int]:
+            order_value = int(getattr(photo, "order", 0) or 0)
+            score_meta = variant_scores.get(order_value) or {}
+            winner_score = float(score_meta.get("score") or 0.0)
+            ctr = float(getattr(photo, "ctr", 0.0) or 0.0)
+            shows = max(int(getattr(photo, "shows", 0) or 0), 0)
+            clicks = max(int(getattr(photo, "clicks", 0) or 0), 0)
+            return winner_score, ctr, shows, clicks, -order_value
 
         photos_sorted = sorted(
             photos,
-            key=lambda p: (float(p.ctr or 0), int(p.shows or 0), -int(p.order)),
+            key=_score,
             reverse=True,
         )
-        winner = photos_sorted[0]
-        winner_order = int(winner.order)
+        winner = photos_sorted[0] if photos_sorted else None
+        runner_up = photos_sorted[1] if len(photos_sorted) > 1 else None
+        winner_order = int(getattr(winner, "order", 0) or 0)
+
+        decision = "winner_found"
+        finish_reason: str | None = None
+
+        if len(photos_sorted) < int(self.WINNER_MIN_VARIANTS):
+            decision = "insufficient_data"
+            finish_reason = (
+                f"insufficient_data: variants={len(photos_sorted)}, min_required={int(self.WINNER_MIN_VARIANTS)}"
+            )
+            winner_order = 0
+            winner = None
+        elif winner is not None and runner_up is not None:
+            winner_shows = max(int(getattr(winner, "shows", 0) or 0), 0)
+            runner_shows = max(int(getattr(runner_up, "shows", 0) or 0), 0)
+            ctr_delta = abs(float(getattr(winner, "ctr", 0.0) or 0.0) - float(getattr(runner_up, "ctr", 0.0) or 0.0))
+            winner_score = float((variant_scores.get(int(getattr(winner, "order", 0) or 0)) or {}).get("score") or 0.0)
+            runner_score = float((variant_scores.get(int(getattr(runner_up, "order", 0) or 0)) or {}).get("score") or 0.0)
+            score_delta = abs(winner_score - runner_score)
+            min_shows = min(winner_shows, runner_shows)
+
+            if min_shows < int(self.WINNER_MIN_IMPRESSIONS):
+                decision = "insufficient_data"
+                finish_reason = (
+                    f"insufficient_data: winner_shows={winner_shows}, runner_shows={runner_shows}, "
+                    f"min_required={int(self.WINNER_MIN_IMPRESSIONS)}"
+                )
+                winner_order = 0
+                winner = None
+            elif (
+                ctr_delta < float(self.WINNER_MIN_CTR_DELTA)
+                or score_delta < float(self.WINNER_MIN_SCORE_DELTA)
+            ):
+                decision = "no_clear_winner"
+                finish_reason = (
+                    "no_clear_winner: "
+                    f"ctr_delta={ctr_delta:.4f}, min_ctr_delta={float(self.WINNER_MIN_CTR_DELTA):.4f}, "
+                    f"score_delta={score_delta:.4f}, min_score_delta={float(self.WINNER_MIN_SCORE_DELTA):.4f}"
+                )
+                winner_order = 0
+                winner = None
 
         if stop_campaign:
             try:
@@ -1559,7 +1896,7 @@ class PromotionService:
             except Exception:
                 pass
 
-            if keep_winner_as_main:
+            if keep_winner_as_main and winner is not None:
                 # Apply winner after restore
                 try:
                     self._apply_variant_to_main_slot(nm_id, st, str(winner.file_url))
@@ -1568,7 +1905,10 @@ class PromotionService:
 
             repo.set_media_state(company, state=st)
 
-        repo.finish_with_winner(company, winner_order)
+        if winner_order > 0:
+            repo.finish_with_winner(company, winner_order)
+        else:
+            repo.finish_without_winner(company, reason=finish_reason or decision)
         return winner_order
 
     @staticmethod

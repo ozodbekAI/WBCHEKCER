@@ -17,10 +17,17 @@ from app.core.database import get_db_dependency
 from app.core.dependencies import get_current_user, require_admin
 from app.models.photo_asset import PhotoAsset, AssetType, AssetOwnerType
 from app.services.photo_asset_repository import PhotoAssetRepository
+from app.services.photo_error_mapper import map_photo_error
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/photo-assets", tags=["Photo Assets"])
+
+
+def _mapped_photo_http_exception(raw_error: Any, *, context: str, default_status: int = 400) -> HTTPException:
+    mapped = map_photo_error(raw_error, context=context)
+    status_code = int(mapped.get("http_status") or default_status)
+    return HTTPException(status_code=status_code, detail=mapped)
 
 
 # ==================== Schemas ====================
@@ -114,11 +121,11 @@ def _extract_user_id(user: Any) -> int:
     else:
         raw_uid = getattr(user, "id", None)
     if raw_uid is None:
-        raise HTTPException(401, "Unauthorized")
+        raise _mapped_photo_http_exception("Unauthorized", context="photo_assets_auth", default_status=401)
     try:
         return int(raw_uid)
     except (TypeError, ValueError):
-        raise HTTPException(401, "Invalid user context")
+        raise _mapped_photo_http_exception("Invalid user context", context="photo_assets_auth", default_status=401)
 
 
 def ensure_upload_dir():
@@ -199,12 +206,12 @@ def _resolve_local_media_path(source_url: str) -> Optional[Path]:
 
     rel = raw_path[len("/media/") :].lstrip("/").replace("\\", "/")
     if not rel or ".." in Path(rel).parts:
-        raise HTTPException(400, "Invalid media path")
+        raise _mapped_photo_http_exception("Invalid media path", context="photo_assets_import", default_status=400)
 
     media_root = Path(settings.MEDIA_ROOT).resolve()
     full_path = (media_root / rel).resolve()
     if not str(full_path).startswith(str(media_root) + os.sep) and full_path != media_root:
-        raise HTTPException(400, "Invalid media path")
+        raise _mapped_photo_http_exception("Invalid media path", context="photo_assets_import", default_status=400)
 
     return full_path
 
@@ -215,29 +222,45 @@ async def _download_image_bytes(source_url: str) -> tuple[bytes, str]:
     """
     parsed = urlparse(source_url)
     if parsed.scheme not in ("http", "https"):
-        raise HTTPException(400, "Unsupported URL scheme")
+        raise _mapped_photo_http_exception("Unsupported URL scheme", context="photo_assets_import", default_status=400)
 
     host = (parsed.hostname or "").lower()
     if not _is_allowed_remote_host(host):
-        raise HTTPException(400, "Unsupported URL host")
+        raise _mapped_photo_http_exception("Unsupported URL host", context="photo_assets_import", default_status=400)
 
     timeout = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         try:
             resp = await client.get(source_url)
         except httpx.HTTPError as e:
-            raise HTTPException(400, f"Failed to fetch image: {e}") from e
+            raise _mapped_photo_http_exception(
+                f"Cannot load source image: {e}",
+                context="photo_assets_import",
+                default_status=400,
+            ) from e
 
         final_host = (resp.url.host or "").lower()
         if not _is_allowed_remote_host(final_host):
-            raise HTTPException(400, "Redirected to an unsupported host")
+            raise _mapped_photo_http_exception(
+                "Redirected to an unsupported host",
+                context="photo_assets_import",
+                default_status=400,
+            )
 
         if resp.status_code >= 400:
-            raise HTTPException(400, f"Failed to fetch image (HTTP {resp.status_code})")
+            raise _mapped_photo_http_exception(
+                f"Cannot load source image: HTTP {resp.status_code}",
+                context="photo_assets_import",
+                default_status=400,
+            )
 
         content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
         if not content_type.startswith("image/"):
-            raise HTTPException(400, "URL does not point to an image")
+            raise _mapped_photo_http_exception(
+                "URL does not point to an image",
+                context="photo_assets_import",
+                default_status=400,
+            )
 
         # Stream with a hard cap.
         chunks: list[bytes] = []
@@ -247,7 +270,7 @@ async def _download_image_bytes(source_url: str) -> tuple[bytes, str]:
                 continue
             total += len(chunk)
             if total > MAX_REMOTE_BYTES:
-                raise HTTPException(413, "Image is too large")
+                raise _mapped_photo_http_exception("Image is too large", context="photo_assets_import", default_status=413)
             chunks.append(chunk)
         content = b"".join(chunks)
 
@@ -333,8 +356,8 @@ async def admin_upload_asset(
         return asset_to_response(asset)
         
     except Exception as e:
-        logger.error(f"Admin upload error: {e}")
-        raise HTTPException(500, str(e))
+        logger.exception("photo_assets admin/upload failed")
+        raise _mapped_photo_http_exception(e, context="photo_assets_admin_upload", default_status=500)
 
 
 @router.get("/admin/list", response_model=PhotoAssetListResponse)
@@ -454,8 +477,8 @@ async def user_upload_asset(
         return asset_to_response(asset)
         
     except Exception as e:
-        logger.error(f"User upload error: {e}")
-        raise HTTPException(500, str(e))
+        logger.exception("photo_assets user/upload failed")
+        raise _mapped_photo_http_exception(e, context="photo_assets_user_upload", default_status=500)
 
 @router.post("/user/add-from-url", response_model=PhotoAssetResponse)
 @router.post("/user/import", response_model=PhotoAssetResponse)
@@ -470,7 +493,7 @@ async def user_add_asset_from_url(
     """
     source_url = (data.source_url or "").strip()
     if not source_url:
-        raise HTTPException(400, "source_url is required")
+        raise _mapped_photo_http_exception("source_url is required", context="photo_assets_import", default_status=400)
     user_id = _extract_user_id(user)
 
     # Local /media/* path support
@@ -479,9 +502,9 @@ async def user_add_asset_from_url(
     ext: str
     if local_path is not None:
         if not local_path.exists() or not local_path.is_file():
-            raise HTTPException(404, "Source file not found")
+            raise _mapped_photo_http_exception("asset not found", context="photo_assets_import", default_status=404)
         if local_path.stat().st_size > MAX_REMOTE_BYTES:
-            raise HTTPException(413, "Image is too large")
+            raise _mapped_photo_http_exception("Image is too large", context="photo_assets_import", default_status=413)
         content = local_path.read_bytes()
         ext = local_path.suffix.lower() or ".jpg"
     else:
@@ -514,8 +537,8 @@ async def user_add_asset_from_url(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"User add-from-url error: {e}")
-        raise HTTPException(500, str(e))
+        logger.exception("photo_assets user/import failed")
+        raise _mapped_photo_http_exception(e, context="photo_assets_import", default_status=500)
 
 
 @router.get("/user/my-assets", response_model=PhotoAssetListResponse)

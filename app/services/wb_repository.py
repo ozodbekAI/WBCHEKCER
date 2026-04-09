@@ -5,6 +5,7 @@ from pathlib import Path
 import logging
 import mimetypes
 import time
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -243,6 +244,19 @@ class WBRepository:
             return []
 
     @staticmethod
+    def _strip_url_query(url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return raw
+        try:
+            parsed = urlparse(raw)
+            if not parsed.scheme:
+                return raw.split("?", 1)[0].split("#", 1)[0]
+            return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        except Exception:
+            return raw.split("?", 1)[0].split("#", 1)[0]
+
+    @staticmethod
     def _ext_from_ct(content_type: str) -> str:
         ct = (content_type or "").split(";")[0].strip().lower()
         if ct == "image/webp":
@@ -257,6 +271,31 @@ class WBRepository:
                 return ext
         return ".bin"
 
+    @classmethod
+    def _build_media_verification_summary(
+        cls,
+        *,
+        requested_order: List[str],
+        actual_order: List[str],
+    ) -> Dict[str, Any]:
+        requested = [str(url).strip() for url in (requested_order or []) if str(url).strip()]
+        actual = [str(url).strip() for url in (actual_order or []) if str(url).strip()]
+
+        requested_clean = [cls._strip_url_query(url) for url in requested]
+        actual_clean = [cls._strip_url_query(url) for url in actual]
+
+        missing_urls = [url for url in requested_clean if url not in actual_clean]
+        unexpected_urls = [url for url in actual_clean if url not in requested_clean]
+        matched = (not missing_urls) and (not unexpected_urls) and actual_clean[: len(requested_clean)] == requested_clean
+
+        return {
+            "requested_order": requested,
+            "actual_order": actual,
+            "matched": matched,
+            "missing_urls": missing_urls,
+            "unexpected_urls": unexpected_urls,
+        }
+
     def save_media_state(self, nm_id: int, urls: Optional[List[str]] = None, photos: Optional[List[str]] = None) -> Dict[str, Any]:
         """POST /content/v3/media/save.
 
@@ -265,6 +304,8 @@ class WBRepository:
         Docs warning: new 'data' fully replaces old media, so you MUST send full list (old + new).
         """
         data_urls = urls if urls is not None else (photos if photos is not None else [])
+        requested_order = [str(url).strip() for url in data_urls if str(url).strip()]
+        before_order = self.get_photo_urls(int(nm_id))
 
         url = f"{self.BASE_URL}/content/v3/media/save"
         headers = self._get_headers()
@@ -280,6 +321,49 @@ class WBRepository:
 
         if isinstance(data, dict) and data.get("error"):
             raise ValueError(f"WB media/save failed: {data.get('errorText')}")
+
+        last_urls: List[str] = []
+        last_clean: Optional[List[str]] = None
+        stable_hits = 0
+        stabilized = False
+
+        for _ in range(8):
+            time.sleep(1.0)
+            current = self.get_photo_urls(int(nm_id))
+            if current:
+                last_urls = [str(url).strip() for url in current if str(url).strip()]
+            current_clean = [self._strip_url_query(url) for url in current]
+            if len(current_clean) == len(requested_order):
+                if current_clean == last_clean:
+                    stable_hits += 1
+                else:
+                    stable_hits = 1
+                    last_clean = current_clean
+                if stable_hits >= 2:
+                    stabilized = True
+                    break
+
+        verification = self._build_media_verification_summary(
+            requested_order=requested_order,
+            actual_order=last_urls,
+        )
+
+        if isinstance(data, dict):
+            data.update(
+                {
+                    "before_order": [str(url).strip() for url in before_order if str(url).strip()],
+                    "before_snapshot": [str(url).strip() for url in before_order if str(url).strip()],
+                    "requested_order": list(verification["requested_order"]),
+                    "requested_after_snapshot": list(verification["requested_order"]),
+                    "actual_order": list(verification["actual_order"]),
+                    "actual_after_snapshot": list(verification["actual_order"]),
+                    "matched": bool(verification["matched"]),
+                    "missing_urls": list(verification["missing_urls"]),
+                    "unexpected_urls": list(verification["unexpected_urls"]),
+                    "stabilized": bool(stabilized),
+                    "verification": verification,
+                }
+            )
         return data
     
     def upload_photo_append(

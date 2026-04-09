@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -13,9 +14,17 @@ from app.controllers.photo_chat_controller import PhotoChatController
 from app.services.model_repository import ModelRepository
 from app.services.scence_repositories import PoseRepository, SceneCategoryRepository
 from app.models.generator import VideoScenario
+from app.services.photo_error_mapper import map_photo_error
 
 
 router = APIRouter(prefix="/api/photo", tags=["Photo Chat"])
+logger = logging.getLogger("photo.chat.router")
+
+
+def _mapped_photo_http_exception(raw_error: Any, *, context: str, default_status: int = 400) -> HTTPException:
+    mapped = map_photo_error(raw_error, context=context)
+    status_code = int(mapped.get("http_status") or default_status)
+    return HTTPException(status_code=status_code, detail=mapped)
 
 
 class CatalogItem(BaseModel):
@@ -144,9 +153,12 @@ async def upload_chat_asset(
             )
         finally:
             await controller.close()
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.exception("photo assets/upload failed")
+        raise _mapped_photo_http_exception(e, context="assets_upload", default_status=400)
 
 
 @router.post("/assets/import")
@@ -159,7 +171,7 @@ async def import_chat_asset(
     client_session_id = (payload.get("client_session_id") or "").strip()
     source_url = (payload.get("source_url") or "").strip()
     if not source_url:
-        raise HTTPException(status_code=400, detail="source_url is required")
+        raise _mapped_photo_http_exception("source_url is required", context="assets_import", default_status=400)
 
     controller = PhotoChatController()
     try:
@@ -169,9 +181,12 @@ async def import_chat_asset(
             client_session_id=client_session_id,
             source_url=source_url,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.exception("photo assets/import failed")
+        raise _mapped_photo_http_exception(e, context="assets_import", default_status=400)
     finally:
         await controller.close()
 
@@ -217,9 +232,12 @@ async def delete_chat_messages(
     controller = PhotoChatController()
     try:
         return await controller.delete_messages(user=current_user, db=db, payload=payload)
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.exception("photo chat/messages/delete failed")
+        raise _mapped_photo_http_exception(e, context="chat_delete_messages", default_status=400)
     finally:
         await controller.close()
 
@@ -232,8 +250,11 @@ async def clear_chat_history(
     controller = PhotoChatController()
     try:
         return await controller.clear_history(user=current_user, db=db)
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.exception("photo chat/clear failed")
+        raise _mapped_photo_http_exception(e, context="chat_clear", default_status=400)
     finally:
         await controller.close()

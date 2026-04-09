@@ -99,6 +99,31 @@ class WildberriesAPI:
             return ".jpg"
         return ".jpg"
 
+    @classmethod
+    def _build_media_verification_summary(
+        cls,
+        *,
+        requested_order: List[str],
+        actual_order: List[str],
+    ) -> Dict[str, Any]:
+        requested = [str(url).strip() for url in (requested_order or []) if str(url).strip()]
+        actual = [str(url).strip() for url in (actual_order or []) if str(url).strip()]
+
+        requested_clean = [cls.strip_url_query(url) for url in requested]
+        actual_clean = [cls.strip_url_query(url) for url in actual]
+
+        missing_urls = [url for url in requested_clean if url not in actual_clean]
+        unexpected_urls = [url for url in actual_clean if url not in requested_clean]
+        matched = (not missing_urls) and (not unexpected_urls) and actual_clean[: len(requested_clean)] == requested_clean
+
+        return {
+            "requested_order": requested,
+            "actual_order": actual,
+            "matched": matched,
+            "missing_urls": missing_urls,
+            "unexpected_urls": unexpected_urls,
+        }
+
     @staticmethod
     def strip_url_query(url: str) -> str:
         raw = str(url or "").strip()
@@ -658,6 +683,8 @@ class WildberriesAPI:
                 "error": "At least one photo URL is required",
             }
 
+        # Snapshot before destructive media/save (for verification and future rollback).
+        before_urls = await self.get_card_photo_urls(int(nm_id))
         payload = {"nmId": int(nm_id), "data": desired_urls}
 
         try:
@@ -674,7 +701,9 @@ class WildberriesAPI:
                         "details": response.text,
                     }
 
-            last_urls = desired_urls
+            # Do not assume requested order was applied until WB returns current card media.
+            # Otherwise matched=true can be reported even when verification polling never observed actual URLs.
+            last_urls: List[str] = []
             last_clean: Optional[List[str]] = None
             stable_hits = 0
             attempts = max(int(poll_attempts or 1), 1)
@@ -695,16 +724,44 @@ class WildberriesAPI:
                         last_clean = current_clean
 
                     if stable_hits >= 2:
+                        verification = self._build_media_verification_summary(
+                            requested_order=desired_urls,
+                            actual_order=current_urls,
+                        )
                         return {
                             "success": True,
                             "photos": current_urls,
                             "stabilized": True,
+                            "before_order": list(before_urls or []),
+                            "before_snapshot": list(before_urls or []),
+                            "requested_order": list(verification["requested_order"]),
+                            "requested_after_snapshot": list(verification["requested_order"]),
+                            "actual_order": list(verification["actual_order"]),
+                            "actual_after_snapshot": list(verification["actual_order"]),
+                            "matched": bool(verification["matched"]),
+                            "missing_urls": list(verification["missing_urls"]),
+                            "unexpected_urls": list(verification["unexpected_urls"]),
+                            "verification": verification,
                         }
 
+            verification = self._build_media_verification_summary(
+                requested_order=desired_urls,
+                actual_order=last_urls,
+            )
             return {
                 "success": True,
                 "photos": last_urls,
                 "stabilized": False,
+                "before_order": list(before_urls or []),
+                "before_snapshot": list(before_urls or []),
+                "requested_order": list(verification["requested_order"]),
+                "requested_after_snapshot": list(verification["requested_order"]),
+                "actual_order": list(verification["actual_order"]),
+                "actual_after_snapshot": list(verification["actual_order"]),
+                "matched": bool(verification["matched"]),
+                "missing_urls": list(verification["missing_urls"]),
+                "unexpected_urls": list(verification["unexpected_urls"]),
+                "verification": verification,
             }
         except Exception as e:
             return {

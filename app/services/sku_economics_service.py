@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import logging
 import time
 import zipfile
 from collections import defaultdict
@@ -41,6 +42,7 @@ from app.schemas.sku_economics import (
     AdAnalysisItemOut,
     AdAnalysisMetricsOut,
     AdAnalysisOverviewOut,
+    AdAnalysisSourceLineageOut,
     AdAnalysisSourceStatusOut,
     AdAnalysisTrendOut,
     AdAnalysisUploadNeedsOut,
@@ -48,6 +50,8 @@ from app.schemas.sku_economics import (
 )
 from app.services.wb_advert_repository import WBAdvertRepository
 from app.services.wb_token_access import get_store_feature_api_key
+
+logger = logging.getLogger("wbai.sku_economics")
 
 
 _UNRESOLVED_ISSUE_STATUSES = {
@@ -315,10 +319,47 @@ class _UploadResult:
     unresolved_preview: List[AdAnalysisUploadUnresolvedRowOut] = field(default_factory=list)
 
 
+class _FinanceFetchError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_count: int = 0,
+        status_code: Optional[int] = None,
+        partial_rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = str(message or "")
+        self.retry_count = int(retry_count or 0)
+        self.status_code = int(status_code) if status_code is not None else None
+        self.partial_rows: List[Dict[str, Any]] = list(partial_rows or [])
+
+    def __str__(self) -> str:
+        return self.message
+
+
 class SkuEconomicsService:
     CACHE_TTL_SEC = 300
     HISTORY_LOOKBACK_DAYS = 365
     MAX_PAGE_SIZE = 100
+    FINANCE_PAGE_LIMIT = 100000
+    FINANCE_MAX_PAGES_PER_RANGE = 500
+    FINANCE_MIN_REQUEST_INTERVAL_SEC = 0.25
+    FINANCE_RETRY_MAX_ATTEMPTS = 5
+    FINANCE_RETRY_BASE_DELAY_SEC = 1.0
+    FINANCE_RETRY_MAX_DELAY_SEC = 20.0
+    FINANCE_RATE_LIMIT_STATUS = 429
+    FINANCE_SERVER_ERROR_MIN_STATUS = 500
+    FINANCE_SERVER_ERROR_MAX_STATUS = 599
+    ADVERT_RESIDUAL_EPSILON = 0.01
+    ADVERT_CAMPAIGN_SPEND_KEYS = ("sum", "spend", "spent", "total", "cost")
+    ADVERT_NM_ID_KEYS = ("nmId", "nm_id", "nmid", "id")
+    ADVERT_NM_TITLE_KEYS = ("name", "title", "nmName", "nm_name")
+    ADVERT_NM_SPEND_KEYS = ("sum", "spend", "spent", "cost")
+    ADVERT_NM_VIEWS_KEYS = ("views", "shows", "impressions")
+    ADVERT_NM_CLICKS_KEYS = ("clicks", "click", "clickCount", "click_count")
+    ADVERT_NM_ORDERS_KEYS = ("orders", "orderCount", "orders_count", "order_count")
+    ADVERT_NM_GMV_KEYS = ("sum_price", "sumPrice", "gmv", "sumPriceWithDisc")
 
     COST_ALIASES = {
         "nm_id": ["nm_id", "nmid", "nm id", "артикул wb", "артикул", "wb nm", "wb article"],
@@ -387,6 +428,215 @@ class SkuEconomicsService:
         if last_response is None:
             raise RuntimeError("WB request failed before response")
         return last_response
+
+    async def _throttle_finance_request(self, last_request_ts: float) -> None:
+        if last_request_ts <= 0:
+            return
+        wait_for = self.FINANCE_MIN_REQUEST_INTERVAL_SEC - (time.monotonic() - float(last_request_ts))
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+
+    def _finance_backoff_delay(self, response: Optional[httpx.Response], attempt: int) -> float:
+        safe_attempt = max(int(attempt), 0)
+        if response is not None and int(response.status_code) == self.FINANCE_RATE_LIMIT_STATUS:
+            return _retry_delay_from_response(response, safe_attempt)
+        return min(
+            self.FINANCE_RETRY_BASE_DELAY_SEC * (2 ** safe_attempt),
+            self.FINANCE_RETRY_MAX_DELAY_SEC,
+        )
+
+    async def _request_finance_page_with_retry(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: Dict[str, str],
+        params: Dict[str, Any],
+        date_from: date,
+        date_to: date,
+        rrdid: int,
+        last_request_ts: float,
+    ) -> Tuple[httpx.Response, float]:
+        max_attempts = max(int(self.FINANCE_RETRY_MAX_ATTEMPTS), 1)
+
+        for attempt in range(max_attempts):
+            await self._throttle_finance_request(last_request_ts)
+            try:
+                response = await client.request(
+                    "GET",
+                    url,
+                    headers=headers,
+                    params=params,
+                )
+                last_request_ts = time.monotonic()
+            except httpx.RequestError as exc:
+                retry_count = attempt + 1
+                if retry_count >= max_attempts:
+                    logger.error(
+                        "[sku-finance] request failed after retries type=request_error retries=%s "
+                        "period=%s..%s rrdid=%s error=%s",
+                        retry_count,
+                        date_from.isoformat(),
+                        date_to.isoformat(),
+                        int(rrdid),
+                        str(exc),
+                    )
+                    raise _FinanceFetchError(
+                        f"WB finance request error after {retry_count} retries: {exc}",
+                        retry_count=retry_count,
+                    ) from exc
+
+                delay = self._finance_backoff_delay(None, attempt)
+                logger.warning(
+                    "[sku-finance] retrying request type=request_error retry=%s/%s backoff=%.2fs "
+                    "period=%s..%s rrdid=%s error=%s",
+                    retry_count,
+                    max_attempts,
+                    delay,
+                    date_from.isoformat(),
+                    date_to.isoformat(),
+                    int(rrdid),
+                    str(exc),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if response.status_code == 204 or response.status_code < 400:
+                if attempt > 0:
+                    logger.info(
+                        "[sku-finance] request recovered after retry retries=%s status=%s "
+                        "period=%s..%s rrdid=%s",
+                        attempt,
+                        int(response.status_code),
+                        date_from.isoformat(),
+                        date_to.isoformat(),
+                        int(rrdid),
+                    )
+                return response, last_request_ts
+
+            retry_count = attempt + 1
+            retryable = (
+                int(response.status_code) == self.FINANCE_RATE_LIMIT_STATUS
+                or self.FINANCE_SERVER_ERROR_MIN_STATUS
+                <= int(response.status_code)
+                <= self.FINANCE_SERVER_ERROR_MAX_STATUS
+            )
+            if retryable and retry_count < max_attempts:
+                delay = self._finance_backoff_delay(response, attempt)
+                logger.warning(
+                    "[sku-finance] retrying request status=%s retry=%s/%s backoff=%.2fs "
+                    "period=%s..%s rrdid=%s",
+                    int(response.status_code),
+                    retry_count,
+                    max_attempts,
+                    delay,
+                    date_from.isoformat(),
+                    date_to.isoformat(),
+                    int(rrdid),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            reason = f"WB finance error {response.status_code}: {response.text[:300]}"
+            logger.error(
+                "[sku-finance] request failed status=%s retries=%s period=%s..%s rrdid=%s reason=%s",
+                int(response.status_code),
+                retry_count,
+                date_from.isoformat(),
+                date_to.isoformat(),
+                int(rrdid),
+                response.text[:200],
+            )
+            raise _FinanceFetchError(
+                reason,
+                retry_count=retry_count,
+                status_code=int(response.status_code),
+            )
+
+        raise _FinanceFetchError(
+            "WB finance request failed: retry loop ended unexpectedly",
+            retry_count=max_attempts,
+        )
+
+    async def _fetch_finance_rows_paginated(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        url: str,
+        token: str,
+        date_from: date,
+        date_to: date,
+        period: str = "daily",
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        rrdid = 0
+        pages = 0
+        seen_rrd_ids: set[int] = set()
+        last_request_ts = 0.0
+
+        while True:
+            params = {
+                "dateFrom": date_from.isoformat(),
+                "dateTo": date_to.isoformat(),
+                "limit": self.FINANCE_PAGE_LIMIT,
+                "rrdid": int(rrdid),
+                "period": period,
+            }
+            try:
+                resp, last_request_ts = await self._request_finance_page_with_retry(
+                    client=client,
+                    url=url,
+                    headers={"Authorization": token, "Accept": "application/json"},
+                    params=params,
+                    date_from=date_from,
+                    date_to=date_to,
+                    rrdid=int(rrdid),
+                    last_request_ts=last_request_ts,
+                )
+            except _FinanceFetchError as exc:
+                if rows:
+                    raise _FinanceFetchError(
+                        f"{exc} (partial rows collected: {len(rows)})",
+                        retry_count=exc.retry_count,
+                        status_code=exc.status_code,
+                        partial_rows=rows,
+                    ) from exc
+                raise
+
+            if resp.status_code == 204:
+                break
+            if resp.status_code >= 400:
+                raise ValueError(f"WB finance error {resp.status_code}: {resp.text[:300]}")
+
+            payload = resp.json() or []
+            if isinstance(payload, dict):
+                payload = payload.get("data") or payload.get("rows") or []
+            if not isinstance(payload, list) or not payload:
+                break
+
+            page_rows = [item for item in payload if isinstance(item, dict)]
+            if not page_rows:
+                break
+
+            rows.extend(page_rows)
+            pages += 1
+            if pages >= self.FINANCE_MAX_PAGES_PER_RANGE:
+                raise ValueError(
+                    f"WB finance pagination safeguard reached ({self.FINANCE_MAX_PAGES_PER_RANGE} pages) "
+                    f"for {date_from.isoformat()}..{date_to.isoformat()}"
+                )
+
+            last_row = page_rows[-1]
+            last_rrd_id = _to_int((last_row or {}).get("rrd_id") or (last_row or {}).get("rrdId"))
+            if last_rrd_id <= 0:
+                break
+            if last_rrd_id <= int(rrdid) or last_rrd_id in seen_rrd_ids:
+                break
+
+            seen_rrd_ids.add(last_rrd_id)
+            rrdid = last_rrd_id
+
+        return rows
 
     async def build_overview(
         self,
@@ -795,6 +1045,117 @@ class SkuEconomicsService:
             target.funnel_buyout_sum = float(source.funnel_buyout_sum or 0.0)
             target.has_funnel = bool(source.has_funnel)
 
+    def _extract_fullstats_items(self, payload: Any) -> List[dict]:
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if not isinstance(payload, dict):
+            return []
+
+        for key in ("data", "items", "adverts", "rows", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                for inner_key in ("data", "items", "adverts", "rows"):
+                    inner_value = value.get(inner_key)
+                    if isinstance(inner_value, list):
+                        return [item for item in inner_value if isinstance(item, dict)]
+
+        if any(key in payload for key in ("days", "apps", "nms", "advertId", "advert_id", "id", "sum")):
+            return [payload]
+        return []
+
+    def _extract_value_by_keys(self, payload: Optional[Dict[str, Any]], keys: Sequence[str]) -> Any:
+        if not isinstance(payload, dict):
+            return None
+        for key in keys:
+            if key in payload:
+                value = payload.get(key)
+                if value is not None:
+                    return value
+        return None
+
+    def _extract_campaign_total(self, node: Dict[str, Any]) -> float:
+        raw = self._extract_value_by_keys(node, self.ADVERT_CAMPAIGN_SPEND_KEYS)
+        if raw is not None:
+            return max(_to_float(raw), 0.0)
+
+        for key in ("stat", "stats", "statistic", "selected"):
+            nested = node.get(key)
+            raw_nested = self._extract_value_by_keys(nested if isinstance(nested, dict) else None, self.ADVERT_CAMPAIGN_SPEND_KEYS)
+            if raw_nested is not None:
+                return max(_to_float(raw_nested), 0.0)
+        return 0.0
+
+    def _extract_nm_id(self, nm_row: Dict[str, Any]) -> int:
+        direct_nm_id = _to_int(self._extract_value_by_keys(nm_row, self.ADVERT_NM_ID_KEYS))
+        if direct_nm_id > 0:
+            return direct_nm_id
+
+        for key in ("nm", "product", "item"):
+            nested = nm_row.get(key)
+            if isinstance(nested, dict):
+                nested_nm_id = _to_int(self._extract_value_by_keys(nested, self.ADVERT_NM_ID_KEYS))
+                if nested_nm_id > 0:
+                    return nested_nm_id
+            else:
+                nested_nm_id = _to_int(nested)
+                if nested_nm_id > 0:
+                    return nested_nm_id
+        return 0
+
+    def _extract_nm_metric_float(self, nm_row: Dict[str, Any], keys: Sequence[str]) -> float:
+        raw = self._extract_value_by_keys(nm_row, keys)
+        if raw is not None:
+            return max(_to_float(raw), 0.0)
+
+        for key in ("stats", "stat", "statistic", "selected"):
+            nested = nm_row.get(key)
+            if isinstance(nested, dict):
+                raw_nested = self._extract_value_by_keys(nested, keys)
+                if raw_nested is not None:
+                    return max(_to_float(raw_nested), 0.0)
+        return 0.0
+
+    def _extract_nm_title(self, nm_row: Dict[str, Any]) -> str:
+        raw = self._extract_value_by_keys(nm_row, self.ADVERT_NM_TITLE_KEYS)
+        if raw is not None:
+            return str(raw or "").strip()
+        for key in ("nm", "product", "item"):
+            nested = nm_row.get(key)
+            if isinstance(nested, dict):
+                nested_title = self._extract_value_by_keys(nested, self.ADVERT_NM_TITLE_KEYS)
+                if nested_title is not None:
+                    return str(nested_title or "").strip()
+        return ""
+
+    def _build_residual_weights(self, nm_rows: Sequence[Tuple[int, Dict[str, Any]]]) -> List[Tuple[int, float]]:
+        if not nm_rows:
+            return []
+
+        order_weights: List[Tuple[int, float]] = [
+            (nm_id, self._extract_nm_metric_float(row, self.ADVERT_NM_ORDERS_KEYS))
+            for nm_id, row in nm_rows
+        ]
+        if sum(weight for _, weight in order_weights) > self.ADVERT_RESIDUAL_EPSILON:
+            return order_weights
+
+        click_weights: List[Tuple[int, float]] = [
+            (nm_id, self._extract_nm_metric_float(row, self.ADVERT_NM_CLICKS_KEYS))
+            for nm_id, row in nm_rows
+        ]
+        if sum(weight for _, weight in click_weights) > self.ADVERT_RESIDUAL_EPSILON:
+            return click_weights
+
+        view_weights: List[Tuple[int, float]] = [
+            (nm_id, self._extract_nm_metric_float(row, self.ADVERT_NM_VIEWS_KEYS))
+            for nm_id, row in nm_rows
+        ]
+        if sum(weight for _, weight in view_weights) > self.ADVERT_RESIDUAL_EPSILON:
+            return view_weights
+
+        return [(nm_id, 1.0) for nm_id, _ in nm_rows]
+
     async def _fetch_advert_daily_history(
         self,
         store: Store,
@@ -831,8 +1192,7 @@ class SkuEconomicsService:
                             begin_date=chunk_start.isoformat(),
                             end_date=chunk_end.isoformat(),
                         )
-                        if isinstance(batch_data, list):
-                            raw_items.extend(item for item in batch_data if isinstance(item, dict))
+                        raw_items.extend(self._extract_fullstats_items(batch_data))
                     chunk_start = chunk_end + timedelta(days=1)
 
                 parsed = self._parse_fullstats_daily(raw_items, fallback_end=period_end)
@@ -875,13 +1235,22 @@ class SkuEconomicsService:
     ) -> Dict[str, Any]:
         rows: Dict[Tuple[date, int], _DailyMetricBucket] = {}
         unallocated_spend = 0.0
+        skipped_items = 0
+        invalid_nm_rows = 0
+        zero_total_drift_rows = 0
 
         for item in items:
+            if not isinstance(item, dict):
+                skipped_items += 1
+                continue
             day_nodes = item.get("days")
             if isinstance(day_nodes, list) and day_nodes:
                 candidates = [node for node in day_nodes if isinstance(node, dict)]
             else:
                 candidates = [item]
+            if not candidates:
+                skipped_items += 1
+                continue
 
             for node in candidates:
                 metric_date = self._parse_generic_date(
@@ -894,59 +1263,43 @@ class SkuEconomicsService:
 
                 leaf_nms: List[dict] = []
                 self._collect_leaf_nms(node, leaf_nms)
-                campaign_total = _to_float(node.get("sum"))
+                campaign_total = self._extract_campaign_total(node)
                 campaign_spend_from_nms = 0.0
+                valid_nm_rows: List[Tuple[int, Dict[str, Any]]] = []
 
                 for nm_row in leaf_nms:
-                    nm_id = _to_int(nm_row.get("nmId") or nm_row.get("nm_id"))
-                    if nm_id <= 0:
+                    if not isinstance(nm_row, dict):
+                        invalid_nm_rows += 1
                         continue
+                    nm_id = self._extract_nm_id(nm_row)
+                    if nm_id <= 0:
+                        invalid_nm_rows += 1
+                        continue
+                    valid_nm_rows.append((nm_id, nm_row))
                     key = (metric_date, nm_id)
                     bucket = rows.setdefault(key, _DailyMetricBucket())
-                    nm_spend = _to_float(nm_row.get("sum"))
-                    bucket.advert_views += _to_int(nm_row.get("views"))
-                    bucket.advert_clicks += _to_int(nm_row.get("clicks"))
-                    bucket.advert_orders += _to_int(nm_row.get("orders"))
-                    bucket.advert_gmv += _to_float(nm_row.get("sum_price"))
+                    nm_spend = self._extract_nm_metric_float(nm_row, self.ADVERT_NM_SPEND_KEYS)
+                    bucket.advert_views += _to_int(self._extract_nm_metric_float(nm_row, self.ADVERT_NM_VIEWS_KEYS))
+                    bucket.advert_clicks += _to_int(self._extract_nm_metric_float(nm_row, self.ADVERT_NM_CLICKS_KEYS))
+                    bucket.advert_orders += _to_int(self._extract_nm_metric_float(nm_row, self.ADVERT_NM_ORDERS_KEYS))
+                    bucket.advert_gmv += self._extract_nm_metric_float(nm_row, self.ADVERT_NM_GMV_KEYS)
                     bucket.advert_exact_spend += nm_spend
                     bucket.has_advert = True
                     if not bucket.title:
-                        bucket.title = str(nm_row.get("name") or "").strip()
+                        bucket.title = self._extract_nm_title(nm_row)
                     campaign_spend_from_nms += nm_spend
 
-                residual = max(campaign_total - campaign_spend_from_nms, 0.0)
-                if residual <= 0.01:
+                if campaign_total <= self.ADVERT_RESIDUAL_EPSILON and campaign_spend_from_nms > self.ADVERT_RESIDUAL_EPSILON:
+                    zero_total_drift_rows += 1
+                effective_campaign_total = max(campaign_total, campaign_spend_from_nms)
+                residual = max(effective_campaign_total - campaign_spend_from_nms, 0.0)
+                if residual <= self.ADVERT_RESIDUAL_EPSILON:
                     continue
-                if leaf_nms:
-                    weighted_rows = [
-                        (nm_row, max(_to_float(nm_row.get("orders")), 0.0))
-                        for nm_row in leaf_nms
-                        if _to_int(nm_row.get("nmId") or nm_row.get("nm_id")) > 0
-                    ]
-                    if sum(weight for _, weight in weighted_rows) <= 0.01:
-                        weighted_rows = [
-                            (nm_row, max(_to_float(nm_row.get("clicks")), 0.0))
-                            for nm_row in leaf_nms
-                            if _to_int(nm_row.get("nmId") or nm_row.get("nm_id")) > 0
-                        ]
-                    if sum(weight for _, weight in weighted_rows) <= 0.01:
-                        weighted_rows = [
-                            (nm_row, max(_to_float(nm_row.get("views")), 0.0))
-                            for nm_row in leaf_nms
-                            if _to_int(nm_row.get("nmId") or nm_row.get("nm_id")) > 0
-                        ]
-                    if sum(weight for _, weight in weighted_rows) <= 0.01:
-                        weighted_rows = [
-                            (nm_row, 1.0)
-                            for nm_row in leaf_nms
-                            if _to_int(nm_row.get("nmId") or nm_row.get("nm_id")) > 0
-                        ]
 
-                    total_weight = sum(weight for _, weight in weighted_rows) or float(len(weighted_rows) or 1)
-                    for nm_row, weight in weighted_rows:
-                        nm_id = _to_int(nm_row.get("nmId") or nm_row.get("nm_id"))
-                        if nm_id <= 0:
-                            continue
+                weights = self._build_residual_weights(valid_nm_rows)
+                if weights:
+                    total_weight = sum(weight for _, weight in weights) or float(len(weights) or 1)
+                    for nm_id, weight in weights:
                         key = (metric_date, nm_id)
                         bucket = rows.setdefault(key, _DailyMetricBucket())
                         bucket.advert_estimated_spend += residual * (weight / total_weight)
@@ -957,6 +1310,15 @@ class SkuEconomicsService:
                     bucket.advert_estimated_spend += residual
                     bucket.has_advert = True
                     unallocated_spend += residual
+
+        if skipped_items > 0 or invalid_nm_rows > 0 or zero_total_drift_rows > 0:
+            logger.warning(
+                "[sku-advert] fullstats daily parser normalized anomalies skipped_items=%s invalid_nm_rows=%s "
+                "zero_total_drift_rows=%s",
+                skipped_items,
+                invalid_nm_rows,
+                zero_total_drift_rows,
+            )
 
         return {
             "rows": rows,
@@ -977,30 +1339,31 @@ class SkuEconomicsService:
                 rows_by_day: Dict[Tuple[date, int], _DailyMetricBucket] = {}
                 total_rows = 0
                 chunk_start = period_start
+                partial_reason: Optional[str] = None
                 async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
                     while chunk_start <= period_end:
                         chunk_end = min(chunk_start + timedelta(days=30), period_end)
-                        params = {
-                            "dateFrom": chunk_start.isoformat(),
-                            "dateTo": chunk_end.isoformat(),
-                            "limit": 100000,
-                            "rrdid": 0,
-                            "period": "daily",
-                        }
-                        resp = await self._request_with_retry(
-                            client,
-                            "GET",
-                            url,
-                            headers={"Authorization": token, "Accept": "application/json"},
-                            params=params,
-                        )
-                        if resp.status_code == 204:
-                            chunk_start = chunk_end + timedelta(days=1)
-                            continue
-                        if resp.status_code >= 400:
-                            raise ValueError(f"WB finance error {resp.status_code}: {resp.text[:300]}")
-
-                        rows = resp.json() or []
+                        try:
+                            rows = await self._fetch_finance_rows_paginated(
+                                client=client,
+                                url=url,
+                                token=token,
+                                date_from=chunk_start,
+                                date_to=chunk_end,
+                                period="daily",
+                            )
+                        except _FinanceFetchError as finance_exc:
+                            rows = list(finance_exc.partial_rows or [])
+                            if not rows:
+                                raise
+                            partial_reason = str(finance_exc)
+                            logger.warning(
+                                "[sku-finance] partial daily history fetched period=%s..%s rows=%s reason=%s",
+                                chunk_start.isoformat(),
+                                chunk_end.isoformat(),
+                                len(rows),
+                                partial_reason,
+                            )
                         total_rows += len(rows)
                         for row in rows:
                             nm_id = _to_int(row.get("nm_id"))
@@ -1048,6 +1411,8 @@ class SkuEconomicsService:
                             if not bucket.title:
                                 bucket.title = str(row.get("sa_name") or row.get("subject_name") or row.get("brand_name") or "").strip()
 
+                        if partial_reason:
+                            break
                         chunk_start = chunk_end + timedelta(days=1)
 
                 return (
@@ -1055,11 +1420,15 @@ class SkuEconomicsService:
                     AdAnalysisSourceStatusOut(
                         id="finance",
                         label="Финансы WB",
-                        mode="ok" if total_rows > 0 else "empty",
+                        mode="partial" if partial_reason else ("ok" if total_rows > 0 else "empty"),
                         detail=(
-                            "История финансового слоя сохранена из WB Statistics API."
-                            if total_rows > 0
-                            else "За выбранный диапазон финансовых строк нет."
+                            f"История финансового слоя сохранена частично: {partial_reason}"
+                            if partial_reason
+                            else (
+                                "История финансового слоя сохранена из WB Statistics API."
+                                if total_rows > 0
+                                else "За выбранный диапазон финансовых строк нет."
+                            )
                         ),
                         records=total_rows,
                         automatic=True,
@@ -1547,6 +1916,8 @@ class SkuEconomicsService:
                 cr = (advert.total_orders / advert.total_clicks * 100.0) if advert.total_clicks > 0 else 0.0
                 cpc = (ad_cost / advert.total_clicks) if advert.total_clicks > 0 else 0.0
                 drr = (ad_cost / revenue * 100.0) if revenue > 0 else 0.0
+                precision, precision_label = self._resolve_precision(advert, aggregate["unallocated_spend"])
+                ad_cost_confidence = self._resolve_ad_cost_confidence(advert, aggregate["unallocated_spend"])
 
                 metrics = AdAnalysisMetricsOut(
                     revenue=round(revenue, 2),
@@ -1554,6 +1925,12 @@ class SkuEconomicsService:
                     cost_price=round(cost_price, 2),
                     gross_profit_before_ads=round(gross_profit_before_ads, 2),
                     ad_cost=round(ad_cost, 2),
+                    ad_cost_total=round(ad_cost, 2),
+                    ad_cost_exact=round(advert.exact_spend, 2),
+                    ad_cost_estimated=round(advert.estimated_spend, 2),
+                    ad_cost_manual=round(advert.manual_spend, 2),
+                    ad_cost_source_mode=precision,
+                    ad_cost_confidence=ad_cost_confidence,
                     net_profit=round(net_profit, 2),
                     profit_per_order=round(net_profit / order_denominator, 2) if total_orders > 0 else round(net_profit, 2),
                     max_cpo=round(max_cpo, 2),
@@ -1575,7 +1952,6 @@ class SkuEconomicsService:
                     drr=round(drr, 2),
                 )
 
-                precision, precision_label = self._resolve_precision(advert, aggregate["unallocated_spend"])
                 finance_ready = aggregate["finance_records"] > 0 or nm_id in finance_topups
                 diagnosis, diagnosis_label, reasons, hints = self._resolve_diagnosis(
                     metrics=metrics,
@@ -1612,7 +1988,16 @@ class SkuEconomicsService:
                         records=0,
                         automatic=True,
                     ),
+                    "funnel": AdAnalysisSourceStatusOut(
+                        id="funnel",
+                        label="Воронка продаж",
+                        mode="ok" if funnel_metric.open_count > 0 or funnel_metric.order_count > 0 else "empty",
+                        detail=None,
+                        records=0,
+                        automatic=True,
+                    ),
                 }
+                source_lineage = self._build_source_lineage(source_status_stub)
                 action_title, action_description, steps, insights, risk_flags = self._build_actions(
                     status=status,
                     diagnosis=diagnosis,
@@ -1654,6 +2039,7 @@ class SkuEconomicsService:
                         priority_label=priority_label,
                         precision=precision,
                         precision_label=precision_label,
+                        source_lineage=source_lineage,
                         trend=AdAnalysisTrendOut(),
                         issue_summary=AdAnalysisIssueSummaryOut(
                             total=issue_summary.total,
@@ -1852,6 +2238,7 @@ class SkuEconomicsService:
             loss_count=loss_count,
             status_counts=status_counts,
             source_statuses=[advert_status, funnel_status, finance_status, costs_status, manual_spend_status],
+            source_lineage=self._build_source_lineage([advert_status, funnel_status, finance_status]),
             alerts=alerts,
             budget_moves=budget_moves,
             campaigns=[],
@@ -2082,6 +2469,7 @@ class SkuEconomicsService:
             previous_period_start=previous_period_start,
             previous_period_end=previous_period_end,
             source_statuses=source_statuses,
+            source_lineage=self._build_source_lineage(source_statuses),
             alerts=alerts,
             upload_needs=AdAnalysisUploadNeedsOut(
                 period_start=period_start,
@@ -2244,6 +2632,9 @@ class SkuEconomicsService:
             cr = (advert.total_orders / advert.total_clicks * 100.0) if advert.total_clicks > 0 else 0.0
             cpc = (ad_cost / advert.total_clicks) if advert.total_clicks > 0 else 0.0
             drr = (ad_cost / revenue * 100.0) if revenue > 0 else 0.0
+            precision, precision_label = self._resolve_precision(advert, raw_unallocated)
+            ad_cost_confidence = self._resolve_ad_cost_confidence(advert, raw_unallocated)
+            source_lineage = self._build_source_lineage(source_map)
 
             metrics = AdAnalysisMetricsOut(
                 revenue=round(revenue, 2),
@@ -2251,6 +2642,12 @@ class SkuEconomicsService:
                 cost_price=round(cost_price, 2),
                 gross_profit_before_ads=round(gross_profit_before_ads, 2),
                 ad_cost=round(ad_cost, 2),
+                ad_cost_total=round(ad_cost, 2),
+                ad_cost_exact=round(advert.exact_spend, 2),
+                ad_cost_estimated=round(advert.estimated_spend, 2),
+                ad_cost_manual=round(advert.manual_spend, 2),
+                ad_cost_source_mode=precision,
+                ad_cost_confidence=ad_cost_confidence,
                 net_profit=round(net_profit, 2),
                 profit_per_order=round(net_profit / order_denominator, 2) if total_orders > 0 else round(net_profit, 2),
                 max_cpo=round(max_cpo, 2),
@@ -2272,7 +2669,6 @@ class SkuEconomicsService:
                 drr=round(drr, 2),
             )
 
-            precision, precision_label = self._resolve_precision(advert, raw_unallocated)
             diagnosis, diagnosis_label, reasons, hints = self._resolve_diagnosis(
                 metrics=metrics,
                 issue_summary=issue_summary,
@@ -2333,6 +2729,7 @@ class SkuEconomicsService:
                     priority_label=priority_label,
                     precision=precision,
                     precision_label=precision_label,
+                    source_lineage=source_lineage,
                     trend=AdAnalysisTrendOut(),
                     issue_summary=AdAnalysisIssueSummaryOut(
                         total=issue_summary.total,
@@ -2439,6 +2836,7 @@ class SkuEconomicsService:
             loss_count=loss_count,
             status_counts=status_counts,
             source_statuses=list(source_map.values()),
+            source_lineage=self._build_source_lineage(source_map),
             alerts=alerts,
             budget_moves=budget_moves,
             campaigns=list(advert_data.get("campaigns", []))[:12],
@@ -2887,8 +3285,7 @@ class SkuEconomicsService:
                         begin_date=period_start.isoformat(),
                         end_date=period_end.isoformat(),
                     )
-                    if isinstance(batch_data, list):
-                        raw_items.extend(item for item in batch_data if isinstance(item, dict))
+                    raw_items.extend(self._extract_fullstats_items(batch_data))
 
                 parsed = self._parse_fullstats(raw_items)
                 mode = "partial" if parsed["unallocated_spend"] > 0.01 else "ok"
@@ -2930,77 +3327,76 @@ class SkuEconomicsService:
         exact_spend = 0.0
         estimated_spend = 0.0
         unallocated_spend = 0.0
+        skipped_items = 0
+        invalid_nm_rows = 0
+        zero_total_drift_items = 0
 
         for item in items:
+            if not isinstance(item, dict):
+                skipped_items += 1
+                continue
             leaf_nms: List[dict] = []
             self._collect_leaf_nms(item, leaf_nms)
-            campaign_total = _to_float(item.get("sum"))
+            campaign_total = self._extract_campaign_total(item)
             campaign_spend_from_nms = 0.0
             campaign_orders = 0
             campaign_gmv = 0.0
             linked_skus = 0
+            valid_nm_rows: List[Tuple[int, Dict[str, Any]]] = []
 
             for nm_row in leaf_nms:
-                nm_id = _to_int(nm_row.get("nmId") or nm_row.get("nm_id"))
-                if nm_id <= 0:
+                if not isinstance(nm_row, dict):
+                    invalid_nm_rows += 1
                     continue
+                nm_id = self._extract_nm_id(nm_row)
+                if nm_id <= 0:
+                    invalid_nm_rows += 1
+                    continue
+                valid_nm_rows.append((nm_id, nm_row))
                 linked_skus += 1
                 metric = per_nm[nm_id]
-                nm_spend = _to_float(nm_row.get("sum"))
-                nm_orders = _to_int(nm_row.get("orders"))
-                nm_gmv = _to_float(nm_row.get("sum_price"))
-                metric.views += _to_int(nm_row.get("views"))
-                metric.clicks += _to_int(nm_row.get("clicks"))
+                nm_spend = self._extract_nm_metric_float(nm_row, self.ADVERT_NM_SPEND_KEYS)
+                nm_orders = _to_int(self._extract_nm_metric_float(nm_row, self.ADVERT_NM_ORDERS_KEYS))
+                nm_gmv = self._extract_nm_metric_float(nm_row, self.ADVERT_NM_GMV_KEYS)
+                metric.views += _to_int(self._extract_nm_metric_float(nm_row, self.ADVERT_NM_VIEWS_KEYS))
+                metric.clicks += _to_int(self._extract_nm_metric_float(nm_row, self.ADVERT_NM_CLICKS_KEYS))
                 metric.orders += nm_orders
                 metric.gmv += nm_gmv
                 metric.exact_spend += nm_spend
-                titles[nm_id] = str(nm_row.get("name") or "").strip() or titles.get(nm_id, "")
+                title = self._extract_nm_title(nm_row)
+                titles[nm_id] = title or titles.get(nm_id, "")
                 exact_spend += nm_spend
                 campaign_spend_from_nms += nm_spend
                 campaign_orders += nm_orders
                 campaign_gmv += nm_gmv
 
-            residual = max(campaign_total - campaign_spend_from_nms, 0.0)
-            if residual <= 0.01:
+            if campaign_total <= self.ADVERT_RESIDUAL_EPSILON and campaign_spend_from_nms > self.ADVERT_RESIDUAL_EPSILON:
+                zero_total_drift_items += 1
+            effective_campaign_total = max(campaign_total, campaign_spend_from_nms)
+            residual = max(effective_campaign_total - campaign_spend_from_nms, 0.0)
+            if residual <= self.ADVERT_RESIDUAL_EPSILON:
                 residual = 0.0
-            elif leaf_nms:
-                order_weights: List[Tuple[int, float]] = []
-                click_weights: List[Tuple[int, float]] = []
-                view_weights: List[Tuple[int, float]] = []
-                for nm_row in leaf_nms:
-                    nm_id = _to_int(nm_row.get("nmId") or nm_row.get("nm_id"))
-                    if nm_id <= 0:
-                        continue
-                    order_weights.append((nm_id, max(_to_float(nm_row.get("orders")), 0.0)))
-                    click_weights.append((nm_id, max(_to_float(nm_row.get("clicks")), 0.0)))
-                    view_weights.append((nm_id, max(_to_float(nm_row.get("views")), 0.0)))
-
-                weights = order_weights
-                if sum(weight for _, weight in weights) <= 0.01:
-                    weights = click_weights
-                if sum(weight for _, weight in weights) <= 0.01:
-                    weights = view_weights
-                if sum(weight for _, weight in weights) <= 0.01:
-                    weights = [(nm_id, 1.0) for nm_id, _ in view_weights]
-
-                total_weight = sum(weight for _, weight in weights) or float(len(weights) or 1)
-                for nm_id, weight in weights:
-                    share = residual * (weight / total_weight)
-                    per_nm[nm_id].estimated_spend += share
-                    estimated_spend += share
             else:
-                unallocated_spend += residual
+                weights = self._build_residual_weights(valid_nm_rows)
+                if weights:
+                    total_weight = sum(weight for _, weight in weights) or float(len(weights) or 1)
+                    for nm_id, weight in weights:
+                        share = residual * (weight / total_weight)
+                        per_nm[nm_id].estimated_spend += share
+                        estimated_spend += share
+                else:
+                    unallocated_spend += residual
 
             advert_id = _to_int(item.get("advertId") or item.get("advert_id") or item.get("id"))
             campaign_title = (
                 str(item.get("advertName") or item.get("advert_name") or item.get("name") or item.get("advertTitle") or "").strip()
                 or (f"РК {advert_id}" if advert_id > 0 else "Рекламная кампания")
             )
-            if residual > 0.01 and linked_skus == 0:
+            if residual > self.ADVERT_RESIDUAL_EPSILON and linked_skus == 0:
                 precision = "unallocated"
                 precision_label = "Нераспределенные расходы"
-            elif residual > 0.01:
-                precision = "estimated" if campaign_spend_from_nms <= 0.01 else "mixed"
+            elif residual > self.ADVERT_RESIDUAL_EPSILON:
+                precision = "estimated" if campaign_spend_from_nms <= self.ADVERT_RESIDUAL_EPSILON else "mixed"
                 precision_label = "Оценка" if precision == "estimated" else "Смешанный источник"
             else:
                 precision = "exact"
@@ -3010,13 +3406,22 @@ class SkuEconomicsService:
                 AdAnalysisCampaignOut(
                     advert_id=advert_id or None,
                     title=campaign_title,
-                    ad_cost=round(campaign_total, 2),
+                    ad_cost=round(effective_campaign_total, 2),
                     ad_gmv=round(campaign_gmv, 2),
-                    drr=round((campaign_total / campaign_gmv * 100.0) if campaign_gmv > 0 else 0.0, 2),
+                    drr=round((effective_campaign_total / campaign_gmv * 100.0) if campaign_gmv > 0 else 0.0, 2),
                     linked_skus=linked_skus,
                     precision=precision,
                     precision_label=precision_label,
                 )
+            )
+
+        if skipped_items > 0 or invalid_nm_rows > 0 or zero_total_drift_items > 0:
+            logger.warning(
+                "[sku-advert] fullstats parser normalized anomalies skipped_items=%s invalid_nm_rows=%s "
+                "zero_total_drift_items=%s",
+                skipped_items,
+                invalid_nm_rows,
+                zero_total_drift_items,
             )
 
         return {
@@ -3040,10 +3445,15 @@ class SkuEconomicsService:
         if nested:
             for child in nested:
                 self._collect_leaf_nms(child, out)
-            return
-        nms = node.get("nms")
-        if isinstance(nms, list):
-            out.extend(item for item in nms if isinstance(item, dict))
+
+        for key in ("nms", "products", "items"):
+            values = node.get(key)
+            if isinstance(values, list):
+                out.extend(item for item in values if isinstance(item, dict))
+
+        nm_single = node.get("nm")
+        if isinstance(nm_single, dict):
+            out.append(nm_single)
 
     async def _fetch_funnel_metrics(
         self,
@@ -3150,22 +3560,30 @@ class SkuEconomicsService:
         url = f"{settings.WB_STATISTICS_API_URL}/api/v5/supplier/reportDetailByPeriod"
         for token in tokens:
             try:
-                params = {
-                    "dateFrom": period_start.isoformat(),
-                    "dateTo": period_end.isoformat(),
-                    "limit": 100000,
-                    "rrdid": 0,
-                    "period": "daily",
-                }
+                partial_reason: Optional[str] = None
                 async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
-                    resp = await self._request_with_retry(
-                        client,
-                        "GET",
-                        url,
-                        headers={"Authorization": token, "Accept": "application/json"},
-                        params=params,
-                    )
-                if resp.status_code == 204:
+                    try:
+                        rows = await self._fetch_finance_rows_paginated(
+                            client=client,
+                            url=url,
+                            token=token,
+                            date_from=period_start,
+                            date_to=period_end,
+                            period="daily",
+                        )
+                    except _FinanceFetchError as finance_exc:
+                        rows = list(finance_exc.partial_rows or [])
+                        if not rows:
+                            raise
+                        partial_reason = str(finance_exc)
+                        logger.warning(
+                            "[sku-finance] partial finance metrics fetched period=%s..%s rows=%s reason=%s",
+                            period_start.isoformat(),
+                            period_end.isoformat(),
+                            len(rows),
+                            partial_reason,
+                        )
+                if not rows:
                     return (
                         {},
                         AdAnalysisSourceStatusOut(
@@ -3177,10 +3595,6 @@ class SkuEconomicsService:
                             automatic=True,
                         ),
                     )
-                if resp.status_code >= 400:
-                    raise ValueError(f"WB finance error {resp.status_code}: {resp.text[:300]}")
-
-                rows = resp.json() or []
                 out: Dict[int, _FinanceMetrics] = defaultdict(_FinanceMetrics)
                 for row in rows:
                     nm_id = _to_int(row.get("nm_id"))
@@ -3217,16 +3631,17 @@ class SkuEconomicsService:
                     metric.payout = round(metric.payout, 2)
                     metric.orders = max(int(metric.orders), 0)
 
-                detail = "Финансовый отчет WB подтянут по API"
-                if len(rows) >= 100000:
-                    detail = "Финансовый отчет частичный: WB вернул лимит 100000 строк"
                 return (
                     out,
                     AdAnalysisSourceStatusOut(
                         id="finance",
                         label="Финансы WB",
-                        mode="partial" if len(rows) >= 100000 else "ok",
-                        detail=detail,
+                        mode="partial" if partial_reason else "ok",
+                        detail=(
+                            f"Финансовый отчет WB подтянут частично: {partial_reason}"
+                            if partial_reason
+                            else "Финансовый отчет WB подтянут по API (с постраничной загрузкой)."
+                        ),
                         records=len(rows),
                         automatic=True,
                     ),
@@ -3323,6 +3738,49 @@ class SkuEconomicsService:
         if raw_unallocated > 0.01:
             return "unallocated", "Нераспределенные расходы"
         return "exact", "Точные данные"
+
+    def _resolve_ad_cost_confidence(self, advert: _AdvertMetrics, raw_unallocated: float) -> str:
+        if advert.manual_spend > 0.01:
+            return "low"
+        if raw_unallocated > self.ADVERT_RESIDUAL_EPSILON:
+            return "low"
+        if advert.estimated_spend > 0.01:
+            return "medium"
+        return "high"
+
+    def _lineage_mode_from_source_status(self, source_status: Optional[AdAnalysisSourceStatusOut]) -> str:
+        if source_status is None:
+            return "failed"
+        mode = str(source_status.mode or "")
+        if mode in {"error", "manual_required"}:
+            return "failed"
+        if mode == "partial":
+            return "partial"
+        if mode == "manual" or not bool(source_status.automatic):
+            return "manual"
+        return "automatic"
+
+    def _build_source_lineage(
+        self,
+        source_statuses: Dict[str, AdAnalysisSourceStatusOut] | Sequence[AdAnalysisSourceStatusOut],
+    ) -> AdAnalysisSourceLineageOut:
+        by_id: Dict[str, AdAnalysisSourceStatusOut] = {}
+        if isinstance(source_statuses, dict):
+            by_id = {
+                str(key): value
+                for key, value in source_statuses.items()
+                if isinstance(value, AdAnalysisSourceStatusOut)
+            }
+        else:
+            for source in source_statuses:
+                if isinstance(source, AdAnalysisSourceStatusOut):
+                    by_id[str(source.id)] = source
+
+        return AdAnalysisSourceLineageOut(
+            advert=self._lineage_mode_from_source_status(by_id.get("advert")),
+            finance=self._lineage_mode_from_source_status(by_id.get("finance")),
+            funnel=self._lineage_mode_from_source_status(by_id.get("funnel")),
+        )
 
     def _resolve_diagnosis(
         self,

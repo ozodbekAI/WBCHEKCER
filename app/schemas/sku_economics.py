@@ -5,12 +5,14 @@ from pydantic import BaseModel, Field
 
 
 SourceMode = Literal["ok", "partial", "manual", "manual_required", "error", "empty"]
+SourceLineageMode = Literal["automatic", "manual", "partial", "failed"]
 ItemStatus = Literal["stop", "rescue", "control", "grow", "low_data"]
 DiagnosisKind = Literal["traffic", "card", "economics", "data"]
 PrecisionKind = Literal["exact", "estimated", "manual", "mixed", "unallocated"]
 AlertLevel = Literal["info", "warning", "error", "success"]
 PriorityLevel = Literal["critical", "high", "medium", "low"]
 TrendSignal = Literal["worsening", "improving", "stable", "volatile", "new", "no_history"]
+AdCostConfidence = Literal["high", "medium", "low"]
 
 
 class AdAnalysisSourceStatusOut(BaseModel):
@@ -20,6 +22,12 @@ class AdAnalysisSourceStatusOut(BaseModel):
     detail: Optional[str] = None
     records: int = 0
     automatic: bool = True
+
+
+class AdAnalysisSourceLineageOut(BaseModel):
+    advert: SourceLineageMode = "automatic"
+    finance: SourceLineageMode = "automatic"
+    funnel: SourceLineageMode = "automatic"
 
 
 class AdAnalysisAlertOut(BaseModel):
@@ -66,6 +74,12 @@ class AdAnalysisMetricsOut(BaseModel):
     cost_price: float = 0
     gross_profit_before_ads: float = 0
     ad_cost: float = 0
+    ad_cost_total: float = 0
+    ad_cost_exact: float = 0
+    ad_cost_estimated: float = 0
+    ad_cost_manual: float = 0
+    ad_cost_source_mode: PrecisionKind = "exact"
+    ad_cost_confidence: AdCostConfidence = "high"
     net_profit: float = 0
     profit_per_order: float = 0
     max_cpo: float = 0
@@ -121,6 +135,7 @@ class AdAnalysisItemOut(BaseModel):
     priority_label: str
     precision: PrecisionKind
     precision_label: str
+    source_lineage: AdAnalysisSourceLineageOut = Field(default_factory=AdAnalysisSourceLineageOut)
     trend: AdAnalysisTrendOut = Field(default_factory=AdAnalysisTrendOut)
     issue_summary: AdAnalysisIssueSummaryOut
     metrics: AdAnalysisMetricsOut
@@ -180,6 +195,7 @@ class AdAnalysisOverviewOut(BaseModel):
     main_takeaway: str = ""
     status_counts: Dict[str, int] = Field(default_factory=dict)
     source_statuses: List[AdAnalysisSourceStatusOut] = Field(default_factory=list)
+    source_lineage: AdAnalysisSourceLineageOut = Field(default_factory=AdAnalysisSourceLineageOut)
     alerts: List[AdAnalysisAlertOut] = Field(default_factory=list)
     budget_moves: List[AdAnalysisBudgetMoveOut] = Field(default_factory=list)
     campaigns: List[AdAnalysisCampaignOut] = Field(default_factory=list)
@@ -209,6 +225,22 @@ class AdAnalysisBootstrapStatusOut(BaseModel):
     status: Literal["idle", "pending", "running", "completed", "failed"] = "idle"
     progress: int = 0
     step: str = ""
+    current_stage: Optional[
+        Literal[
+            "queued",
+            "fetching_advert",
+            "fetching_finance",
+            "fetching_funnel",
+            "building_snapshot",
+            "completed_partial",
+            "completed",
+            "failed",
+        ]
+    ] = None
+    stage_progress: int = 0
+    source_statuses: Dict[str, SourceMode] = Field(default_factory=dict)
+    is_partial: bool = False
+    failed_source: Optional[Literal["advert", "finance", "funnel", "snapshot", "unknown"]] = None
     ready: bool = False
     error: Optional[str] = None
     started_at: Optional[datetime] = None

@@ -44,6 +44,7 @@ class PromotionUpdateRequest(BaseModel):
     views_per_photo: int
     cpm: int
     spend_rub: int = 0
+    estimated_spend_rub: Optional[int] = None
     auto_deposit: bool = True
     deposit_rub: Optional[int] = None
     payment_source: Optional[str] = None
@@ -61,14 +62,21 @@ class PromotionPhotoOut(BaseModel):
     clicks: int = 0
     ctr: float = 0.0
     is_winner: bool = False
+    winner_score: Optional[float] = None
+    winner_score_confidence: Optional[float] = None
+    winner_score_conversion_source: Optional[str] = None
+    winner_score_reason: Optional[str] = None
 
 class PromotionCompanyOut(BaseModel):
     id_company: int
     company_id: int
     nm_id: int
+    card_id: Optional[int] = None
     title: str
     status: str
     spend_rub: int
+    estimated_spend_rub: int = 0
+    winner_decision: Optional[str] = None
     views_per_photo: int
     photos_count: int
     winner_photo_order: Optional[int] = None

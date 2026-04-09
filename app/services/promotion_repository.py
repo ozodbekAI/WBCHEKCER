@@ -303,6 +303,20 @@ class PromotionRepository:
 
         self.db.add(company)
         self.db.commit()
+
+    def finish_without_winner(self, company: PromotionCompany, *, reason: str | None = None) -> None:
+        company.status = PromotionStatus.FINISHED
+        company.winner_photo_order = None
+        company.finished_at = utc_now()
+        company.error_message = (str(reason or "").strip() or None)
+
+        photos = self.db.query(PromotionPhoto).filter(PromotionPhoto.company_id == company.id).all()
+        for p in photos:
+            p.is_winner = False
+            self.db.add(p)
+
+        self.db.add(company)
+        self.db.commit()
     
     def mark_pending_start(self, company: PromotionCompany, *, error: str, delay_sec: int = 30) -> None:
         company.status = PromotionStatus.CREATED
