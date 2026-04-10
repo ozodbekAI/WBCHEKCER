@@ -195,3 +195,39 @@ class SkuEconomicsDailyMetric(Base):
             "metric_date",
         ),
     )
+
+
+class AdAnalysisBootstrapJob(Base):
+    __tablename__ = "ad_analysis_bootstrap_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    store_id = Column(Integer, ForeignKey("stores.id", ondelete="CASCADE"), nullable=False)
+    requested_by_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    status = Column(String(32), nullable=False, default="pending")
+    current_stage = Column(String(64), nullable=True)
+    stage_progress = Column(Integer, nullable=False, default=0)
+    step = Column(String(1000), nullable=True)
+
+    days = Column(Integer, nullable=False, default=14)
+    preset = Column(String(32), nullable=False, default="14d")
+    period_start = Column(Date, nullable=True)
+    period_end = Column(Date, nullable=True)
+
+    source_statuses = Column(JSON, nullable=False, default=list)
+    is_partial = Column(Boolean, nullable=False, default=False)
+    failed_source = Column(String(64), nullable=True)
+    result = Column(JSON, nullable=True)
+    error_message = Column(String(1000), nullable=True)
+
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    heartbeat_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (
+        Index("idx_ad_analysis_bootstrap_jobs_store_id", "store_id"),
+        Index("idx_ad_analysis_bootstrap_jobs_status", "status"),
+        Index("idx_ad_analysis_bootstrap_jobs_created_at", "created_at"),
+    )

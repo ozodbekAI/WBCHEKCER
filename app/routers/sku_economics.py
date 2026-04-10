@@ -1,34 +1,43 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import date, timedelta
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from fastapi.encoders import jsonable_encoder
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.database import AsyncSessionLocal, get_db
-from app.core.time import utc_now
+from app.core.database import get_db
 from app.core.security import get_current_user
-from app.models import AnalysisTask, Store, User
+from app.models import AdAnalysisBootstrapJob, Store, User
 from app.schemas.sku_economics import (
     AdAnalysisBootstrapStatusOut,
     AdAnalysisOverviewOut,
+    AdAnalysisSourceStatusOut,
     AdAnalysisUploadResultOut,
+)
+from app.services.ad_analysis_bootstrap_scheduler import (
+    BOOTSTRAP_STATUS_COMPLETED,
+    BOOTSTRAP_STATUS_COMPLETED_PARTIAL,
 )
 from app.services.sku_economics_service import sku_economics_service
 from app.services.wb_token_access import ensure_store_feature_access
 
 
 router = APIRouter(prefix="/stores/{store_id}/ad-analysis", tags=["Ad Analysis"])
-AD_ANALYSIS_BOOTSTRAP_TASK_TYPE = "ad_analysis_bootstrap"
 AD_ANALYSIS_BOOTSTRAP_DAYS = 14
 AD_ANALYSIS_BOOTSTRAP_PRESET = "14d"
-AD_ANALYSIS_BOOTSTRAP_STALE_AFTER = timedelta(minutes=20)
-AD_ANALYSIS_BOOTSTRAP_TIMEOUT_SEC = 900
-BOOTSTRAP_SOURCE_MODES = {"ok", "partial", "manual", "manual_required", "error", "empty"}
+BOOTSTRAP_SOURCE_MODES = {
+    "automatic",
+    "manual",
+    "partial",
+    "manual_required",
+    "failed",
+    "pending",
+    "running",
+    "missing",
+}
 BOOTSTRAP_FAILED_SOURCES = {"advert", "finance", "funnel", "snapshot", "unknown"}
 
 
@@ -68,39 +77,72 @@ def _validate_period(period_start: date, period_end: date) -> None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="period_end must be greater than or equal to period_start")
 
 
-def _bootstrap_progress(task: AnalysisTask | None) -> int:
-    if task is None:
-        return 0
-    if str(task.status) == "completed":
-        return 100
-    total_items = max(int(task.total_items or 0), 0)
-    processed_items = max(int(task.processed_items or 0), 0)
-    if total_items <= 0:
-        return 5 if str(task.status) in {"pending", "running"} else 0
-    if processed_items >= total_items:
-        return 99 if str(task.status) == "running" else 100
-    return max(5, min(int(processed_items / total_items * 100), 95))
+def _default_bootstrap_source_statuses() -> list[dict[str, Any]]:
+    return [
+        AdAnalysisSourceStatusOut(id="advert", label="Реклама WB", mode="pending", detail=None, records=0).model_dump(mode="json"),
+        AdAnalysisSourceStatusOut(id="finance", label="Финансы WB", mode="pending", detail=None, records=0).model_dump(mode="json"),
+        AdAnalysisSourceStatusOut(id="funnel", label="Воронка продаж", mode="pending", detail=None, records=0).model_dump(mode="json"),
+    ]
 
 
-def _failed_source_from_stage(stage: str | None) -> str:
-    normalized = str(stage or "").strip()
-    if normalized == "fetching_advert":
-        return "advert"
-    if normalized == "fetching_finance":
-        return "finance"
-    if normalized == "fetching_funnel":
-        return "funnel"
-    if normalized == "building_snapshot":
-        return "snapshot"
-    return "unknown"
+def _parse_source_statuses(raw: object) -> list[AdAnalysisSourceStatusOut]:
+    if isinstance(raw, list):
+        out: list[AdAnalysisSourceStatusOut] = []
+        for item in raw:
+            if isinstance(item, dict):
+                try:
+                    out.append(AdAnalysisSourceStatusOut.model_validate(item))
+                except Exception:
+                    continue
+        return out
+
+    if isinstance(raw, dict):
+        out: list[AdAnalysisSourceStatusOut] = []
+        for source_id, mode in raw.items():
+            source_key = str(source_id or "").strip()
+            if not source_key:
+                continue
+            mode_value = str(mode or "").strip()
+            out.append(
+                AdAnalysisSourceStatusOut(
+                    id=source_key,
+                    label=source_key,
+                    mode=mode_value if mode_value in BOOTSTRAP_SOURCE_MODES else "missing",
+                    detail=None,
+                    records=0,
+                )
+            )
+        return out
+
+    return []
 
 
-def _serialize_bootstrap_task(task: AnalysisTask | None, *, store_id: int) -> AdAnalysisBootstrapStatusOut:
-    payload = task.result if isinstance(getattr(task, "result", None), dict) else {}
-    status_value = str(getattr(task, "status", "idle") or "idle")
-    if status_value not in {"idle", "pending", "running", "completed", "failed"}:
+def _serialize_bootstrap_job(job: AdAnalysisBootstrapJob | None, *, store_id: int) -> AdAnalysisBootstrapStatusOut:
+    if job is None:
+        return AdAnalysisBootstrapStatusOut(
+            task_id=None,
+            store_id=int(store_id),
+            status="idle",
+            progress=0,
+            step="Подготовка анализа рекламы еще не запускалась",
+            current_stage=None,
+            stage_progress=0,
+            source_statuses=[],
+            is_partial=False,
+            failed_source=None,
+            ready=False,
+            error=None,
+            started_at=None,
+            completed_at=None,
+            period_start=None,
+            period_end=None,
+        )
+
+    status_value = str(job.status or "idle").strip().lower()
+    if status_value not in {"idle", "pending", "running", "completed", "completed_partial", "failed"}:
         status_value = "idle"
-    current_stage = str(payload.get("current_stage") or "").strip() or None
+
+    current_stage = str(job.current_stage or "").strip() or None
     if current_stage not in {
         "queued",
         "fetching_advert",
@@ -112,293 +154,92 @@ def _serialize_bootstrap_task(task: AnalysisTask | None, *, store_id: int) -> Ad
         "failed",
     }:
         current_stage = None
-    source_statuses_raw = payload.get("source_statuses")
-    source_statuses: dict[str, str] = {}
-    if isinstance(source_statuses_raw, dict):
-        for source_id, mode in source_statuses_raw.items():
-            source_key = str(source_id or "").strip()
-            mode_value = str(mode or "").strip()
-            if source_key and mode_value in BOOTSTRAP_SOURCE_MODES:
-                source_statuses[source_key] = mode_value
-    stage_progress = int(payload.get("stage_progress") or 0)
-    if stage_progress <= 0:
-        stage_progress = _bootstrap_progress(task)
-    stage_progress = max(0, min(stage_progress, 100))
-    is_partial = bool(payload.get("is_partial"))
-    failed_source = str(payload.get("failed_source") or "").strip() or None
-    if failed_source not in BOOTSTRAP_FAILED_SOURCES:
-        failed_source = None
-    step = str(payload.get("step") or "").strip()
+
+    source_statuses = _parse_source_statuses(job.source_statuses)
+    stage_progress = max(0, min(int(job.stage_progress or 0), 100))
+    step = str(job.step or "").strip()
     if not step:
-        if status_value == "completed":
-            step = "Данные для анализа рекламы готовы" if not is_partial else "Данные собраны частично, можно работать и дозагрузить вручную."
+        if status_value in {"completed", "completed_partial"}:
+            step = "Данные для анализа рекламы готовы."
         elif status_value == "failed":
-            step = "Не удалось подготовить анализ рекламы"
+            step = "Не удалось подготовить анализ рекламы."
         elif status_value in {"pending", "running"}:
             step = "Собираем рекламу, финансы и воронку из Wildberries..."
         else:
             step = "Подготовка анализа рекламы еще не запускалась"
+
+    failed_source = str(job.failed_source or "").strip() or None
+    if failed_source not in BOOTSTRAP_FAILED_SOURCES:
+        failed_source = None
+
+    ready = status_value in {BOOTSTRAP_STATUS_COMPLETED, BOOTSTRAP_STATUS_COMPLETED_PARTIAL}
     return AdAnalysisBootstrapStatusOut(
-        task_id=getattr(task, "id", None),
+        task_id=int(job.id),
         store_id=int(store_id),
         status=status_value,
-        progress=_bootstrap_progress(task),
+        progress=stage_progress,
         step=step,
         current_stage=current_stage,
         stage_progress=stage_progress,
         source_statuses=source_statuses,
-        is_partial=is_partial,
+        is_partial=bool(job.is_partial or status_value == BOOTSTRAP_STATUS_COMPLETED_PARTIAL),
         failed_source=failed_source,
-        ready=status_value == "completed",
-        error=getattr(task, "error_message", None) or payload.get("error"),
-        started_at=getattr(task, "started_at", None),
-        completed_at=getattr(task, "completed_at", None),
-        period_start=payload.get("period_start"),
-        period_end=payload.get("period_end"),
+        ready=ready,
+        error=str(job.error_message or "").strip() or None,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        period_start=job.period_start,
+        period_end=job.period_end,
     )
 
 
-def _is_bootstrap_task_stale(task: AnalysisTask | None) -> bool:
-    if task is None:
-        return False
-    status_value = str(getattr(task, "status", "") or "")
-    if status_value not in {"pending", "running"}:
-        return False
-    reference_at = getattr(task, "started_at", None) or getattr(task, "created_at", None)
-    if reference_at is None:
-        return False
-    return (utc_now() - reference_at) > AD_ANALYSIS_BOOTSTRAP_STALE_AFTER
-
-
-async def _get_latest_bootstrap_task(db: AsyncSession, store_id: int) -> AnalysisTask | None:
+async def _get_latest_bootstrap_job(db: AsyncSession, store_id: int) -> AdAnalysisBootstrapJob | None:
     result = await db.execute(
-        select(AnalysisTask)
-        .where(
-            AnalysisTask.store_id == int(store_id),
-            AnalysisTask.task_type == AD_ANALYSIS_BOOTSTRAP_TASK_TYPE,
-        )
-        .order_by(AnalysisTask.created_at.desc(), AnalysisTask.id.desc())
+        select(AdAnalysisBootstrapJob)
+        .where(AdAnalysisBootstrapJob.store_id == int(store_id))
+        .order_by(AdAnalysisBootstrapJob.created_at.desc(), AdAnalysisBootstrapJob.id.desc())
         .limit(1)
     )
     return result.scalar_one_or_none()
 
 
-async def _run_ad_analysis_bootstrap(task_id: int, store_id: int) -> None:
-    async with AsyncSessionLocal() as db:
-        task = await db.get(AnalysisTask, int(task_id))
-        if task is None:
-            return
-        current_stage = "queued"
-        source_statuses: dict[str, str] = {}
-
-        try:
-            task.status = "running"
-            task.started_at = utc_now()
-            task.completed_at = None
-            task.total_items = 3
-            task.processed_items = 1
-            task.error_message = None
-            task.result = jsonable_encoder({
-                "step": "Сохраняем базовые слои рекламы, финансов и воронки из Wildberries...",
-                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
-                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
-                "current_stage": "queued",
-                "stage_progress": 5,
-                "source_statuses": source_statuses,
-                "is_partial": False,
-                "failed_source": None,
-            })
-            await db.commit()
-
-            store_result = await db.execute(
-                select(Store)
-                .where(Store.id == int(store_id))
-                .options(selectinload(Store.feature_api_keys))
-            )
-            store = store_result.scalar_one_or_none()
-            if store is None:
-                raise ValueError("Store not found")
-
-            ensure_store_feature_access(store, "ad_analysis")
-
-            current_stage = "fetching_advert"
-            task.result = jsonable_encoder({
-                "step": "Загружаем рекламные кампании и расход из WB Advert...",
-                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
-                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
-                "current_stage": current_stage,
-                "stage_progress": 20,
-                "source_statuses": source_statuses,
-                "is_partial": False,
-                "failed_source": None,
-            })
-            await db.commit()
-
-            current_stage = "fetching_finance"
-            task.result = jsonable_encoder({
-                "step": "Загружаем финансовый слой из WB Statistics...",
-                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
-                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
-                "current_stage": current_stage,
-                "stage_progress": 35,
-                "source_statuses": source_statuses,
-                "is_partial": False,
-                "failed_source": None,
-            })
-            await db.commit()
-
-            current_stage = "fetching_funnel"
-            task.result = jsonable_encoder({
-                "step": "Загружаем воронку продаж из WB Analytics...",
-                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
-                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
-                "current_stage": current_stage,
-                "stage_progress": 45,
-                "source_statuses": source_statuses,
-                "is_partial": False,
-                "failed_source": None,
-            })
-            await db.commit()
-
-            task.processed_items = 2
-            current_stage = "building_snapshot"
-            task.result = jsonable_encoder({
-                "step": "Загружаем источники WB и строим витрину анализа...",
-                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
-                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
-                "current_stage": current_stage,
-                "stage_progress": 60,
-                "source_statuses": source_statuses,
-                "is_partial": False,
-                "failed_source": None,
-            })
-            await db.commit()
-
-            overview = await asyncio.wait_for(
-                sku_economics_service.build_overview(
-                    db,
-                    store,
-                    days=AD_ANALYSIS_BOOTSTRAP_DAYS,
-                    preset=AD_ANALYSIS_BOOTSTRAP_PRESET,
-                    force=True,
-                ),
-                timeout=AD_ANALYSIS_BOOTSTRAP_TIMEOUT_SEC,
-            )
-
-            source_statuses = {str(src.id): str(src.mode) for src in (overview.source_statuses or [])}
-            finance_failed = source_statuses.get("finance") in {"manual_required", "error"}
-            advert_or_funnel_ready = any(
-                source_statuses.get(source_id) in {"ok", "partial", "manual"}
-                for source_id in ("advert", "funnel")
-            )
-            force_partial = finance_failed and advert_or_funnel_ready
-            is_partial = any(
-                mode in {"partial", "manual_required", "error"}
-                for mode in source_statuses.values()
-            ) or force_partial
-            current_stage = "completed_partial" if is_partial else "completed"
-            completion_step = (
-                "Финансы WB недоступны: анализ собран частично по рекламе и воронке, можно дозагрузить финансы вручную."
-                if force_partial
-                else "Данные собраны частично: можно работать и дозагрузить недостающие источники вручную."
-                if is_partial
-                else "Данные для анализа рекламы готовы"
-            )
-
-            task.status = "completed"
-            task.processed_items = task.total_items
-            task.completed_at = utc_now()
-            task.result = jsonable_encoder({
-                "step": completion_step,
-                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
-                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
-                "period_start": overview.period_start,
-                "period_end": overview.period_end,
-                "snapshot_ready": overview.snapshot_ready,
-                "available_period_start": overview.available_period_start,
-                "available_period_end": overview.available_period_end,
-                "current_stage": current_stage,
-                "stage_progress": 100,
-                "source_statuses": source_statuses,
-                "is_partial": is_partial,
-                "failed_source": None,
-            })
-            await db.commit()
-        except Exception as exc:
-            await db.rollback()
-            failed_source = _failed_source_from_stage(current_stage)
-            if failed_source in {"advert", "finance", "funnel"}:
-                source_statuses[failed_source] = "error"
-            task.status = "failed"
-            task.completed_at = utc_now()
-            task.error_message = str(exc)
-            task.result = jsonable_encoder({
-                "step": "Не удалось подготовить анализ рекламы",
-                "error": str(exc),
-                "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
-                "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
-                "current_stage": "failed",
-                "stage_progress": 100,
-                "source_statuses": source_statuses,
-                "is_partial": False,
-                "failed_source": failed_source,
-            })
-            await db.commit()
-
-
-async def _start_or_get_bootstrap_task(
+async def _start_or_get_bootstrap_job(
     db: AsyncSession,
     store: Store,
     *,
+    started_by_id: int | None,
     force: bool = False,
-) -> AnalysisTask:
-    latest_task = await _get_latest_bootstrap_task(db, int(store.id))
-    if latest_task is not None and not force:
-        latest_status = str(latest_task.status or "")
-        if latest_status == "completed":
-            return latest_task
-        if latest_status in {"pending", "running"} and not _is_bootstrap_task_stale(latest_task):
-            return latest_task
+) -> AdAnalysisBootstrapJob:
+    latest_job = await _get_latest_bootstrap_job(db, int(store.id))
+    if latest_job is not None and not force:
+        latest_status = str(latest_job.status or "")
+        if latest_status in {"pending", "running", "completed", "completed_partial"}:
+            return latest_job
 
-    if latest_task is not None and _is_bootstrap_task_stale(latest_task):
-        latest_task.status = "failed"
-        latest_task.completed_at = utc_now()
-        latest_task.error_message = "Подготовка анализа рекламы зависла по тайм-ауту и будет перезапущена."
-        latest_task.result = jsonable_encoder({
-            "step": "Подготовка анализа рекламы зависла по тайм-ауту и будет перезапущена.",
-            "error": latest_task.error_message,
-            "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
-            "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
-            "current_stage": "failed",
-            "stage_progress": 100,
-            "source_statuses": {},
-            "is_partial": False,
-            "failed_source": "unknown",
-        })
-        await db.commit()
+    if latest_job is not None and force and str(latest_job.status or "") in {"pending", "running"}:
+        latest_job.status = "failed"
+        latest_job.current_stage = "failed"
+        latest_job.stage_progress = 100
+        latest_job.error_message = "Bootstrap restarted by force"
+        latest_job.step = "Предыдущая задача принудительно остановлена и перезапущена."
 
-    task = AnalysisTask(
+    job = AdAnalysisBootstrapJob(
         store_id=int(store.id),
-        task_type=AD_ANALYSIS_BOOTSTRAP_TASK_TYPE,
+        requested_by_id=started_by_id,
         status="pending",
-        total_items=3,
-        processed_items=0,
-        result=jsonable_encoder({
-            "step": "Ставим подготовку анализа рекламы в очередь...",
-            "preset": AD_ANALYSIS_BOOTSTRAP_PRESET,
-            "days": AD_ANALYSIS_BOOTSTRAP_DAYS,
-            "current_stage": "queued",
-            "stage_progress": 0,
-            "source_statuses": {},
-            "is_partial": False,
-            "failed_source": None,
-        }),
+        current_stage="queued",
+        stage_progress=0,
+        step="Ставим подготовку анализа рекламы в очередь...",
+        days=AD_ANALYSIS_BOOTSTRAP_DAYS,
+        preset=AD_ANALYSIS_BOOTSTRAP_PRESET,
+        source_statuses=_default_bootstrap_source_statuses(),
+        is_partial=False,
+        failed_source=None,
     )
-    db.add(task)
+    db.add(job)
     await db.commit()
-    await db.refresh(task)
-    asyncio.create_task(_run_ad_analysis_bootstrap(int(task.id), int(store.id)))
-    return task
+    await db.refresh(job)
+    return job
 
 
 @router.get("/overview", response_model=AdAnalysisOverviewOut)
@@ -448,8 +289,13 @@ async def start_ad_analysis_bootstrap(
 ):
     store = await _get_accessible_store(store_id, db, current_user)
     ensure_store_feature_access(store, "ad_analysis")
-    task = await _start_or_get_bootstrap_task(db, store, force=force)
-    return _serialize_bootstrap_task(task, store_id=store.id)
+    job = await _start_or_get_bootstrap_job(
+        db,
+        store,
+        started_by_id=int(getattr(current_user, "id", 0) or 0) or None,
+        force=force,
+    )
+    return _serialize_bootstrap_job(job, store_id=store.id)
 
 
 @router.get("/bootstrap/status", response_model=AdAnalysisBootstrapStatusOut)
@@ -460,8 +306,8 @@ async def get_ad_analysis_bootstrap_status(
 ):
     store = await _get_accessible_store(store_id, db, current_user)
     ensure_store_feature_access(store, "ad_analysis")
-    task = await _get_latest_bootstrap_task(db, int(store.id))
-    return _serialize_bootstrap_task(task, store_id=store.id)
+    job = await _get_latest_bootstrap_job(db, int(store.id))
+    return _serialize_bootstrap_job(job, store_id=store.id)
 
 
 @router.post("/costs/upload", response_model=AdAnalysisUploadResultOut)

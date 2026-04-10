@@ -11,6 +11,7 @@ from .core.config import settings
 from .core.database import async_engine
 from .models import StoreApiKey
 from .services.card_scheduler import card_scheduler
+from .services.ad_analysis_bootstrap_scheduler import ad_analysis_bootstrap_scheduler
 from .services.task_service import recover_incomplete_tasks
 from .routers import (
     auth_router,
@@ -39,27 +40,28 @@ DEV_CORS_ORIGINS = [
 
 
 def _get_cors_origins() -> list[str]:
-    configured = [origin for origin in settings.CORS_ALLOWED_ORIGINS if origin]
-    if configured:
-        return configured
-    if settings.DEBUG:
-        return DEV_CORS_ORIGINS
-    return []
+    # Temporary non-production mode: allow all origins.
+    return ["*"]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background schedulers on startup, stop on shutdown."""
     scheduler_started = False
+    ad_analysis_scheduler_started = False
     async with async_engine.begin() as conn:
         await conn.run_sync(StoreApiKey.__table__.create, checkfirst=True)
     await recover_incomplete_tasks()
     if settings.CARD_SCHEDULER_ENABLED:
         card_scheduler.start_background()
         scheduler_started = True
+    ad_analysis_bootstrap_scheduler.start_background()
+    ad_analysis_scheduler_started = True
     yield
     if scheduler_started:
         card_scheduler.stop()
+    if ad_analysis_scheduler_started:
+        ad_analysis_bootstrap_scheduler.stop()
 
 
 app = FastAPI(
@@ -75,7 +77,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_get_cors_origins(),
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

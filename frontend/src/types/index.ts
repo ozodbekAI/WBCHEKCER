@@ -528,7 +528,15 @@ export interface TeamWorklog {
 }
 
 // ==================== Ad Analysis / SKU Economics ====================
-export type AdAnalysisSourceMode = 'ok' | 'partial' | 'manual' | 'manual_required' | 'error' | 'empty';
+export type AdAnalysisSourceMode =
+  | 'automatic'
+  | 'manual'
+  | 'partial'
+  | 'manual_required'
+  | 'failed'
+  | 'pending'
+  | 'running'
+  | 'missing';
 export type AdAnalysisItemStatus = 'stop' | 'rescue' | 'control' | 'grow' | 'low_data';
 export type AdAnalysisDiagnosis = 'traffic' | 'card' | 'economics' | 'data';
 export type AdAnalysisPrecision = 'exact' | 'estimated' | 'manual' | 'mixed' | 'unallocated';
@@ -542,6 +550,19 @@ export interface AdAnalysisSourceStatus {
   detail: string | null;
   records: number;
   automatic: boolean;
+  synced_at?: string | null;
+  coverage_ratio?: number;
+  coverage_start?: string | null;
+  coverage_end?: string | null;
+  expected_start?: string | null;
+  expected_end?: string | null;
+  blocked?: boolean;
+}
+
+export interface AdAnalysisSourceLineage {
+  advert: 'automatic' | 'manual' | 'partial' | 'failed';
+  finance: 'automatic' | 'manual' | 'partial' | 'failed';
+  funnel: 'automatic' | 'manual' | 'partial' | 'failed';
 }
 
 export interface AdAnalysisAlert {
@@ -584,10 +605,17 @@ export interface AdAnalysisIssueSummary {
 
 export interface AdAnalysisMetrics {
   revenue: number;
+  revenue_net: number;
   wb_costs: number;
   cost_price: number;
   gross_profit_before_ads: number;
   ad_cost: number;
+  ad_cost_total: number;
+  ad_cost_exact: number;
+  ad_cost_estimated: number;
+  ad_cost_manual: number;
+  ad_cost_source_mode: AdAnalysisPrecision;
+  ad_cost_confidence: 'high' | 'medium' | 'low';
   net_profit: number;
   profit_per_order: number;
   max_cpo: number;
@@ -607,6 +635,10 @@ export interface AdAnalysisMetrics {
   cart_to_order_percent: number;
   cpc: number;
   drr: number;
+  funnel_orders: number;
+  advert_attributed_orders: number;
+  finance_realized_orders: number;
+  payout_realized: number;
 }
 
 export interface AdAnalysisTrend {
@@ -643,6 +675,11 @@ export interface AdAnalysisItem {
   priority_label: string;
   precision: AdAnalysisPrecision;
   precision_label: string;
+  revenue_lineage: 'finance' | 'manual_finance' | 'funnel' | 'advert' | 'missing';
+  orders_lineage: 'finance' | 'manual_finance' | 'funnel' | 'advert' | 'missing';
+  decision_ready: boolean;
+  decision_label: 'ready' | 'preliminary' | 'blocked';
+  source_lineage: AdAnalysisSourceLineage;
   trend: AdAnalysisTrend;
   issue_summary: AdAnalysisIssueSummary;
   metrics: AdAnalysisMetrics;
@@ -650,6 +687,14 @@ export interface AdAnalysisItem {
   insights: string[];
   steps: string[];
   risk_flags: string[];
+}
+
+export interface AdAnalysisDataQuality {
+  decision_ready: boolean;
+  confidence: 'high' | 'medium' | 'low';
+  partial_sources: string[];
+  blocked_sources: string[];
+  notes: string[];
 }
 
 export interface AdAnalysisUploadNeeds {
@@ -695,6 +740,8 @@ export interface AdAnalysisOverview {
   main_takeaway: string;
   status_counts: Record<string, number>;
   source_statuses: AdAnalysisSourceStatus[];
+  source_lineage: AdAnalysisSourceLineage;
+  data_quality: AdAnalysisDataQuality;
   alerts: AdAnalysisAlert[];
   budget_moves: AdAnalysisBudgetMove[];
   campaigns: AdAnalysisCampaign[];
@@ -707,9 +754,23 @@ export interface AdAnalysisOverview {
 export interface AdAnalysisBootstrapStatus {
   task_id: number | null;
   store_id: number;
-  status: 'idle' | 'pending' | 'running' | 'completed' | 'failed';
+  status: 'idle' | 'pending' | 'running' | 'completed' | 'completed_partial' | 'failed';
   progress: number;
   step: string;
+  current_stage:
+    | 'queued'
+    | 'fetching_advert'
+    | 'fetching_finance'
+    | 'fetching_funnel'
+    | 'building_snapshot'
+    | 'completed_partial'
+    | 'completed'
+    | 'failed'
+    | null;
+  stage_progress: number;
+  source_statuses: AdAnalysisSourceStatus[];
+  is_partial: boolean;
+  failed_source: 'advert' | 'finance' | 'funnel' | 'snapshot' | 'unknown' | null;
   ready: boolean;
   error: string | null;
   started_at: string | null;

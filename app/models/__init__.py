@@ -28,6 +28,7 @@ from .workflow import (
     TicketStatus,
 )
 from .sku_economics import (
+    AdAnalysisBootstrapJob,
     SkuEconomicsCost,
     SkuEconomicsManualSpend,
     SkuEconomicsManualFinance,
@@ -93,4 +94,5 @@ __all__ = [
     "SkuEconomicsSnapshot",
     "SkuEconomicsOverviewCache",
     "SkuEconomicsDailyMetric",
+    "AdAnalysisBootstrapJob",
 ]

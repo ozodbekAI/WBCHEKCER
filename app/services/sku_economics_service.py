@@ -38,6 +38,7 @@ from app.schemas.sku_economics import (
     AdAnalysisAlertOut,
     AdAnalysisBudgetMoveOut,
     AdAnalysisCampaignOut,
+    AdAnalysisDataQualityOut,
     AdAnalysisIssueSummaryOut,
     AdAnalysisItemOut,
     AdAnalysisMetricsOut,
@@ -341,6 +342,7 @@ class _FinanceFetchError(Exception):
 class SkuEconomicsService:
     CACHE_TTL_SEC = 300
     HISTORY_LOOKBACK_DAYS = 365
+    DEFAULT_PAGE_SIZE = 25
     MAX_PAGE_SIZE = 100
     FINANCE_PAGE_LIMIT = 100000
     FINANCE_MAX_PAGES_PER_RANGE = 500
@@ -648,7 +650,7 @@ class SkuEconomicsService:
         period_end: Optional[date] = None,
         preset: Optional[str] = None,
         page: int = 1,
-        page_size: int = 50,
+        page_size: int = DEFAULT_PAGE_SIZE,
         status_filter: Optional[str] = None,
         search: Optional[str] = None,
         force: bool = False,
@@ -706,7 +708,14 @@ class SkuEconomicsService:
             effective_start, effective_end = available_start, available_end
             selected_preset = "all"
 
-        should_use_saved_overview = not force and not status_filter and not search and int(page or 1) <= 1
+        normalized_page_size = max(1, min(int(page_size or self.DEFAULT_PAGE_SIZE), self.MAX_PAGE_SIZE))
+        should_use_saved_overview = (
+            not force
+            and not status_filter
+            and not search
+            and int(page or 1) <= 1
+            and normalized_page_size == self.DEFAULT_PAGE_SIZE
+        )
         if should_use_saved_overview:
             saved_overview = await self._load_persisted_overview(
                 db,
@@ -714,7 +723,7 @@ class SkuEconomicsService:
                 effective_start,
                 effective_end,
             )
-            if saved_overview is not None:
+            if saved_overview is not None and int(saved_overview.page_size or self.DEFAULT_PAGE_SIZE) == self.DEFAULT_PAGE_SIZE:
                 saved_overview.available_period_start = available_start
                 saved_overview.available_period_end = available_end
                 saved_overview.selected_preset = selected_preset
@@ -868,9 +877,9 @@ class SkuEconomicsService:
             funnel_task,
         )
 
-        advert_refresh_ok = advert_status.mode != "error"
-        finance_refresh_ok = finance_status.mode not in {"error", "manual_required"}
-        funnel_refresh_ok = funnel_status.mode != "error"
+        advert_refresh_ok = advert_status.mode != "failed"
+        finance_refresh_ok = finance_status.mode not in {"failed", "manual_required"}
+        funnel_refresh_ok = funnel_status.mode != "failed"
 
         if not advert_refresh_ok and not finance_refresh_ok and not funnel_refresh_ok:
             return
@@ -1174,7 +1183,7 @@ class SkuEconomicsService:
                         AdAnalysisSourceStatusOut(
                             id="advert",
                             label="Реклама WB",
-                            mode="empty",
+                            mode="missing",
                             detail="Кампании за выбранный период не найдены",
                             records=0,
                             automatic=True,
@@ -1196,7 +1205,7 @@ class SkuEconomicsService:
                     chunk_start = chunk_end + timedelta(days=1)
 
                 parsed = self._parse_fullstats_daily(raw_items, fallback_end=period_end)
-                mode = "partial" if parsed["unallocated_spend"] > 0.01 else "ok"
+                mode = "partial" if parsed["unallocated_spend"] > 0.01 else "automatic"
                 return (
                     parsed["rows"],
                     AdAnalysisSourceStatusOut(
@@ -1220,7 +1229,7 @@ class SkuEconomicsService:
             AdAnalysisSourceStatusOut(
                 id="advert",
                 label="Реклама WB",
-                mode="error",
+                mode="failed",
                 detail=last_error,
                 records=0,
                 automatic=True,
@@ -1420,7 +1429,7 @@ class SkuEconomicsService:
                     AdAnalysisSourceStatusOut(
                         id="finance",
                         label="Финансы WB",
-                        mode="partial" if partial_reason else ("ok" if total_rows > 0 else "empty"),
+                        mode="partial" if partial_reason else ("automatic" if total_rows > 0 else "missing"),
                         detail=(
                             f"История финансового слоя сохранена частично: {partial_reason}"
                             if partial_reason
@@ -1462,7 +1471,7 @@ class SkuEconomicsService:
                 AdAnalysisSourceStatusOut(
                     id="funnel",
                     label="Воронка продаж",
-                    mode="empty",
+                    mode="missing",
                     detail="Нет карточек для запроса воронки.",
                     records=0,
                     automatic=True,
@@ -1553,7 +1562,7 @@ class SkuEconomicsService:
                     AdAnalysisSourceStatusOut(
                         id="funnel",
                         label="Воронка продаж",
-                        mode="ok" if history_rows > 0 else "empty",
+                        mode="automatic" if history_rows > 0 else "missing",
                         detail=(
                             f"История воронки из WB Analytics сохранена за {effective_start.isoformat()} — {effective_end.isoformat()}."
                             if history_rows > 0
@@ -1571,7 +1580,7 @@ class SkuEconomicsService:
             AdAnalysisSourceStatusOut(
                 id="funnel",
                 label="Воронка продаж",
-                mode="error",
+                mode="failed",
                 detail=last_error,
                 records=0,
                 automatic=True,
@@ -1699,7 +1708,7 @@ class SkuEconomicsService:
             signed_revenue = float(finance.revenue or 0.0)
             signed_payout = float(finance.payout or 0.0)
             finance.wb_costs = round(max(float(finance.wb_costs or 0.0), 0.0) + max(signed_revenue - signed_payout, 0.0), 2)
-            finance.revenue = round(max(signed_revenue, 0.0), 2)
+            finance.revenue = round(float(signed_revenue), 2)
             finance.payout = round(signed_payout, 2)
             finance.orders = max(int(finance.orders or 0), 0)
 
@@ -1788,6 +1797,23 @@ class SkuEconomicsService:
             metric.orders += int(round(float(row.orders or 0) * ratio))
         return out
 
+    def _collect_candidate_nm_ids(
+        self,
+        aggregate: Dict[str, Any],
+        *,
+        spend_topups: Optional[Dict[int, _AdvertMetrics]] = None,
+        finance_topups: Optional[Dict[int, _FinanceMetrics]] = None,
+    ) -> List[int]:
+        candidate_ids: set[int] = set()
+        per_nm = aggregate.get("per_nm")
+        if isinstance(per_nm, dict):
+            candidate_ids.update(int(nm_id) for nm_id in per_nm.keys() if int(nm_id or 0) > 0)
+        if spend_topups:
+            candidate_ids.update(int(nm_id) for nm_id in spend_topups.keys() if int(nm_id or 0) > 0)
+        if finance_topups:
+            candidate_ids.update(int(nm_id) for nm_id in finance_topups.keys() if int(nm_id or 0) > 0)
+        return sorted(candidate_ids)
+
     async def _build_overview_from_history(
         self,
         db: AsyncSession,
@@ -1808,22 +1834,44 @@ class SkuEconomicsService:
         available_period_end: Optional[date],
     ) -> AdAnalysisOverviewOut:
         safe_page = max(int(page or 1), 1)
-        safe_page_size = max(1, min(int(page_size or 50), self.MAX_PAGE_SIZE))
+        safe_page_size = max(1, min(int(page_size or self.DEFAULT_PAGE_SIZE), self.MAX_PAGE_SIZE))
 
         manual_costs = await self._load_costs(db, store.id)
         manual_spend = await self._load_manual_spend_overlap(db, store.id, period_start, period_end)
         manual_finance = await self._load_manual_finance_overlap(db, store.id, period_start, period_end)
         previous_manual_spend = await self._load_manual_spend_overlap(db, store.id, previous_period_start, previous_period_end)
         previous_manual_finance = await self._load_manual_finance_overlap(db, store.id, previous_period_start, previous_period_end)
-        funnel_coverage = await self._get_source_coverage(db, store.id, "funnel")
-
-        current_nm_ids = sorted(
-            set(current_data.get("advert_nm_ids", []))
-            | set(manual_spend.keys())
+        advert_coverage = await self._get_source_coverage(
+            db,
+            store.id,
+            "advert",
+            period_start=period_start,
+            period_end=period_end,
         )
-        previous_nm_ids = sorted(
-            set(previous_data.get("advert_nm_ids", []))
-            | set(previous_manual_spend.keys())
+        finance_coverage = await self._get_source_coverage(
+            db,
+            store.id,
+            "finance",
+            period_start=period_start,
+            period_end=period_end,
+        )
+        funnel_coverage = await self._get_source_coverage(
+            db,
+            store.id,
+            "funnel",
+            period_start=period_start,
+            period_end=period_end,
+        )
+
+        current_nm_ids = self._collect_candidate_nm_ids(
+            current_data,
+            spend_topups=manual_spend,
+            finance_topups=manual_finance,
+        )
+        previous_nm_ids = self._collect_candidate_nm_ids(
+            previous_data,
+            spend_topups=previous_manual_spend,
+            finance_topups=previous_manual_finance,
         )
 
         cards_map, issue_map = await self._load_cards_and_issues(db, store.id, current_nm_ids)
@@ -1835,7 +1883,11 @@ class SkuEconomicsService:
             *,
             include_cards: bool,
         ) -> Tuple[List[AdAnalysisItemOut], List[int]]:
-            nm_ids = sorted(set(aggregate.get("advert_nm_ids", [])) | set(spend_topups.keys()))
+            nm_ids = self._collect_candidate_nm_ids(
+                aggregate,
+                spend_topups=spend_topups,
+                finance_topups=finance_topups,
+            )
             built: List[AdAnalysisItemOut] = []
             missing_cost_nm_ids: List[int] = []
 
@@ -1892,8 +1944,22 @@ class SkuEconomicsService:
                 card = cards_map.get(nm_id) if include_cards else None
                 issues = issue_map.get(card.id if card else -1, []) if include_cards and card else []
                 issue_summary = self._summarize_issues(issues)
-                total_orders = max(finance.orders, funnel_metric.order_count, advert.total_orders)
-                revenue = finance.revenue or funnel_metric.order_sum or advert.total_gmv
+                manual_finance_used = nm_id in finance_topups
+                finance_ready = bool(base.get("has_finance")) or manual_finance_used
+                total_orders, orders_lineage = self._resolve_orders_lineage(
+                    finance=finance,
+                    funnel=funnel_metric,
+                    advert=advert,
+                    finance_preferred=finance_ready,
+                    manual_finance=manual_finance_used,
+                )
+                revenue, revenue_lineage = self._resolve_revenue_lineage(
+                    finance=finance,
+                    funnel=funnel_metric,
+                    advert=advert,
+                    finance_preferred=finance_ready,
+                    manual_finance=manual_finance_used,
+                )
                 wb_costs = finance.wb_costs
                 unit_cost = manual_costs.get(nm_id)
                 missing_cost = unit_cost is None
@@ -1919,8 +1985,58 @@ class SkuEconomicsService:
                 precision, precision_label = self._resolve_precision(advert, aggregate["unallocated_spend"])
                 ad_cost_confidence = self._resolve_ad_cost_confidence(advert, aggregate["unallocated_spend"])
 
+                source_status_stub = {
+                    "advert": AdAnalysisSourceStatusOut(
+                        id="advert",
+                        label="Реклама WB",
+                        mode=(
+                            "partial"
+                            if aggregate["unallocated_spend"] > 0.01 and (bool(base.get("has_advert")) or advert.total_spend > 0.01)
+                            else "automatic"
+                            if bool(base.get("has_advert")) or advert.total_spend > 0.01 or advert.total_views > 0 or advert.total_clicks > 0
+                            else "missing"
+                        ),
+                        detail=None,
+                        records=0,
+                        automatic=True,
+                    ),
+                    "finance": AdAnalysisSourceStatusOut(
+                        id="finance",
+                        label="Финансы WB",
+                        mode=(
+                            "automatic"
+                            if bool(base.get("has_finance"))
+                            else "manual"
+                            if manual_finance_used
+                            else "manual_required"
+                        ),
+                        detail=None,
+                        records=0,
+                        automatic=not manual_finance_used,
+                    ),
+                    "funnel": AdAnalysisSourceStatusOut(
+                        id="funnel",
+                        label="Воронка продаж",
+                        mode="automatic" if bool(base.get("has_funnel")) or funnel_metric.open_count > 0 or funnel_metric.order_count > 0 else "missing",
+                        detail=None,
+                        records=0,
+                        automatic=True,
+                    ),
+                }
+                decision_ready, decision_label = self._resolve_decision_ready(
+                    missing_cost=missing_cost,
+                    finance_ready=finance_ready,
+                    ad_cost_confidence=ad_cost_confidence,
+                    source_statuses=source_status_stub,
+                )
+                if not decision_ready and decision_label == "preliminary":
+                    status_hint_prefix = "Предварительный вывод: "
+                else:
+                    status_hint_prefix = ""
+
                 metrics = AdAnalysisMetricsOut(
                     revenue=round(revenue, 2),
+                    revenue_net=round(revenue, 2),
                     wb_costs=round(wb_costs, 2),
                     cost_price=round(cost_price, 2),
                     gross_profit_before_ads=round(gross_profit_before_ads, 2),
@@ -1950,53 +2066,35 @@ class SkuEconomicsService:
                     cart_to_order_percent=round(funnel_metric.cart_to_order_percent, 2),
                     cpc=round(cpc, 2),
                     drr=round(drr, 2),
+                    funnel_orders=int(funnel_metric.order_count or 0),
+                    advert_attributed_orders=int(advert.total_orders or 0),
+                    finance_realized_orders=int(finance.orders or 0),
+                    payout_realized=round(float(finance.payout or 0.0), 2),
                 )
 
-                finance_ready = aggregate["finance_records"] > 0 or nm_id in finance_topups
                 diagnosis, diagnosis_label, reasons, hints = self._resolve_diagnosis(
                     metrics=metrics,
+                    orders_lineage=orders_lineage,
                     issue_summary=issue_summary,
                     missing_cost=missing_cost,
                     finance_ready=finance_ready,
                 )
                 status, status_label = self._resolve_status(
                     metrics=metrics,
+                    orders_lineage=orders_lineage,
                     diagnosis=diagnosis,
                     missing_cost=missing_cost,
                     finance_ready=finance_ready,
                 )
+                if not decision_ready:
+                    status = "low_data"
+                    status_label = "Предварительно"
                 priority, priority_label = self._resolve_priority(
                     status=status,
                     diagnosis=diagnosis,
                     metrics=metrics,
                     trend_signal="no_history",
                 )
-                source_status_stub = {
-                    "advert": AdAnalysisSourceStatusOut(
-                        id="advert",
-                        label="Реклама WB",
-                        mode="partial" if aggregate["unallocated_spend"] > 0.01 else ("ok" if advert.total_spend > 0.01 else "empty"),
-                        detail=None,
-                        records=0,
-                        automatic=True,
-                    ),
-                    "finance": AdAnalysisSourceStatusOut(
-                        id="finance",
-                        label="Финансы WB",
-                        mode="ok" if finance.revenue > 0.01 or finance.wb_costs > 0.01 else "manual_required",
-                        detail=None,
-                        records=0,
-                        automatic=True,
-                    ),
-                    "funnel": AdAnalysisSourceStatusOut(
-                        id="funnel",
-                        label="Воронка продаж",
-                        mode="ok" if funnel_metric.open_count > 0 or funnel_metric.order_count > 0 else "empty",
-                        detail=None,
-                        records=0,
-                        automatic=True,
-                    ),
-                }
                 source_lineage = self._build_source_lineage(source_status_stub)
                 action_title, action_description, steps, insights, risk_flags = self._build_actions(
                     status=status,
@@ -2007,6 +2105,7 @@ class SkuEconomicsService:
                     source_statuses=source_status_stub,
                     metrics=metrics,
                 )
+                hints = f"{status_hint_prefix}{hints}".strip()
 
                 title = (
                     (card.title if card and card.title else None)
@@ -2039,6 +2138,10 @@ class SkuEconomicsService:
                         priority_label=priority_label,
                         precision=precision,
                         precision_label=precision_label,
+                        revenue_lineage=revenue_lineage,
+                        orders_lineage=orders_lineage,
+                        decision_ready=decision_ready,
+                        decision_label=decision_label,
                         source_lineage=source_lineage,
                         trend=AdAnalysisTrendOut(),
                         issue_summary=AdAnalysisIssueSummaryOut(
@@ -2097,7 +2200,7 @@ class SkuEconomicsService:
         advert_status = AdAnalysisSourceStatusOut(
             id="advert",
             label="Реклама WB",
-            mode="partial" if current_data["advert_records"] > 0 and remaining_unallocated > 0.01 else ("ok" if current_data["advert_records"] > 0 else "empty"),
+            mode="partial" if current_data["advert_records"] > 0 and remaining_unallocated > 0.01 else ("automatic" if current_data["advert_records"] > 0 else "missing"),
             detail=(
                 "Историческая реклама сохранена. Часть spend осталась без точной привязки к nmID."
                 if current_data["advert_records"] > 0 and remaining_unallocated > 0.01
@@ -2107,6 +2210,12 @@ class SkuEconomicsService:
             ),
             records=int(current_data["advert_records"]),
             automatic=True,
+            synced_at=advert_coverage.get("synced_at"),
+            coverage_ratio=float(advert_coverage.get("coverage_ratio") or 0.0),
+            coverage_start=advert_coverage.get("start"),
+            coverage_end=advert_coverage.get("end"),
+            expected_start=period_start,
+            expected_end=period_end,
         )
         finance_status = AdAnalysisSourceStatusOut(
             id="finance",
@@ -2114,7 +2223,7 @@ class SkuEconomicsService:
             mode=(
                 "partial"
                 if current_data["finance_records"] > 0 and manual_finance
-                else "ok"
+                else "automatic"
                 if current_data["finance_records"] > 0
                 else "manual"
                 if manual_finance
@@ -2131,14 +2240,24 @@ class SkuEconomicsService:
             ),
             records=max(int(current_data["finance_records"]), len(manual_finance)),
             automatic=not bool(manual_finance),
+            synced_at=finance_coverage.get("synced_at"),
+            coverage_ratio=float(finance_coverage.get("coverage_ratio") or 0.0),
+            coverage_start=finance_coverage.get("start"),
+            coverage_end=finance_coverage.get("end"),
+            expected_start=period_start,
+            expected_end=period_end,
+            blocked=(
+                (current_data["finance_records"] <= 0 and not manual_finance)
+                or (current_data["finance_records"] > 0 and float(finance_coverage.get("coverage_ratio") or 0.0) < 0.5)
+            ),
         )
         funnel_status = AdAnalysisSourceStatusOut(
             id="funnel",
             label="Воронка продаж",
             mode=(
-                "empty"
+                "missing"
                 if funnel_coverage["records"] <= 0
-                else "ok"
+                else "automatic"
                 if funnel_coverage["start"] and funnel_coverage["end"] and funnel_coverage["start"] <= period_start and funnel_coverage["end"] >= period_end
                 else "partial"
             ),
@@ -2158,6 +2277,12 @@ class SkuEconomicsService:
             ),
             records=int(current_data["funnel_records"] or funnel_coverage["records"]),
             automatic=True,
+            synced_at=funnel_coverage.get("synced_at"),
+            coverage_ratio=float(funnel_coverage.get("coverage_ratio") or 0.0),
+            coverage_start=funnel_coverage.get("start"),
+            coverage_end=funnel_coverage.get("end"),
+            expected_start=period_start,
+            expected_end=period_end,
         )
         costs_status = AdAnalysisSourceStatusOut(
             id="costs",
@@ -2182,7 +2307,7 @@ class SkuEconomicsService:
         manual_spend_status = AdAnalysisSourceStatusOut(
             id="manual_spend",
             label="Ручное распределение рекламы",
-            mode="manual" if manual_spend else "empty",
+            mode="manual" if manual_spend else "missing",
             detail=(
                 "Ручной файл использован для выбранного периода."
                 if manual_spend
@@ -2200,6 +2325,12 @@ class SkuEconomicsService:
             items=all_items,
         )
         budget_moves = self._build_budget_moves(all_items)
+        data_quality = self._build_data_quality(
+            source_statuses=[advert_status, finance_status, funnel_status],
+            missing_cost_nm_ids=missing_cost_nm_ids,
+            unallocated_spend=remaining_unallocated,
+            total_ad_spend=total_ad_spend,
+        )
 
         previous_overview = AdAnalysisOverviewOut(
             store_id=int(store.id),
@@ -2239,6 +2370,7 @@ class SkuEconomicsService:
             status_counts=status_counts,
             source_statuses=[advert_status, funnel_status, finance_status, costs_status, manual_spend_status],
             source_lineage=self._build_source_lineage([advert_status, funnel_status, finance_status]),
+            data_quality=data_quality,
             alerts=alerts,
             budget_moves=budget_moves,
             campaigns=[],
@@ -2248,7 +2380,7 @@ class SkuEconomicsService:
                 missing_costs_count=len(sorted(set(missing_cost_nm_ids))),
                 missing_cost_nm_ids=sorted(set(missing_cost_nm_ids))[:20],
                 needs_manual_spend=remaining_unallocated > 0.01,
-                needs_manual_finance=finance_status.mode in {"error", "manual_required"},
+                needs_manual_finance=finance_status.mode in {"failed", "manual_required"},
                 can_upload_costs=True,
                 can_upload_manual_spend=True,
                 can_upload_manual_finance=True,
@@ -2301,6 +2433,9 @@ class SkuEconomicsService:
         db: AsyncSession,
         store_id: int,
         source_id: str,
+        *,
+        period_start: Optional[date] = None,
+        period_end: Optional[date] = None,
     ) -> Dict[str, Any]:
         source_column = {
             "advert": SkuEconomicsDailyMetric.has_advert,
@@ -2314,17 +2449,40 @@ class SkuEconomicsService:
                 func.min(SkuEconomicsDailyMetric.metric_date),
                 func.max(SkuEconomicsDailyMetric.metric_date),
                 func.count(),
+                func.max(SkuEconomicsDailyMetric.synced_at),
             ).where(
                 SkuEconomicsDailyMetric.store_id == int(store_id),
                 SkuEconomicsDailyMetric.nm_id > 0,
                 source_column.is_(True),
             )
         )
-        start, end, records = result.one()
+        start, end, records, synced_at = result.one()
+
+        coverage_ratio = 0.0
+        period_days = 0
+        covered_days = 0
+        if period_start and period_end and period_end >= period_start:
+            period_days = max((period_end - period_start).days + 1, 1)
+            covered_days_result = await db.execute(
+                select(func.count(func.distinct(SkuEconomicsDailyMetric.metric_date))).where(
+                    SkuEconomicsDailyMetric.store_id == int(store_id),
+                    SkuEconomicsDailyMetric.nm_id > 0,
+                    source_column.is_(True),
+                    SkuEconomicsDailyMetric.metric_date >= period_start,
+                    SkuEconomicsDailyMetric.metric_date <= period_end,
+                )
+            )
+            covered_days = int(covered_days_result.scalar_one() or 0)
+            coverage_ratio = max(0.0, min(float(covered_days) / float(period_days), 1.0))
+
         return {
             "start": start,
             "end": end,
             "records": int(records or 0),
+            "synced_at": synced_at,
+            "period_days": period_days,
+            "covered_days": covered_days,
+            "coverage_ratio": round(float(coverage_ratio), 4),
         }
 
     async def _load_persisted_overview(
@@ -2391,7 +2549,7 @@ class SkuEconomicsService:
             AdAnalysisSourceStatusOut(
                 id="advert",
                 label="Реклама WB",
-                mode="empty",
+                mode="missing",
                 detail="История рекламы еще не загружалась. Нажмите «Обновить данные», чтобы сохранить слой WB Advert в backend.",
                 records=0,
                 automatic=True,
@@ -2399,7 +2557,7 @@ class SkuEconomicsService:
             AdAnalysisSourceStatusOut(
                 id="funnel",
                 label="Воронка продаж",
-                mode="empty",
+                mode="missing",
                 detail="История воронки еще не загружалась. Нажмите «Обновить данные», чтобы сохранить слой WB Analytics в backend.",
                 records=0,
                 automatic=True,
@@ -2407,7 +2565,7 @@ class SkuEconomicsService:
             AdAnalysisSourceStatusOut(
                 id="finance",
                 label="Финансы WB",
-                mode="manual" if manual_finance else "empty",
+                mode="manual" if manual_finance else "missing",
                 detail=(
                     "Используется ранее загруженный финансовый файл. Для полного снимка нажмите «Обновить»."
                     if manual_finance
@@ -2431,7 +2589,7 @@ class SkuEconomicsService:
             AdAnalysisSourceStatusOut(
                 id="manual_spend",
                 label="Ручное распределение рекламы",
-                mode="manual" if manual_spend else "empty",
+                mode="manual" if manual_spend else "missing",
                 detail=(
                     "Есть ручное распределение расходов за выбранный период."
                     if manual_spend
@@ -2485,7 +2643,9 @@ class SkuEconomicsService:
             items=[],
         )
 
-    async def _build_period_overview(
+    # NOTE: legacy direct-live WB builder path. Kept only for backward compatibility
+    # while history-based snapshot flow remains the production source of truth.
+    async def _build_period_overview_legacy(
         self,
         db: AsyncSession,
         store: Store,
@@ -2500,11 +2660,11 @@ class SkuEconomicsService:
             return cached[1]
 
         source_map = {
-            "advert": AdAnalysisSourceStatusOut(id="advert", label="Реклама WB", mode="empty", detail="Данные еще не загружены", records=0, automatic=True),
-            "funnel": AdAnalysisSourceStatusOut(id="funnel", label="Воронка продаж", mode="empty", detail="Данные еще не загружены", records=0, automatic=True),
-            "finance": AdAnalysisSourceStatusOut(id="finance", label="Финансы WB", mode="empty", detail="Данные еще не загружены", records=0, automatic=True),
+            "advert": AdAnalysisSourceStatusOut(id="advert", label="Реклама WB", mode="missing", detail="Данные еще не загружены", records=0, automatic=True),
+            "funnel": AdAnalysisSourceStatusOut(id="funnel", label="Воронка продаж", mode="missing", detail="Данные еще не загружены", records=0, automatic=True),
+            "finance": AdAnalysisSourceStatusOut(id="finance", label="Финансы WB", mode="missing", detail="Данные еще не загружены", records=0, automatic=True),
             "costs": AdAnalysisSourceStatusOut(id="costs", label="Себестоимость", mode="manual_required", detail="Нужен файл с себестоимостью", records=0, automatic=False),
-            "manual_spend": AdAnalysisSourceStatusOut(id="manual_spend", label="Ручное распределение рекламы", mode="empty", detail="Понадобится только если WB не отдал nmID", records=0, automatic=False),
+            "manual_spend": AdAnalysisSourceStatusOut(id="manual_spend", label="Ручное распределение рекламы", mode="missing", detail="Понадобится только если WB не отдал nmID", records=0, automatic=False),
         }
 
         manual_costs = await self._load_costs(db, store.id)
@@ -2532,7 +2692,7 @@ class SkuEconomicsService:
             )
 
         advert_data, source_map["advert"] = await self._fetch_advert_metrics(store, period_start, period_end)
-        base_nm_ids = set(advert_data["per_nm"].keys()) | set(manual_spend.keys()) | set(manual_finance.keys())
+        base_nm_ids = set(self._collect_candidate_nm_ids({"per_nm": advert_data["per_nm"]}, spend_topups=manual_spend, finance_topups=manual_finance))
 
         finance_data: Dict[int, _FinanceMetrics] = {}
         if base_nm_ids:
@@ -2543,7 +2703,7 @@ class SkuEconomicsService:
             source_map["funnel"] = AdAnalysisSourceStatusOut(
                 id="funnel",
                 label="Воронка продаж",
-                mode="empty",
+                mode="missing",
                 detail="Нет SKU с рекламными расходами за выбранный период",
                 records=0,
                 automatic=True,
@@ -2551,14 +2711,14 @@ class SkuEconomicsService:
             source_map["finance"] = AdAnalysisSourceStatusOut(
                 id="finance",
                 label="Финансы WB",
-                mode="empty",
+                mode="missing",
                 detail="Нет SKU с рекламными расходами за выбранный период",
                 records=0,
                 automatic=True,
             )
 
         if manual_finance:
-            if source_map["finance"].mode in {"error", "manual_required", "empty"}:
+            if source_map["finance"].mode in {"failed", "manual_required", "missing"}:
                 source_map["finance"] = AdAnalysisSourceStatusOut(
                     id="finance",
                     label="Финансы WB",
@@ -2607,8 +2767,22 @@ class SkuEconomicsService:
             issue_summary = self._summarize_issues(issues)
 
             funnel_metric = funnel_data.get(nm_id, _FunnelMetrics())
-            total_orders = max(finance.orders, funnel_metric.order_count, advert.total_orders)
-            revenue = finance.revenue or manual_finance.get(nm_id, _FinanceMetrics()).revenue or funnel_metric.order_sum or advert.total_gmv
+            manual_finance_used = bool(manual_finance.get(nm_id))
+            finance_ready = bool(nm_id in finance_data) or manual_finance_used
+            total_orders, orders_lineage = self._resolve_orders_lineage(
+                finance=finance,
+                funnel=funnel_metric,
+                advert=advert,
+                finance_preferred=finance_ready,
+                manual_finance=manual_finance_used,
+            )
+            revenue, revenue_lineage = self._resolve_revenue_lineage(
+                finance=finance,
+                funnel=funnel_metric,
+                advert=advert,
+                finance_preferred=finance_ready,
+                manual_finance=manual_finance_used,
+            )
             wb_costs = finance.wb_costs
             unit_cost = manual_costs.get(nm_id)
             missing_cost = unit_cost is None
@@ -2635,9 +2809,16 @@ class SkuEconomicsService:
             precision, precision_label = self._resolve_precision(advert, raw_unallocated)
             ad_cost_confidence = self._resolve_ad_cost_confidence(advert, raw_unallocated)
             source_lineage = self._build_source_lineage(source_map)
+            decision_ready, decision_label = self._resolve_decision_ready(
+                missing_cost=missing_cost,
+                finance_ready=finance_ready,
+                ad_cost_confidence=ad_cost_confidence,
+                source_statuses=source_map,
+            )
 
             metrics = AdAnalysisMetricsOut(
                 revenue=round(revenue, 2),
+                revenue_net=round(revenue, 2),
                 wb_costs=round(wb_costs, 2),
                 cost_price=round(cost_price, 2),
                 gross_profit_before_ads=round(gross_profit_before_ads, 2),
@@ -2667,20 +2848,29 @@ class SkuEconomicsService:
                 cart_to_order_percent=round(funnel_metric.cart_to_order_percent, 2),
                 cpc=round(cpc, 2),
                 drr=round(drr, 2),
+                funnel_orders=int(funnel_metric.order_count or 0),
+                advert_attributed_orders=int(advert.total_orders or 0),
+                finance_realized_orders=int(finance.orders or 0),
+                payout_realized=round(float(finance.payout or 0.0), 2),
             )
 
             diagnosis, diagnosis_label, reasons, hints = self._resolve_diagnosis(
                 metrics=metrics,
+                orders_lineage=orders_lineage,
                 issue_summary=issue_summary,
                 missing_cost=missing_cost,
-                finance_ready=(source_map["finance"].mode not in {"error", "manual_required", "empty"} or bool(manual_finance)),
+                finance_ready=finance_ready,
             )
             status, status_label = self._resolve_status(
                 metrics=metrics,
+                orders_lineage=orders_lineage,
                 diagnosis=diagnosis,
                 missing_cost=missing_cost,
-                finance_ready=(source_map["finance"].mode not in {"error", "manual_required", "empty"} or bool(manual_finance)),
+                finance_ready=finance_ready,
             )
+            if not decision_ready:
+                status = "low_data"
+                status_label = "Предварительно"
             priority, priority_label = self._resolve_priority(
                 status=status,
                 diagnosis=diagnosis,
@@ -2729,6 +2919,10 @@ class SkuEconomicsService:
                     priority_label=priority_label,
                     precision=precision,
                     precision_label=precision_label,
+                    revenue_lineage=revenue_lineage,
+                    orders_lineage=orders_lineage,
+                    decision_ready=decision_ready,
+                    decision_label=decision_label,
                     source_lineage=source_lineage,
                     trend=AdAnalysisTrendOut(),
                     issue_summary=AdAnalysisIssueSummaryOut(
@@ -2810,11 +3004,17 @@ class SkuEconomicsService:
             period_end=period_end,
             missing_costs_count=len(sorted(set(missing_cost_nm_ids))),
             missing_cost_nm_ids=sorted(set(missing_cost_nm_ids))[:20],
-            needs_manual_spend=remaining_unallocated > 0.01 or source_map["advert"].mode in {"error", "manual_required"},
-            needs_manual_finance=source_map["finance"].mode in {"error", "manual_required"},
+            needs_manual_spend=remaining_unallocated > 0.01 or source_map["advert"].mode in {"failed", "manual_required"},
+            needs_manual_finance=source_map["finance"].mode in {"failed", "manual_required"},
             can_upload_costs=True,
             can_upload_manual_spend=True,
             can_upload_manual_finance=True,
+        )
+        data_quality = self._build_data_quality(
+            source_statuses=list(source_map.values()),
+            missing_cost_nm_ids=missing_cost_nm_ids,
+            unallocated_spend=remaining_unallocated,
+            total_ad_spend=total_ad_spend,
         )
 
         overview = AdAnalysisOverviewOut(
@@ -2837,6 +3037,7 @@ class SkuEconomicsService:
             status_counts=status_counts,
             source_statuses=list(source_map.values()),
             source_lineage=self._build_source_lineage(source_map),
+            data_quality=data_quality,
             alerts=alerts,
             budget_moves=budget_moves,
             campaigns=list(advert_data.get("campaigns", []))[:12],
@@ -3116,7 +3317,7 @@ class SkuEconomicsService:
             revenue = metric.revenue
             payout = metric.payout
             base_costs = max(revenue - payout, 0.0)
-            row.revenue = round(max(revenue, 0.0), 2)
+            row.revenue = round(float(revenue), 2)
             row.wb_costs = round(max(metric.wb_costs, 0.0) + base_costs, 2)
             row.payout = round(payout, 2)
             row.orders = max(int(metric.orders), 0)
@@ -3252,6 +3453,7 @@ class SkuEconomicsService:
             issue_map[int(issue.card_id)].append(issue)
         return cards_map, issue_map
 
+    # NOTE: legacy helper used by `_build_period_overview_legacy` only.
     async def _fetch_advert_metrics(
         self,
         store: Store,
@@ -3270,7 +3472,7 @@ class SkuEconomicsService:
                         AdAnalysisSourceStatusOut(
                             id="advert",
                             label="Реклама WB",
-                            mode="empty",
+                            mode="missing",
                             detail="Кампании за выбранный период не найдены",
                             records=0,
                             automatic=True,
@@ -3288,7 +3490,7 @@ class SkuEconomicsService:
                     raw_items.extend(self._extract_fullstats_items(batch_data))
 
                 parsed = self._parse_fullstats(raw_items)
-                mode = "partial" if parsed["unallocated_spend"] > 0.01 else "ok"
+                mode = "partial" if parsed["unallocated_spend"] > 0.01 else "automatic"
                 detail = (
                     "Часть кампаний не удалось точно привязать к nmID"
                     if mode == "partial"
@@ -3313,7 +3515,7 @@ class SkuEconomicsService:
             AdAnalysisSourceStatusOut(
                 id="advert",
                 label="Реклама WB",
-                mode="error",
+                mode="failed",
                 detail=last_error,
                 records=0,
                 automatic=True,
@@ -3455,6 +3657,7 @@ class SkuEconomicsService:
         if isinstance(nm_single, dict):
             out.append(nm_single)
 
+    # NOTE: legacy helper used by `_build_period_overview_legacy` only.
     async def _fetch_funnel_metrics(
         self,
         store: Store,
@@ -3466,7 +3669,7 @@ class SkuEconomicsService:
             return {}, AdAnalysisSourceStatusOut(
                 id="funnel",
                 label="Воронка продаж",
-                mode="empty",
+                mode="missing",
                 detail="Нет SKU для анализа",
                 records=0,
                 automatic=True,
@@ -3528,7 +3731,7 @@ class SkuEconomicsService:
                     AdAnalysisSourceStatusOut(
                         id="funnel",
                         label="Воронка продаж",
-                        mode="ok",
+                        mode="automatic",
                         detail="Открытия карточки, корзина и заказы подтянуты из WB Analytics",
                         records=len(out),
                         automatic=True,
@@ -3542,13 +3745,14 @@ class SkuEconomicsService:
             AdAnalysisSourceStatusOut(
                 id="funnel",
                 label="Воронка продаж",
-                mode="error",
+                mode="failed",
                 detail=last_error,
                 records=0,
                 automatic=True,
             ),
         )
 
+    # NOTE: legacy helper used by `_build_period_overview_legacy` only.
     async def _fetch_finance_metrics(
         self,
         store: Store,
@@ -3589,7 +3793,7 @@ class SkuEconomicsService:
                         AdAnalysisSourceStatusOut(
                             id="finance",
                             label="Финансы WB",
-                            mode="empty",
+                            mode="missing",
                             detail="За период нет строк в отчете реализации",
                             records=0,
                             automatic=True,
@@ -3627,7 +3831,7 @@ class SkuEconomicsService:
 
                 for metric in out.values():
                     metric.wb_costs = round(max(metric.wb_costs, 0.0) + max(metric.revenue - metric.payout, 0.0), 2)
-                    metric.revenue = round(max(metric.revenue, 0.0), 2)
+                    metric.revenue = round(float(metric.revenue or 0.0), 2)
                     metric.payout = round(metric.payout, 2)
                     metric.orders = max(int(metric.orders), 0)
 
@@ -3636,7 +3840,7 @@ class SkuEconomicsService:
                     AdAnalysisSourceStatusOut(
                         id="finance",
                         label="Финансы WB",
-                        mode="partial" if partial_reason else "ok",
+                        mode="partial" if partial_reason else "automatic",
                         detail=(
                             f"Финансовый отчет WB подтянут частично: {partial_reason}"
                             if partial_reason
@@ -3748,11 +3952,91 @@ class SkuEconomicsService:
             return "medium"
         return "high"
 
+    def _resolve_orders_lineage(
+        self,
+        *,
+        finance: _FinanceMetrics,
+        funnel: _FunnelMetrics,
+        advert: _AdvertMetrics,
+        finance_preferred: bool,
+        manual_finance: bool = False,
+    ) -> Tuple[int, str]:
+        if finance_preferred:
+            return int(finance.orders or 0), "manual_finance" if manual_finance else "finance"
+        if int(funnel.order_count or 0) != 0:
+            return int(funnel.order_count or 0), "funnel"
+        if int(advert.total_orders or 0) != 0:
+            return int(advert.total_orders or 0), "advert"
+        return 0, "missing"
+
+    def _resolve_revenue_lineage(
+        self,
+        *,
+        finance: _FinanceMetrics,
+        funnel: _FunnelMetrics,
+        advert: _AdvertMetrics,
+        finance_preferred: bool,
+        manual_finance: bool = False,
+    ) -> Tuple[float, str]:
+        if finance_preferred:
+            return float(finance.revenue or 0.0), "manual_finance" if manual_finance else "finance"
+        if float(funnel.order_sum or 0.0) != 0.0:
+            return float(funnel.order_sum or 0.0), "funnel"
+        if float(advert.total_gmv or 0.0) != 0.0:
+            return float(advert.total_gmv or 0.0), "advert"
+        return 0.0, "missing"
+
+    def _resolve_decision_ready(
+        self,
+        *,
+        missing_cost: bool,
+        finance_ready: bool,
+        ad_cost_confidence: str,
+        source_statuses: Dict[str, AdAnalysisSourceStatusOut] | None = None,
+    ) -> Tuple[bool, str]:
+        if missing_cost or not finance_ready:
+            return False, "blocked"
+        if str(ad_cost_confidence) in {"low", "medium"}:
+            return False, "preliminary"
+
+        statuses = source_statuses or {}
+        core_modes = {
+            source_id: str((statuses.get(source_id).mode if statuses.get(source_id) else "missing") or "missing")
+            for source_id in ("advert", "finance", "funnel")
+        }
+        if any(mode in {"failed", "manual_required", "missing"} for mode in core_modes.values()):
+            return False, "blocked"
+        if any(mode == "partial" for mode in core_modes.values()):
+            return False, "preliminary"
+        return True, "ready"
+
+    def _orders_for_decision(
+        self,
+        *,
+        metrics: AdAnalysisMetricsOut,
+        orders_lineage: Optional[str] = None,
+    ) -> int:
+        lineage = str(orders_lineage or "").strip().lower()
+        if lineage in {"finance", "manual_finance"}:
+            return max(int(metrics.finance_realized_orders or 0), 0)
+        if lineage == "funnel":
+            return max(int(metrics.funnel_orders or metrics.order_count or 0), 0)
+        if lineage == "advert":
+            return max(int(metrics.advert_attributed_orders or metrics.ad_orders or 0), 0)
+
+        finance_orders = max(int(metrics.finance_realized_orders or 0), 0)
+        if finance_orders > 0:
+            return finance_orders
+        funnel_orders = max(int(metrics.funnel_orders or metrics.order_count or 0), 0)
+        if funnel_orders > 0:
+            return funnel_orders
+        return max(int(metrics.advert_attributed_orders or metrics.ad_orders or 0), 0)
+
     def _lineage_mode_from_source_status(self, source_status: Optional[AdAnalysisSourceStatusOut]) -> str:
         if source_status is None:
             return "failed"
         mode = str(source_status.mode or "")
-        if mode in {"error", "manual_required"}:
+        if mode in {"failed", "manual_required"}:
             return "failed"
         if mode == "partial":
             return "partial"
@@ -3782,10 +4066,58 @@ class SkuEconomicsService:
             funnel=self._lineage_mode_from_source_status(by_id.get("funnel")),
         )
 
+    def _build_data_quality(
+        self,
+        *,
+        source_statuses: Sequence[AdAnalysisSourceStatusOut],
+        missing_cost_nm_ids: Sequence[int],
+        unallocated_spend: float,
+        total_ad_spend: float,
+    ) -> AdAnalysisDataQualityOut:
+        by_id = {str(source.id): source for source in source_statuses}
+        partial_sources: list[str] = []
+        blocked_sources: list[str] = []
+
+        for source_id in ("advert", "finance", "funnel"):
+            source = by_id.get(source_id)
+            mode = str((source.mode if source else "missing") or "missing")
+            if mode in {"partial"}:
+                partial_sources.append(source_id)
+            if mode in {"failed", "manual_required", "missing"} or bool(getattr(source, "blocked", False)):
+                blocked_sources.append(source_id)
+
+        notes: list[str] = []
+        if missing_cost_nm_ids:
+            notes.append("Для части SKU отсутствует себестоимость.")
+        if unallocated_spend > self.ADVERT_RESIDUAL_EPSILON:
+            notes.append("Есть нераспределенный рекламный расход.")
+        if blocked_sources:
+            notes.append("Есть заблокированные источники данных.")
+        elif partial_sources:
+            notes.append("Часть источников покрыта частично.")
+        else:
+            notes.append("Качество данных достаточное для решений.")
+
+        confidence: str = "high"
+        if blocked_sources or missing_cost_nm_ids:
+            confidence = "low"
+        elif partial_sources or (total_ad_spend > 0 and (unallocated_spend / max(total_ad_spend, 1.0)) > 0.05):
+            confidence = "medium"
+
+        decision_ready = bool(confidence == "high")
+        return AdAnalysisDataQualityOut(
+            decision_ready=decision_ready,
+            confidence=confidence,
+            partial_sources=partial_sources,
+            blocked_sources=blocked_sources,
+            notes=notes,
+        )
+
     def _resolve_diagnosis(
         self,
         *,
         metrics: AdAnalysisMetricsOut,
+        orders_lineage: Optional[str] = None,
         issue_summary: _IssueSnapshot,
         missing_cost: bool,
         finance_ready: bool,
@@ -3798,7 +4130,7 @@ class SkuEconomicsService:
                 "Сначала дозагрузите недостающие данные, потом принимайте решение по бюджету.",
             )
 
-        orders_total = max(metrics.order_count, metrics.ad_orders)
+        orders_total = self._orders_for_decision(metrics=metrics, orders_lineage=orders_lineage)
         cpo_ratio = (metrics.actual_cpo / metrics.max_cpo) if metrics.max_cpo > 0 else float("inf")
         if metrics.gross_profit_before_ads <= 0:
             return (
@@ -3853,11 +4185,12 @@ class SkuEconomicsService:
         self,
         *,
         metrics: AdAnalysisMetricsOut,
+        orders_lineage: Optional[str] = None,
         diagnosis: str,
         missing_cost: bool,
         finance_ready: bool,
     ) -> Tuple[str, str]:
-        orders_total = max(metrics.order_count, metrics.ad_orders)
+        orders_total = self._orders_for_decision(metrics=metrics, orders_lineage=orders_lineage)
         cpo_ratio = (metrics.actual_cpo / metrics.max_cpo) if metrics.max_cpo > 0 else float("inf")
 
         if missing_cost or not finance_ready:
@@ -3909,7 +4242,7 @@ class SkuEconomicsService:
 
         if missing_cost:
             risk_flags.append("Нет себестоимости: прибыль и Max CPO завышены")
-        if source_statuses["finance"].mode in {"error", "manual_required"}:
+        if source_statuses["finance"].mode in {"failed", "manual_required"}:
             risk_flags.append("Нет финансового отчета WB: revenue и wb costs рассчитаны по упрощенной схеме")
         if precision in {"estimated", "mixed", "unallocated"}:
             risk_flags.append("Расходы по рекламе привязаны не полностью или частично оценочно")
@@ -3976,7 +4309,7 @@ class SkuEconomicsService:
                 insights,
                 risk_flags,
             )
-        if missing_cost or source_statuses["finance"].mode in {"error", "manual_required"}:
+        if missing_cost or source_statuses["finance"].mode in {"failed", "manual_required"}:
             steps.extend([
                 "Загрузите недостающий файл или обновите проблемный источник данных.",
                 "После загрузки пересчитайте snapshot, чтобы система получила точную прибыль и Max CPO.",
@@ -4043,7 +4376,7 @@ class SkuEconomicsService:
                     action="Загрузить себестоимость",
                 )
             )
-        if finance_status.mode in {"error", "manual_required"}:
+        if finance_status.mode in {"failed", "manual_required"}:
             alerts.append(
                 AdAnalysisAlertOut(
                     level="warning",
@@ -4052,7 +4385,7 @@ class SkuEconomicsService:
                     action="Загрузить финансовый файл",
                 )
             )
-        if advert_status.mode == "error":
+        if advert_status.mode == "failed":
             alerts.append(
                 AdAnalysisAlertOut(
                     level="error",
@@ -4110,8 +4443,14 @@ class SkuEconomicsService:
                 summary="В предыдущем окне сравнения по этому SKU не было достаточных данных.",
             )
 
-        current_orders = max(current.metrics.order_count, current.metrics.ad_orders)
-        previous_orders = max(previous.metrics.order_count, previous.metrics.ad_orders)
+        current_orders = self._orders_for_decision(
+            metrics=current.metrics,
+            orders_lineage=current.orders_lineage,
+        )
+        previous_orders = self._orders_for_decision(
+            metrics=previous.metrics,
+            orders_lineage=previous.orders_lineage,
+        )
         actual_cpo_change = round(current.metrics.actual_cpo - previous.metrics.actual_cpo, 2)
         net_profit_change = round(current.metrics.net_profit - previous.metrics.net_profit, 2)
         profit_delta_change = round(current.metrics.profit_delta - previous.metrics.profit_delta, 2)
@@ -4296,7 +4635,12 @@ class SkuEconomicsService:
             row.profit_delta = float(item.metrics.profit_delta or 0.0)
             row.ctr = float(item.metrics.ctr or 0.0)
             row.cr = float(item.metrics.cr or 0.0)
-            row.orders = int(max(item.metrics.order_count, item.metrics.ad_orders))
+            row.orders = int(
+                self._orders_for_decision(
+                    metrics=item.metrics,
+                    orders_lineage=item.orders_lineage,
+                )
+            )
             row.ad_orders = int(item.metrics.ad_orders or 0)
             row.generated_at = overview.generated_at
 

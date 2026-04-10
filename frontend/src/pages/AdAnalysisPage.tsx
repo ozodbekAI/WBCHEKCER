@@ -22,10 +22,8 @@ import {
   TrendingUp,
   Upload,
 } from 'lucide-react';
-import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 
-import api from '@/api/client';
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -34,6 +32,15 @@ import { Progress } from '@/components/ui/progress';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useStore } from '@/contexts/StoreContext';
+import {
+  SourceHealthCard,
+} from '@/features/ad-analysis/components/SourceHealthCard';
+import { buildSkuExportRows } from '@/features/ad-analysis/export';
+import {
+  useAdAnalysisOverview,
+  type AdAnalysisUploadKind,
+  type SchedulerStatus,
+} from '@/features/ad-analysis/hooks/useAdAnalysisOverview';
 import { cn } from '@/lib/utils';
 import type {
   AdAnalysisCampaign,
@@ -55,16 +62,9 @@ const PERIOD_OPTIONS: Array<{ id: PeriodPreset; label: string }> = [
   { id: 'all', label: 'Весь период' },
 ];
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
-type UploadKind = 'costs' | 'spend' | 'finance';
+type UploadKind = AdAnalysisUploadKind;
 type ViewMode = 'simple' | 'explanation' | 'analytics';
 type DrawerTab = 'action' | 'why' | 'analytics';
-type SchedulerStatus = {
-  is_running: boolean;
-  interval_sec: number;
-  last_tick_at: string | null;
-  next_tick_at: string | null;
-  next_tick_in_sec: number | null;
-};
 
 const STATUS_META: Record<AdAnalysisItemStatus, { label: string; tileClass: string; chipClass: string; dotClass: string }> = {
   stop: {
@@ -100,12 +100,14 @@ const STATUS_META: Record<AdAnalysisItemStatus, { label: string; tileClass: stri
 };
 
 const SOURCE_MODE_META: Record<AdAnalysisSourceStatus['mode'], string> = {
-  ok: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+  automatic: 'border-emerald-200 bg-emerald-50 text-emerald-700',
   partial: 'border-amber-200 bg-amber-50 text-amber-700',
   manual: 'border-sky-200 bg-sky-50 text-sky-700',
   manual_required: 'border-rose-200 bg-rose-50 text-rose-700',
-  error: 'border-rose-200 bg-rose-50 text-rose-700',
-  empty: 'border-slate-200 bg-slate-50 text-slate-600',
+  failed: 'border-rose-200 bg-rose-50 text-rose-700',
+  pending: 'border-slate-200 bg-slate-50 text-slate-600',
+  running: 'border-indigo-200 bg-indigo-50 text-indigo-700',
+  missing: 'border-slate-200 bg-slate-50 text-slate-600',
 };
 
 const PRIORITY_META: Record<AdAnalysisPriority, { label: string; className: string }> = {
@@ -392,23 +394,7 @@ function downloadTemplate(fileName: string, rows: string[][]) {
 }
 
 function downloadSkuExport(items: AdAnalysisItem[]) {
-  const rows = items.map((item) => ({
-    'Артикул ВБ': item.nm_id,
-    'Артикул поставщика': item.vendor_code || '',
-    'Название': item.title || '',
-    'Статус': displayStatusLabel(item),
-    'Причина': item.status_reason,
-    'Действие': item.action_title,
-    'Чистая прибыль, руб': Math.round(item.metrics.net_profit),
-    'Факт. CPO, руб': Math.round(item.metrics.actual_cpo),
-    'Лимит CPO, руб': Math.round(item.metrics.max_cpo),
-    'Запас, руб': Math.round(item.metrics.profit_delta),
-    'Выручка, руб': Math.round(item.metrics.revenue),
-    'Расходы WB, руб': Math.round(item.metrics.wb_costs),
-    'Себестоимость, руб': Math.round(item.metrics.cost_price),
-    'Прибыль до рекламы, руб': Math.round(item.metrics.gross_profit_before_ads),
-    'Реклама, руб': Math.round(item.metrics.ad_cost),
-  }));
+  const rows = buildSkuExportRows(items, displayStatusLabel);
   const worksheet = XLSX.utils.json_to_sheet(rows);
   worksheet['!cols'] = Object.keys(rows[0] || {
     'Артикул ВБ': '',
@@ -505,7 +491,7 @@ function getGuideLiveHint(kind: UploadKind, overview: AdAnalysisOverview | null)
 
 function getSourceModeLabel(mode: AdAnalysisSourceStatus['mode']) {
   switch (mode) {
-    case 'ok':
+    case 'automatic':
       return 'Загружено';
     case 'partial':
       return 'Частично';
@@ -513,9 +499,13 @@ function getSourceModeLabel(mode: AdAnalysisSourceStatus['mode']) {
       return 'Есть файл';
     case 'manual_required':
       return 'Нужен файл';
-    case 'error':
+    case 'failed':
       return 'Ошибка';
-    case 'empty':
+    case 'pending':
+      return 'В очереди';
+    case 'running':
+      return 'Загрузка';
+    case 'missing':
     default:
       return 'Не загружали';
   }
@@ -645,111 +635,49 @@ export default function AdAnalysisPage() {
   const [customPeriodStart, setCustomPeriodStart] = useState<string>(initialCustomRange.start);
   const [customPeriodEnd, setCustomPeriodEnd] = useState<string>(initialCustomRange.end);
   const [viewMode, setViewMode] = useState<ViewMode>('simple');
-  const [loading, setLoading] = useState(false);
-  const [bootstrapping, setBootstrapping] = useState(false);
-  const [overview, setOverview] = useState<AdAnalysisOverview | null>(null);
-  const [error, setError] = useState('');
   const [statusFilter, setStatusFilter] = useState<AdAnalysisItemStatus | 'all'>('all');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(25);
   const [selectedItem, setSelectedItem] = useState<AdAnalysisItem | null>(null);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>('action');
-  const [uploading, setUploading] = useState<UploadKind | null>(null);
-  const [schedulerStatus, setSchedulerStatus] = useState<SchedulerStatus | null>(null);
-  const [lastUploadResult, setLastUploadResult] = useState<{ kind: UploadKind; result: AdAnalysisUploadResult } | null>(null);
   const [showTableDetails, setShowTableDetails] = useState(false);
 
   const deferredSearch = useDeferredValue(search);
   const costsInputRef = useRef<HTMLInputElement>(null);
   const spendInputRef = useRef<HTMLInputElement>(null);
   const financeInputRef = useRef<HTMLInputElement>(null);
-  const autoBootstrapStoreRef = useRef<number | null>(null);
+  const requestedPeriod = periodPreset === 'custom'
+    ? { period_start: customPeriodStart, period_end: customPeriodEnd }
+    : fallbackPeriod(periodPresetToDays(periodPreset));
+
+  const {
+    loading,
+    bootstrapping,
+    overview,
+    error,
+    uploading,
+    schedulerStatus,
+    lastUploadResult,
+    loadOverview,
+    handleUpload,
+  } = useAdAnalysisOverview({
+    storeId: activeStore?.id,
+    days: periodPreset === 'custom' ? undefined : periodPresetToDays(periodPreset),
+    periodPreset,
+    periodStart: customPeriodStart,
+    periodEnd: customPeriodEnd,
+    page,
+    pageSize,
+    statusFilter,
+    search: deferredSearch,
+    selectedItemNmId: selectedItem?.nm_id ?? null,
+    onSelectedItemRefresh: setSelectedItem,
+  });
 
   const scrollToSection = (id: string) => {
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
-
-  const loadOverview = async (force = false) => {
-    if (!activeStore) return;
-    setLoading(true);
-    setError('');
-    try {
-      const data = await api.getAdAnalysisOverview(activeStore.id, {
-        days: periodPreset === 'custom' ? undefined : periodPresetToDays(periodPreset),
-        preset: periodPreset,
-        period_start: periodPreset === 'custom' ? customPeriodStart : undefined,
-        period_end: periodPreset === 'custom' ? customPeriodEnd : undefined,
-        page,
-        page_size: pageSize,
-        status: statusFilter !== 'all' ? statusFilter : undefined,
-        search: deferredSearch.trim() || undefined,
-        force,
-      });
-      setOverview(data);
-      if (selectedItem) {
-        const pooledItems = [...data.items, ...data.critical_preview, ...data.growth_preview];
-        const fresh = pooledItems.find((item) => item.nm_id === selectedItem.nm_id) || null;
-        setSelectedItem(fresh);
-      }
-      if (force) {
-        try {
-          const freshSchedulerStatus = await api.getSchedulerStatus();
-          setSchedulerStatus(freshSchedulerStatus);
-        } catch {
-          // scheduler hint is optional here
-        }
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Не удалось загрузить SKU economics';
-      setError(message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (!activeStore) return;
-    void loadOverview(false);
-  }, [
-    activeStore?.id,
-    periodPreset,
-    customPeriodStart,
-    customPeriodEnd,
-    page,
-    pageSize,
-    statusFilter,
-    deferredSearch,
-  ]);
-
-  useEffect(() => {
-    autoBootstrapStoreRef.current = null;
-  }, [activeStore?.id]);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!activeStore) return;
-    void api.getSchedulerStatus()
-      .then((status) => {
-        if (!cancelled) setSchedulerStatus(status);
-      })
-      .catch(() => {
-        if (!cancelled) setSchedulerStatus(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeStore?.id]);
-
-  useEffect(() => {
-    if (!activeStore || !overview || loading || bootstrapping) return;
-    const hasArchive = Boolean(overview.available_period_start && overview.available_period_end);
-    if (overview.snapshot_ready || hasArchive) return;
-    if (autoBootstrapStoreRef.current === activeStore.id) return;
-    autoBootstrapStoreRef.current = activeStore.id;
-    setBootstrapping(true);
-    void loadOverview(true).finally(() => setBootstrapping(false));
-  }, [activeStore, overview, loading, bootstrapping]);
 
   useEffect(() => {
     setPage(1);
@@ -757,9 +685,7 @@ export default function AdAnalysisPage() {
 
   const currentPeriod = overview
     ? { period_start: overview.period_start, period_end: overview.period_end }
-    : periodPreset === 'custom'
-      ? { period_start: customPeriodStart, period_end: customPeriodEnd }
-      : fallbackPeriod(periodPresetToDays(periodPreset));
+    : requestedPeriod;
 
   const items = overview?.items || [];
   const snapshotReady = Boolean(overview?.snapshot_ready);
@@ -784,8 +710,8 @@ export default function AdAnalysisPage() {
   const isExplanationMode = viewMode === 'explanation';
   const isAnalyticsMode = viewMode === 'analytics';
   const shouldShowManualFiles = Boolean(lastUploadResult || requiredUploadKinds.length > 0 || isAnalyticsMode);
-  const readySourceCount = overview?.source_statuses.filter((source) => source.mode === 'ok' || source.mode === 'manual' || source.mode === 'partial').length || 0;
-  const attentionSourceCount = overview?.source_statuses.filter((source) => source.mode === 'error' || source.mode === 'manual_required').length || 0;
+  const readySourceCount = overview?.source_statuses.filter((source) => source.mode === 'automatic' || source.mode === 'manual' || source.mode === 'partial').length || 0;
+  const attentionSourceCount = overview?.source_statuses.filter((source) => source.mode === 'failed' || source.mode === 'manual_required' || source.mode === 'missing').length || 0;
   const nextAction = (() => {
     if (!overview) return null;
     if (overview.upload_needs.missing_costs_count > 0) {
@@ -857,32 +783,6 @@ export default function AdAnalysisPage() {
     if (kind === 'finance') financeInputRef.current?.click();
   };
 
-  const handleUpload = async (kind: UploadKind, file?: File | null) => {
-    if (!activeStore || !file) return;
-    setUploading(kind);
-    try {
-      const result =
-        kind === 'costs'
-          ? await api.uploadAdAnalysisCosts(activeStore.id, file)
-          : kind === 'spend'
-            ? await api.uploadAdAnalysisManualSpend(activeStore.id, file, currentPeriod.period_start, currentPeriod.period_end)
-            : await api.uploadAdAnalysisFinance(activeStore.id, file, currentPeriod.period_start, currentPeriod.period_end);
-      setLastUploadResult({ kind, result });
-      toast(`${result.imported + result.updated} строк обработано.`);
-      (result.notes || []).forEach((note) => {
-        if (note) toast(note);
-      });
-      if (result.unresolved_count > 0) {
-        toast.error(`Осталось ${result.unresolved_count} несопоставленных строк. Ниже показан превью проблемных строк.`);
-      }
-      await loadOverview(true);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Upload failed');
-    } finally {
-      setUploading(null);
-    }
-  };
-
   return (
     <div className="min-h-screen bg-[#fafaf8]">
       <input
@@ -891,7 +791,7 @@ export default function AdAnalysisPage() {
         accept=".xlsx,.xls,.csv"
         className="hidden"
         onChange={(e) => {
-          void handleUpload('costs', e.target.files?.[0]);
+          void handleUpload('costs', e.target.files?.[0], currentPeriod);
           e.currentTarget.value = '';
         }}
       />
@@ -901,7 +801,7 @@ export default function AdAnalysisPage() {
         accept=".xlsx,.xls,.csv"
         className="hidden"
         onChange={(e) => {
-          void handleUpload('spend', e.target.files?.[0]);
+          void handleUpload('spend', e.target.files?.[0], currentPeriod);
           e.currentTarget.value = '';
         }}
       />
@@ -911,7 +811,7 @@ export default function AdAnalysisPage() {
         accept=".xlsx,.xls,.csv"
         className="hidden"
         onChange={(e) => {
-          void handleUpload('finance', e.target.files?.[0]);
+          void handleUpload('finance', e.target.files?.[0], currentPeriod);
           e.currentTarget.value = '';
         }}
       />
@@ -1066,6 +966,44 @@ export default function AdAnalysisPage() {
                     <OverviewMetricCard label="Выручка" value={formatMoney(overview.total_revenue)} large />
                     <OverviewMetricCard label="Реклама" value={formatMoney(overview.total_ad_spend)} large />
                     <OverviewMetricCard label="Чистая прибыль" value={formatMoney(overview.total_net_profit)} accent={overview.total_net_profit >= 0 ? 'text-emerald-600' : 'text-rose-600'} large />
+                  </div>
+
+                  <div className="mt-3 rounded-[16px] border border-black/5 bg-slate-50/70 px-3 py-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Data quality</span>
+                      <Badge
+                        className={cn(
+                          'rounded-full border px-2.5 py-0.5 text-[10px] font-medium',
+                          overview.data_quality.confidence === 'high' && 'border-emerald-200 bg-emerald-50 text-emerald-700',
+                          overview.data_quality.confidence === 'medium' && 'border-amber-200 bg-amber-50 text-amber-700',
+                          overview.data_quality.confidence === 'low' && 'border-rose-200 bg-rose-50 text-rose-700',
+                        )}
+                      >
+                        {overview.data_quality.confidence === 'high' ? 'Высокая уверенность' : overview.data_quality.confidence === 'medium' ? 'Средняя уверенность' : 'Низкая уверенность'}
+                      </Badge>
+                      <Badge
+                        variant="outline"
+                        className={cn(
+                          'rounded-full px-2.5 py-0.5 text-[10px]',
+                          overview.data_quality.decision_ready ? 'border-emerald-300 text-emerald-700' : 'border-amber-300 text-amber-700',
+                        )}
+                      >
+                        {overview.data_quality.decision_ready ? 'Decision-ready' : 'Preliminary / blocked'}
+                      </Badge>
+                    </div>
+                    {(overview.data_quality.partial_sources.length > 0 || overview.data_quality.blocked_sources.length > 0 || overview.data_quality.notes.length > 0) && (
+                      <div className="mt-2 space-y-1.5 text-[12px] text-muted-foreground">
+                        {overview.data_quality.partial_sources.length > 0 && (
+                          <p>Частичные источники: {overview.data_quality.partial_sources.join(', ')}</p>
+                        )}
+                        {overview.data_quality.blocked_sources.length > 0 && (
+                          <p>Заблокированные источники: {overview.data_quality.blocked_sources.join(', ')}</p>
+                        )}
+                        {overview.data_quality.notes.slice(0, 2).map((note, idx) => (
+                          <p key={`${note}-${idx}`}>{note}</p>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
                   <div className="mt-3 flex flex-col gap-3 rounded-[16px] border border-black/5 bg-slate-50/70 px-3 py-3 xl:flex-row xl:items-center xl:justify-between">
@@ -1686,12 +1624,12 @@ function EmptyAnalysisState({
   const automaticSources = setupSources.filter((source) => source.automatic);
   const readyCount = setupSources.filter((source) => {
     const status = sourceMap.get(source.id);
-    return status && ['ok', 'manual', 'partial'].includes(status.mode);
+    return status && ['automatic', 'manual', 'partial'].includes(status.mode);
   }).length;
   const snapshotReady = Boolean(overview?.snapshot_ready);
   const automaticReadyCount = automaticSources.filter((source) => {
     const status = sourceMap.get(source.id);
-    return status && ['ok', 'partial'].includes(status.mode);
+    return status && ['automatic', 'partial'].includes(status.mode);
   }).length;
   const showBootstrapStage = !snapshotReady && automaticReadyCount === 0;
   const isLoadingStage = showBootstrapStage && (loading || bootstrapping || !overview);
@@ -2048,79 +1986,6 @@ function NextActionCard({
   );
 }
 
-function SourceHealthCard({
-  overview,
-  schedulerStatus,
-  viewMode,
-}: {
-  overview: AdAnalysisOverview | null;
-  schedulerStatus: SchedulerStatus | null;
-  viewMode: ViewMode;
-}) {
-  const sources = overview?.source_statuses || [];
-
-  return (
-    <div className="rounded-[20px] border border-black/5 bg-white p-4 shadow-[0_10px_28px_rgba(15,23,42,0.04)]">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Источники</p>
-          <h3 className="mt-1.5 text-base font-semibold">Что уже сохранено</h3>
-        </div>
-        <Badge variant="outline" className="rounded-full px-3 py-1 text-[11px]">
-          {schedulerStatus?.last_tick_at ? `Фон. цикл: ${formatDateTime(schedulerStatus.last_tick_at)}` : 'Без данных о фоновом цикле'}
-        </Badge>
-      </div>
-
-      <div className="mt-3">
-        {sources.length === 0 && (
-          <div className="rounded-[16px] border border-dashed border-black/10 bg-slate-50 px-4 py-6 text-sm text-muted-foreground">
-            Источники появятся после первого успешного запроса overview.
-          </div>
-        )}
-
-        {sources.length > 0 && (
-          <Accordion type="single" collapsible className="space-y-2">
-            {sources.map((source) => (
-              <AccordionItem key={source.id} value={source.id} className="overflow-hidden rounded-[16px] border border-black/5 bg-slate-50 px-0">
-                <AccordionTrigger className="px-4 py-3 hover:no-underline">
-                  <div className="flex w-full items-center justify-between gap-3 pr-3 text-left">
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <p className="text-sm font-semibold">{source.label}</p>
-                        <Badge className={cn('rounded-full border px-2.5 py-0.5 text-[10px] font-medium', SOURCE_MODE_META[source.mode])}>
-                          {getSourceModeLabel(source.mode)}
-                        </Badge>
-                      </div>
-                      <p className="mt-1 text-xs text-muted-foreground">{source.automatic ? 'WB API' : 'Ручной файл'}</p>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Записей</div>
-                      <div className="mt-1 text-sm font-semibold">{source.records}</div>
-                    </div>
-                  </div>
-                </AccordionTrigger>
-                <AccordionContent className="border-t border-black/5 px-4 py-3 text-[13px] leading-5 text-muted-foreground">
-                  {source.detail || '—'}
-                </AccordionContent>
-              </AccordionItem>
-            ))}
-          </Accordion>
-        )}
-      </div>
-
-      {viewMode !== 'simple' && (
-        <div className="mt-3 rounded-[16px] border border-black/5 bg-[linear-gradient(180deg,#ffffff_0%,#fafafa_100%)] p-3.5">
-          <p className="text-sm font-semibold">Как читать блок</p>
-          <p className="mt-1.5 text-[13px] leading-5 text-muted-foreground">
-            Если здесь все зеленое или частично закрыто ручным слоем, можно переходить к решениям по SKU. Если есть `Нужен файл` или `Ошибка`,
-            система покажет ниже ровно тот файл, которого не хватает.
-          </p>
-        </div>
-      )}
-    </div>
-  );
-}
-
 function UploadResultPanel({
   kind,
   result,
@@ -2313,9 +2178,23 @@ function SkuTable({
                   </div>
                 </td>
                 <td className="border-b border-r border-black/5 px-3 py-2.5 align-top">
-                  <Badge className={cn('rounded-full px-3 py-1 text-xs', STATUS_META[item.status].chipClass)}>
-                    {displayStatusLabel(item)}
-                  </Badge>
+                  <div className="flex flex-col items-start gap-1.5">
+                    <Badge className={cn('rounded-full px-3 py-1 text-xs', STATUS_META[item.status].chipClass)}>
+                      {displayStatusLabel(item)}
+                    </Badge>
+                    <Badge
+                      variant="outline"
+                      className={cn(
+                        'rounded-full px-2.5 py-0.5 text-[10px]',
+                        item.decision_ready ? 'border-emerald-300 text-emerald-700' : 'border-amber-300 text-amber-700',
+                      )}
+                    >
+                      {item.decision_label}
+                    </Badge>
+                    <div className="text-[10px] text-muted-foreground">
+                      rev:{item.revenue_lineage} · ord:{item.orders_lineage}
+                    </div>
+                  </div>
                 </td>
                 <td className="border-b border-r border-black/5 px-3 py-2.5 align-top">
                   <div className="max-w-[200px] leading-5 text-slate-700">{item.action_title}</div>
@@ -2895,6 +2774,15 @@ function SkuCard({
               <div className="flex flex-wrap items-center gap-2">
                 {showPriorityBadge && <Badge className={cn('rounded-full px-2.5 py-1 text-[11px]', PRIORITY_META[item.priority].className)}>{item.priority_label}</Badge>}
                 <Badge className={cn('rounded-full px-2.5 py-1 text-[11px]', statusMeta.chipClass)}>{displayStatusLabel(item)}</Badge>
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    'rounded-full px-2.5 py-1 text-[11px]',
+                    item.decision_ready ? 'border-emerald-300 text-emerald-700' : 'border-amber-300 text-amber-700',
+                  )}
+                >
+                  {item.decision_label}
+                </Badge>
                 {showDiagnosisBadge && <Badge variant="outline" className="rounded-full px-2.5 py-1 text-[11px]">{item.diagnosis_label}</Badge>}
                 {showTrendBadge && (
                   <Badge className={cn('rounded-full px-2.5 py-1 text-[11px]', TREND_META[item.trend.signal].className)}>
@@ -2903,6 +2791,19 @@ function SkuCard({
                   </Badge>
                 )}
                 {showPrecisionBadge && <Badge variant="outline" className="rounded-full px-2.5 py-1 text-[11px]">{item.precision_label}</Badge>}
+                {showPrecisionBadge && (
+                  <Badge
+                    variant="outline"
+                    className={cn(
+                      'rounded-full px-2.5 py-1 text-[11px]',
+                      item.metrics.ad_cost_confidence === 'high' && 'border-emerald-300 text-emerald-700',
+                      item.metrics.ad_cost_confidence === 'medium' && 'border-amber-300 text-amber-700',
+                      item.metrics.ad_cost_confidence === 'low' && 'border-rose-300 text-rose-700',
+                    )}
+                  >
+                    ad confidence: {item.metrics.ad_cost_confidence}
+                  </Badge>
+                )}
               </div>
               <h4 className="mt-2 max-w-2xl text-base font-semibold leading-snug">{item.title || `nmID ${item.nm_id}`}</h4>
               <p className="mt-1 text-[13px] text-muted-foreground">

@@ -1,10 +1,19 @@
 from datetime import date, datetime
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
-SourceMode = Literal["ok", "partial", "manual", "manual_required", "error", "empty"]
+SourceMode = Literal[
+    "automatic",
+    "manual",
+    "partial",
+    "manual_required",
+    "failed",
+    "pending",
+    "running",
+    "missing",
+]
 SourceLineageMode = Literal["automatic", "manual", "partial", "failed"]
 ItemStatus = Literal["stop", "rescue", "control", "grow", "low_data"]
 DiagnosisKind = Literal["traffic", "card", "economics", "data"]
@@ -22,6 +31,37 @@ class AdAnalysisSourceStatusOut(BaseModel):
     detail: Optional[str] = None
     records: int = 0
     automatic: bool = True
+    synced_at: Optional[datetime] = None
+    coverage_ratio: float = 0.0
+    coverage_start: Optional[date] = None
+    coverage_end: Optional[date] = None
+    expected_start: Optional[date] = None
+    expected_end: Optional[date] = None
+    blocked: bool = False
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _normalize_mode(cls, value: object) -> str:
+        raw = str(value or "").strip().lower()
+        legacy_to_new = {
+            "ok": "automatic",
+            "error": "failed",
+            "empty": "missing",
+        }
+        if raw in legacy_to_new:
+            return legacy_to_new[raw]
+        if raw in {
+            "automatic",
+            "manual",
+            "partial",
+            "manual_required",
+            "failed",
+            "pending",
+            "running",
+            "missing",
+        }:
+            return raw
+        return "missing"
 
 
 class AdAnalysisSourceLineageOut(BaseModel):
@@ -70,6 +110,7 @@ class AdAnalysisIssueSummaryOut(BaseModel):
 
 class AdAnalysisMetricsOut(BaseModel):
     revenue: float = 0
+    revenue_net: float = 0
     wb_costs: float = 0
     cost_price: float = 0
     gross_profit_before_ads: float = 0
@@ -99,6 +140,10 @@ class AdAnalysisMetricsOut(BaseModel):
     cart_to_order_percent: float = 0
     cpc: float = 0
     drr: float = 0
+    funnel_orders: int = 0
+    advert_attributed_orders: int = 0
+    finance_realized_orders: int = 0
+    payout_realized: float = 0
 
 
 class AdAnalysisTrendOut(BaseModel):
@@ -135,6 +180,10 @@ class AdAnalysisItemOut(BaseModel):
     priority_label: str
     precision: PrecisionKind
     precision_label: str
+    revenue_lineage: Literal["finance", "manual_finance", "funnel", "advert", "missing"] = "missing"
+    orders_lineage: Literal["finance", "manual_finance", "funnel", "advert", "missing"] = "missing"
+    decision_ready: bool = False
+    decision_label: Literal["ready", "preliminary", "blocked"] = "blocked"
     source_lineage: AdAnalysisSourceLineageOut = Field(default_factory=AdAnalysisSourceLineageOut)
     trend: AdAnalysisTrendOut = Field(default_factory=AdAnalysisTrendOut)
     issue_summary: AdAnalysisIssueSummaryOut
@@ -162,6 +211,14 @@ class AdAnalysisUploadUnresolvedRowOut(BaseModel):
     raw_nm_id: Optional[str] = None
     raw_vendor_code: Optional[str] = None
     raw_title: Optional[str] = None
+
+
+class AdAnalysisDataQualityOut(BaseModel):
+    decision_ready: bool = False
+    confidence: AdCostConfidence = "low"
+    partial_sources: List[str] = Field(default_factory=list)
+    blocked_sources: List[str] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
 
 
 class AdAnalysisOverviewOut(BaseModel):
@@ -196,6 +253,7 @@ class AdAnalysisOverviewOut(BaseModel):
     status_counts: Dict[str, int] = Field(default_factory=dict)
     source_statuses: List[AdAnalysisSourceStatusOut] = Field(default_factory=list)
     source_lineage: AdAnalysisSourceLineageOut = Field(default_factory=AdAnalysisSourceLineageOut)
+    data_quality: AdAnalysisDataQualityOut = Field(default_factory=AdAnalysisDataQualityOut)
     alerts: List[AdAnalysisAlertOut] = Field(default_factory=list)
     budget_moves: List[AdAnalysisBudgetMoveOut] = Field(default_factory=list)
     campaigns: List[AdAnalysisCampaignOut] = Field(default_factory=list)
@@ -222,7 +280,7 @@ class AdAnalysisUploadResultOut(BaseModel):
 class AdAnalysisBootstrapStatusOut(BaseModel):
     task_id: Optional[int] = None
     store_id: int
-    status: Literal["idle", "pending", "running", "completed", "failed"] = "idle"
+    status: Literal["idle", "pending", "running", "completed", "completed_partial", "failed"] = "idle"
     progress: int = 0
     step: str = ""
     current_stage: Optional[
@@ -238,7 +296,7 @@ class AdAnalysisBootstrapStatusOut(BaseModel):
         ]
     ] = None
     stage_progress: int = 0
-    source_statuses: Dict[str, SourceMode] = Field(default_factory=dict)
+    source_statuses: List[AdAnalysisSourceStatusOut] = Field(default_factory=list)
     is_partial: bool = False
     failed_source: Optional[Literal["advert", "finance", "funnel", "snapshot", "unknown"]] = None
     ready: bool = False

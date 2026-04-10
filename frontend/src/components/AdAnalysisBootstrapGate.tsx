@@ -43,7 +43,7 @@ export default function AdAnalysisBootstrapGate({ children }: { children: React.
     const handleStatus = (nextStatus: AdAnalysisBootstrapStatus) => {
       if (cancelled) return;
       setStatus(nextStatus);
-      if (nextStatus.status === 'completed') {
+      if (nextStatus.status === 'completed' || nextStatus.status === 'completed_partial') {
         stopPolling();
         setError('');
         setLoading(false);
@@ -99,8 +99,9 @@ export default function AdAnalysisBootstrapGate({ children }: { children: React.
 
   const progress = useMemo(() => {
     if (!status) return 8;
-    if (status.status === 'completed') return 100;
-    return Math.max(8, Math.min(status.progress || 0, 96));
+    if (status.status === 'completed' || status.status === 'completed_partial') return 100;
+    const stageProgress = Number(status.stage_progress || status.progress || 0);
+    return Math.max(8, Math.min(stageProgress, 96));
   }, [status]);
 
   if (!activeStore) {
@@ -113,7 +114,7 @@ export default function AdAnalysisBootstrapGate({ children }: { children: React.
     );
   }
 
-  if (!loading && !error && status?.status === 'completed') {
+  if (!loading && !error && (status?.status === 'completed' || status?.status === 'completed_partial')) {
     return <>{children}</>;
   }
 
