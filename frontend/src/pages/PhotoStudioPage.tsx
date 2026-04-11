@@ -2,6 +2,15 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { useStore } from '../contexts/StoreContext';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import api, { API_ORIGIN } from '../api/client';
+import type {
+  PhotoChatAsset,
+  PhotoChatClearMode,
+  PhotoChatHistoryResponse,
+  PhotoChatSsePayload,
+  PhotoChatThreadContext,
+  PhotoChatUploadResponse,
+} from '../features/photo-studio/contract';
+import { createPhotoChatSseDecoder } from '../features/photo-studio/contract';
 import {
   ChevronLeft,
   Send,
@@ -57,17 +66,21 @@ interface PhotoMedia {
   type: 'image' | 'video';
   prompt?: string;
   localFile?: File;
+  source?: string;
+  caption?: string;
 }
 
 interface ChatMessage {
   id: string;
   dbId?: number;
   role: 'user' | 'assistant';
-  type: 'welcome' | 'text' | 'image' | 'action-progress' | 'action-complete' | 'action-error';
+  type: 'text' | 'image' | 'question' | 'action-progress' | 'action-complete' | 'action-error';
   content: string;
   timestamp: Date;
   photos?: PhotoMedia[];
   isLoading?: boolean;
+  requestId?: string;
+  threadId?: number;
 }
 
 interface ProductItem {
@@ -93,6 +106,73 @@ type QuickActionId = 'change-background' | 'change-pose' | 'put-on-model' | 'enh
 
 type GeneratorTab = 'own-model' | 'new-model' | 'custom-prompt' | 'scenes' | 'poses' | 'video';
 
+type AppLocale = 'ru' | 'uz' | 'en';
+
+interface StreamRequestDraft {
+  text: string;
+  photos: PhotoMedia[];
+  quickAction?: Record<string, any>;
+}
+
+interface PreparedStreamRequest extends StreamRequestDraft {
+  payload: {
+    message: string;
+    asset_ids?: number[];
+    quick_action?: Record<string, any>;
+    thread_id?: number;
+    request_id: string;
+    locale: string;
+  };
+}
+
+interface UiText {
+  studioTitle: string;
+  newChat: string;
+  clearMessages: string;
+  select: string;
+  cancel: string;
+  chooseAll: string;
+  deleteSelected: string;
+  deleteAll: string;
+  activeThread: string;
+  activeThreadShort: string;
+  activeImages: string;
+  noActiveImages: string;
+  activeHint: string;
+  pendingQuestion: string;
+  localeLabel: string;
+  relatedMedia: string;
+  persistentLibraryHint: string;
+  emptyMedia: string;
+  emptyMediaSub: string;
+  retry: string;
+  dismiss: string;
+  sendPlaceholder: string;
+  sendPlaceholderWithAttachments: string;
+  sendPlaceholderWithActiveContext: string;
+  loadingHistory: string;
+  emptyConversationTitle: string;
+  emptyConversationBody: string;
+  generationStarted: string;
+  imagesStarted: string;
+  imageStarted: string;
+  generationComplete: string;
+  genericError: string;
+  retryBannerTitle: string;
+  retryBannerBody: string;
+  limitReachedTitle: string;
+  limitReachedBody: string;
+  questionBadge: string;
+  activeBadge: string;
+  lastGeneratedBadge: string;
+  clearSuccess: string;
+  newChatSuccess: string;
+  restoreHistoryError: string;
+  unsupportedAssetError: string;
+  libraryTabImages: string;
+  libraryTabVideos: string;
+}
+
 const GEN_TABS: { id: GeneratorTab; label: string; icon: React.ElementType }[] = [
   { id: 'own-model', label: 'Своя фотомодель', icon: User },
   { id: 'new-model', label: 'Новая фотомодель', icon: Shirt },
@@ -110,14 +190,6 @@ interface QuickMenuAction {
 }
 
 const MEDIA_BASE = API_ORIGIN;
-
-const WELCOME_MSG: ChatMessage = {
-  id: 'welcome',
-  role: 'assistant',
-  type: 'welcome',
-  content: 'Привет! 👋 Я помогу обработать ваши фото. Выберите товар слева или загрузите своё фото.',
-  timestamp: new Date(),
-};
 
 const QUICK_PRESETS = [
   { icon: Palette, label: 'Изменить фон', prompt: 'Измени фон на белый студийный' },
@@ -217,10 +289,242 @@ function fileNameFromUrl(url: string) {
   return parts[parts.length - 1] || 'image.jpg';
 }
 
+function normalizeUiLocale(raw?: string | null): AppLocale {
+  const value = String(raw || '').trim().toLowerCase();
+  if (value.startsWith('uz')) return 'uz';
+  if (value.startsWith('en')) return 'en';
+  return 'ru';
+}
+
+function detectBrowserLocale(): string {
+  if (typeof navigator === 'undefined') return 'ru';
+  return navigator.languages?.[0] || navigator.language || 'ru';
+}
+
+function getUiText(locale: AppLocale): UiText {
+  if (locale === 'uz') {
+    return {
+      studioTitle: 'AI Foto studiya',
+      newChat: 'Yangi chat',
+      clearMessages: 'Xabarlarni tozalash',
+      select: 'Tanlash',
+      cancel: 'Bekor qilish',
+      chooseAll: 'Barchasini tanlash',
+      deleteSelected: 'Tanlanganlarni o‘chirish',
+      deleteAll: 'Barchasini o‘chirish',
+      activeThread: 'Faol chat',
+      activeThreadShort: 'Chat',
+      activeImages: 'Faol ishchi rasmlar',
+      noActiveImages: 'Bu chat uchun faol rasm tanlanmagan',
+      activeHint: 'Yangi tahrirlar ushbu faol rasm(lar)ga qo‘llanadi.',
+      pendingQuestion: 'Aniqlashtirish savoli',
+      localeLabel: 'Til',
+      relatedMedia: 'Media kutubxonasi',
+      persistentLibraryHint: 'Bu doimiy kutubxona. Chatni tozalash media fayllarni o‘chirmaydi.',
+      emptyMedia: 'Media hali yo‘q',
+      emptyMediaSub: 'Rasm yuklang yoki generatsiyani ishga tushiring',
+      retry: 'Qayta urinish',
+      dismiss: 'Yopish',
+      sendPlaceholder: 'Nima qilmoqchi ekaningizni yozing...',
+      sendPlaceholderWithAttachments: 'Rasm bilan nima qilish kerak?',
+      sendPlaceholderWithActiveContext: 'Faol rasmga qanday o‘zgartirish kiritamiz?',
+      loadingHistory: 'Chat yuklanmoqda...',
+      emptyConversationTitle: 'Yangi suhbat',
+      emptyConversationBody: 'Media biriktiring yoki topshiriq yozing. Kontekst chat ichida saqlanadi.',
+      generationStarted: 'Generatsiya boshlandi...',
+      imagesStarted: 'Bir nechta rasm yaratilmoqda...',
+      imageStarted: 'Rasm yaratilmoqda...',
+      generationComplete: 'Tayyor',
+      genericError: 'Ulanishda xato yuz berdi. Qaytadan urinib ko‘ring.',
+      retryBannerTitle: 'So‘rov yakunlanmadi',
+      retryBannerBody: 'Xuddi shu topshiriqni yana yuborishingiz mumkin.',
+      limitReachedTitle: 'Chat limiti tugadi',
+      limitReachedBody: 'Yana yuborish uchun xabarlarni tozalang yoki yangi chat boshlang.',
+      questionBadge: 'Aniqlashtirish',
+      activeBadge: 'Faol',
+      lastGeneratedBadge: 'Oxirgi natija',
+      clearSuccess: 'Chat xabarlari tozalandi',
+      newChatSuccess: 'Yangi chat boshlandi',
+      restoreHistoryError: 'Foto studiya tarixini yuklab bo‘lmadi',
+      unsupportedAssetError: 'Rasmni chatga tayyorlab bo‘lmadi',
+      libraryTabImages: 'Rasmlar',
+      libraryTabVideos: 'Videolar',
+    };
+  }
+
+  if (locale === 'en') {
+    return {
+      studioTitle: 'AI Photo Studio',
+      newChat: 'New chat',
+      clearMessages: 'Clear messages',
+      select: 'Select',
+      cancel: 'Cancel',
+      chooseAll: 'Select all',
+      deleteSelected: 'Delete selected',
+      deleteAll: 'Delete all',
+      activeThread: 'Active thread',
+      activeThreadShort: 'Thread',
+      activeImages: 'Active working images',
+      noActiveImages: 'No active image is selected for this thread',
+      activeHint: 'Follow-up edits will target these active images.',
+      pendingQuestion: 'Clarification needed',
+      localeLabel: 'Locale',
+      relatedMedia: 'Media library',
+      persistentLibraryHint: 'This library is persistent. Clearing chat does not delete media assets.',
+      emptyMedia: 'No media yet',
+      emptyMediaSub: 'Upload an image or start a generation',
+      retry: 'Retry',
+      dismiss: 'Dismiss',
+      sendPlaceholder: 'Describe what you want to do...',
+      sendPlaceholderWithAttachments: 'What should I do with these images?',
+      sendPlaceholderWithActiveContext: 'What should I change in the active image?',
+      loadingHistory: 'Loading chat...',
+      emptyConversationTitle: 'Start a new conversation',
+      emptyConversationBody: 'Attach media or type a request. Thread context will carry follow-up edits.',
+      generationStarted: 'Starting generation...',
+      imagesStarted: 'Generating images...',
+      imageStarted: 'Generating image...',
+      generationComplete: 'Done',
+      genericError: 'Connection error. Please try again.',
+      retryBannerTitle: 'The request did not finish',
+      retryBannerBody: 'You can retry the same task.',
+      limitReachedTitle: 'Chat limit reached',
+      limitReachedBody: 'Clear messages or start a new chat to continue.',
+      questionBadge: 'Clarification',
+      activeBadge: 'Active',
+      lastGeneratedBadge: 'Latest result',
+      clearSuccess: 'Chat messages cleared',
+      newChatSuccess: 'Started a new chat',
+      restoreHistoryError: 'Could not restore Photo Studio history',
+      unsupportedAssetError: 'Could not prepare an image for chat',
+      libraryTabImages: 'Images',
+      libraryTabVideos: 'Videos',
+    };
+  }
+
+  return {
+    studioTitle: 'AI Фотостудия',
+    newChat: 'Новый чат',
+    clearMessages: 'Очистить сообщения',
+    select: 'Выбрать',
+    cancel: 'Отмена',
+    chooseAll: 'Выбрать все',
+    deleteSelected: 'Удалить выбранные',
+    deleteAll: 'Удалить все',
+    activeThread: 'Активный чат',
+    activeThreadShort: 'Чат',
+    activeImages: 'Активные рабочие изображения',
+    noActiveImages: 'Для этого чата пока нет активного изображения',
+    activeHint: 'Последующие правки будут применяться к активному изображению выше.',
+    pendingQuestion: 'Уточнение от ассистента',
+    localeLabel: 'Язык',
+    relatedMedia: 'Медиатека',
+    persistentLibraryHint: 'Это постоянная библиотека. Очистка чата не удаляет медиафайлы.',
+    emptyMedia: 'Пока нет медиа',
+    emptyMediaSub: 'Загрузите фото или запустите генерацию',
+    retry: 'Повторить',
+    dismiss: 'Закрыть',
+    sendPlaceholder: 'Напишите, что хотите сделать...',
+    sendPlaceholderWithAttachments: 'Что сделать с фото?',
+    sendPlaceholderWithActiveContext: 'Что изменить в активном изображении?',
+    loadingHistory: 'Загружаю чат...',
+    emptyConversationTitle: 'Новый диалог',
+    emptyConversationBody: 'Прикрепите медиа или напишите задачу. Контекст будет храниться внутри чата.',
+    generationStarted: 'Запускаю генерацию...',
+    imagesStarted: 'Генерирую изображения...',
+    imageStarted: 'Генерирую изображение...',
+    generationComplete: 'Готово',
+    genericError: 'Ошибка соединения. Попробуйте ещё раз.',
+    retryBannerTitle: 'Запрос не завершился',
+    retryBannerBody: 'Можно отправить ту же задачу повторно.',
+    limitReachedTitle: 'Достигнут лимит чата',
+    limitReachedBody: 'Очистите сообщения или начните новый чат, чтобы продолжить.',
+    questionBadge: 'Уточнение',
+    activeBadge: 'Активно',
+    lastGeneratedBadge: 'Последний результат',
+    clearSuccess: 'Сообщения чата очищены',
+    newChatSuccess: 'Новый чат создан',
+    restoreHistoryError: 'Не удалось восстановить историю фотостудии',
+    unsupportedAssetError: 'Не удалось подготовить изображение для чата',
+    libraryTabImages: 'Фото',
+    libraryTabVideos: 'Видео',
+  };
+}
+
+function normalizeThreadContext(context?: Partial<PhotoChatThreadContext> | null): PhotoChatThreadContext {
+  const workingIds = Array.isArray(context?.working_asset_ids)
+    ? context?.working_asset_ids.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0)
+    : [];
+
+  return {
+    last_generated_asset_id: context?.last_generated_asset_id ? Number(context.last_generated_asset_id) : null,
+    working_asset_ids: workingIds,
+    pending_question: context?.pending_question ? String(context.pending_question) : null,
+    last_action: context?.last_action ?? null,
+    locale: context?.locale ? String(context.locale) : null,
+  };
+}
+
+function assetToPhotoMedia(asset: PhotoChatAsset): PhotoMedia | null {
+  const assetId = Number(asset.asset_id || 0);
+  const url = toAbsoluteMediaUrl(asset.file_url || '');
+  if (!assetId || !url) return null;
+  return {
+    id: `asset-${assetId}`,
+    assetId,
+    url,
+    fileName: asset.file_name || fileNameFromUrl(url),
+    type: /\.(mp4|mov|webm)$/i.test(asset.file_url || asset.file_name || '') || asset.kind === 'video' ? 'video' : 'image',
+    prompt: asset.prompt || asset.caption || '',
+    source: asset.source,
+    caption: asset.caption || '',
+  };
+}
+
+function buildAssetMap(assets: PhotoChatAsset[]): Map<number, PhotoMedia> {
+  const map = new Map<number, PhotoMedia>();
+  for (const asset of assets) {
+    const media = assetToPhotoMedia(asset);
+    if (media?.assetId) {
+      map.set(media.assetId, media);
+    }
+  }
+  return map;
+}
+
+function historyMessageToChatMessage(record: PhotoChatHistoryResponse['messages'][number], assetMap: Map<number, PhotoMedia>): ChatMessage {
+  const role: 'user' | 'assistant' = record.role === 'model' || record.role === 'assistant' ? 'assistant' : 'user';
+  const metaAssetIds = Array.isArray(record.meta?.asset_ids)
+    ? (record.meta?.asset_ids as unknown[]).map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0)
+    : [];
+  const photos = metaAssetIds.map((assetId) => assetMap.get(assetId)).filter(Boolean) as PhotoMedia[];
+  const msgType: ChatMessage['type'] = record.msg_type === 'image'
+    ? 'image'
+    : role === 'assistant' && record.meta && typeof record.meta === 'object' && (record.meta as Record<string, unknown>).question
+      ? 'question'
+      : 'text';
+
+  return {
+    id: `db-${record.id}`,
+    dbId: Number(record.id),
+    role,
+    type: msgType,
+    content: record.content || '',
+    timestamp: record.created_at ? new Date(record.created_at) : new Date(),
+    photos: photos.length > 0 ? photos : undefined,
+    requestId: record.request_id || undefined,
+    threadId: record.thread_id || undefined,
+  };
+}
+
 export default function PhotoStudioPage() {
   const { activeStore, loadStores } = useStore();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
+  const browserLocale = useMemo(() => detectBrowserLocale(), []);
+  const [threadContext, setThreadContext] = useState<PhotoChatThreadContext>(() => normalizeThreadContext());
+  const locale = normalizeUiLocale(threadContext.locale || browserLocale);
+  const t = useMemo(() => getUiText(locale), [locale]);
   const cardNmId = searchParams.get('nmId');
   const cardIdParam = searchParams.get('cardId');
   const returnTab = searchParams.get('returnTab');
@@ -233,9 +537,10 @@ export default function PhotoStudioPage() {
       ? (requestedGenTab as GeneratorTab)
       : 'own-model';
 
-  const [messages, setMessages] = useState<ChatMessage[]>([WELCOME_MSG]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(true);
   const [mode, setMode] = useState<'chat' | 'generator'>(initialMode);
   const [quickOpen, setQuickOpen] = useState(false);
   const [quickActive, setQuickActive] = useState<QuickActionId>('change-background');
@@ -247,7 +552,14 @@ export default function PhotoStudioPage() {
   const [galleryUploading, setGalleryUploading] = useState(false);
   const [instructionsOpen, setInstructionsOpen] = useState(false);
   const [attachedPhotos, setAttachedPhotos] = useState<PhotoMedia[]>([]);
-  const [generatedPhotos, setGeneratedPhotos] = useState<PhotoMedia[]>([]);
+  const [libraryMedia, setLibraryMedia] = useState<PhotoMedia[]>([]);
+  const [threadId, setThreadId] = useState<number | null>(null);
+  const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
+  const [sessionKey, setSessionKey] = useState<string | null>(null);
+  const [messageCount, setMessageCount] = useState(0);
+  const [messageLimit, setMessageLimit] = useState<number | null>(null);
+  const [isThreadLocked, setIsThreadLocked] = useState(false);
+  const [streamError, setStreamError] = useState<{ title: string; message: string; retryable: boolean } | null>(null);
 
   const [products, setProducts] = useState<ProductItem[]>([]);
   const [productsLoading, setProductsLoading] = useState(false);
@@ -311,6 +623,7 @@ export default function PhotoStudioPage() {
   const quickDropdownRef = useRef<HTMLDivElement>(null);
   const dragDepth = useRef(0);
   const [isDrag, setIsDrag] = useState(false);
+  const lastStreamDraftRef = useRef<PreparedStreamRequest | null>(null);
 
   useEffect(() => {
     if (!activeStore) {
@@ -511,70 +824,53 @@ export default function PhotoStudioPage() {
     void loadGalleryAssets(galleryType);
   }, [samplesOpen, galleryType]);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const data = await api.getPhotoChatHistory();
-
-        const assets: any[] = data.assets || [];
-        const rawMsgs: any[] = data.messages || [];
-
-        const assetMap = new Map<number, PhotoMedia>();
-        for (const a of assets) {
-          const aid = Number(a.asset_id);
-          if (!aid) continue;
-          const url = toAbsoluteMediaUrl(a.file_url || a.fileUrl || '');
-          if (!url) continue;
-          assetMap.set(aid, {
-            id: `asset-${aid}`,
-            assetId: aid,
-            url,
-            fileName: a.file_name,
-            type: /\.(mp4|mov|webm)/i.test(url) ? 'video' : 'image',
-            prompt: a.prompt || a.caption || '',
-          });
-        }
-
-        const mapped: ChatMessage[] = rawMsgs.map((m: any) => {
-          const dbId = Number(m.id);
-          const role: 'user' | 'assistant' = (m.role === 'model' || m.role === 'assistant') ? 'assistant' : 'user';
-          const aids: number[] = (m.meta?.asset_ids || []).map(Number).filter(Boolean);
-          const photos = aids.map((id) => assetMap.get(id)).filter(Boolean) as PhotoMedia[];
-
-          return {
-            id: `db-${dbId}`,
-            dbId,
-            role,
-            type: m.msg_type === 'image' ? 'image' : 'text',
-            content: m.content || '',
-            timestamp: m.created_at ? new Date(m.created_at) : new Date(),
-            photos: photos.length ? photos : undefined,
-          };
-        });
-
-        const genPhotos = assets
-          .filter((a: any) => a.source === 'generated')
-          .map((a: any) => ({
-            id: `asset-${a.asset_id}`,
-            assetId: a.asset_id,
-            url: toAbsoluteMediaUrl(a.file_url),
-            fileName: a.file_name,
-            type: 'image' as const,
-            prompt: a.prompt || a.caption || '',
-          }))
-          .filter((p: PhotoMedia) => !!p.url);
-
-        setGeneratedPhotos(genPhotos);
-
-        if (mapped.length > 0) {
-          setMessages([WELCOME_MSG, ...mapped]);
-        }
-      } catch (e) {
-        console.warn('Failed to load chat history', e);
-        toast.error('Не удалось восстановить историю фотостудии');
-      }
-    })();
+  const upsertLibraryMedia = useCallback((media: PhotoMedia) => {
+    setLibraryMedia((prev) => {
+      const next = prev.filter((item) => {
+        if (media.assetId && item.assetId) return item.assetId !== media.assetId;
+        return item.id !== media.id;
+      });
+      return [media, ...next];
+    });
   }, []);
+
+  const hydrateHistory = useCallback((data: PhotoChatHistoryResponse, options?: { preserveLibraryIfEmpty?: boolean }) => {
+    const assets = Array.isArray(data.assets) ? data.assets : [];
+    const library = assets.map(assetToPhotoMedia).filter(Boolean) as PhotoMedia[];
+    const assetMap = buildAssetMap(assets);
+    const nextMessages = (Array.isArray(data.messages) ? data.messages : []).map((message) => historyMessageToChatMessage(message, assetMap));
+
+    setMessages(nextMessages);
+    setThreadId(Number(data.thread_id || 0) || null);
+    setActiveThreadId(Number(data.active_thread_id || 0) || null);
+    setSessionKey(data.session_key || null);
+    setThreadContext(normalizeThreadContext(data.context_state));
+    setMessageCount(Number(data.message_count || 0));
+    setMessageLimit(data.limit ?? null);
+    setIsThreadLocked(Boolean(data.locked));
+    setStreamError(null);
+
+    if (library.length > 0 || !options?.preserveLibraryIfEmpty) {
+      setLibraryMedia(library);
+    }
+  }, []);
+
+  const loadChatHistory = useCallback(async (requestedThreadId?: number) => {
+    setIsHistoryLoading(true);
+    try {
+      const data = await api.getPhotoChatHistory(requestedThreadId);
+      hydrateHistory(data);
+    } catch (e) {
+      console.warn('Failed to load chat history', e);
+      toast.error(t.restoreHistoryError);
+    } finally {
+      setIsHistoryLoading(false);
+    }
+  }, [hydrateHistory, t.restoreHistoryError]);
+
+  useEffect(() => {
+    void loadChatHistory();
+  }, [loadChatHistory]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -623,215 +919,307 @@ export default function PhotoStudioPage() {
     });
   };
 
-  const uploadFile = async (file: File): Promise<{ assetId?: number; url?: string }> => {
+  const uploadFile = async (file: File): Promise<PhotoChatUploadResponse> => {
     const data = await api.uploadPhotoChatAsset(file);
-    return { assetId: data.asset_id || data.id, url: toAbsoluteMediaUrl(data.file_url || data.url) };
+    const media: PhotoMedia = {
+      id: `asset-${data.asset_id}`,
+      assetId: data.asset_id,
+      url: toAbsoluteMediaUrl(data.file_url),
+      fileName: data.file_name,
+      type: /\.(mp4|mov|webm)$/i.test(data.file_url || data.file_name || '') ? 'video' : 'image',
+      caption: data.caption || '',
+    };
+    upsertLibraryMedia(media);
+    return data;
   };
 
-  const importUrlAsAsset = async (url: string): Promise<{ assetId?: number; url?: string }> => {
+  const importUrlAsAsset = async (url: string): Promise<PhotoChatUploadResponse> => {
     const data = await api.importPhotoChatAsset(url);
-    return { assetId: data.asset_id || data.id, url: toAbsoluteMediaUrl(data.file_url || data.url) };
+    const media: PhotoMedia = {
+      id: `asset-${data.asset_id}`,
+      assetId: data.asset_id,
+      url: toAbsoluteMediaUrl(data.file_url),
+      fileName: data.file_name,
+      type: /\.(mp4|mov|webm)$/i.test(data.file_url || data.file_name || '') ? 'video' : 'image',
+      caption: data.caption || '',
+      source: 'import',
+    };
+    upsertLibraryMedia(media);
+    return data;
   };
 
-  const sendMessage = async ({
-    text,
-    photos,
-    quickAction,
-  }: {
-    text: string;
-    photos: PhotoMedia[];
-    quickAction?: Record<string, any>;
-  }) => {
-    const normalizedText = (text || '').trim();
-    if (!normalizedText && photos.length === 0 && !quickAction) return;
-    if (isStreaming) return;
-
-    setIsStreaming(true);
-    setInputText('');
-    setAttachedPhotos([]);
-
-    const userMsg: ChatMessage = {
-      id: uid(),
-      role: 'user',
-      type: photos.length > 0 && !normalizedText ? 'image' : 'text',
-      content: normalizedText,
-      timestamp: new Date(),
-      photos: photos.length > 0 ? photos : undefined,
-    };
-    setMessages((prev) => [...prev, userMsg]);
-
+  const resolveAssetIds = useCallback(async (photos: PhotoMedia[]): Promise<number[]> => {
     const assetIds: number[] = [];
-    const fallbackPhotoUrls: string[] = [];
-    const addFallbackUrl = (raw?: string) => {
-      const abs = toAbsoluteMediaUrl(raw || '');
-      if (!abs || abs.startsWith('blob:')) return;
-      if (!fallbackPhotoUrls.includes(abs)) fallbackPhotoUrls.push(abs);
-    };
 
-    for (const p of photos) {
-      if (p.localFile) {
-        try {
-          const result = await uploadFile(p.localFile);
-          if (result.assetId) assetIds.push(result.assetId);
-          addFallbackUrl(result.url);
-        } catch (e) {
-          console.warn('Upload failed:', e);
-        }
-      } else if (p.assetId) {
-        assetIds.push(p.assetId);
-        addFallbackUrl(p.url);
-      } else if (p.url) {
-        try {
-          const imported = await importUrlAsAsset(p.url);
-          if (imported.assetId) assetIds.push(imported.assetId);
-          addFallbackUrl(imported.url || p.url);
-        } catch (e) {
-          console.warn('Import failed:', e);
-          addFallbackUrl(p.url);
-        }
+    for (const photo of photos) {
+      if (photo.assetId) {
+        assetIds.push(photo.assetId);
+        continue;
+      }
+
+      if (photo.localFile) {
+        const uploaded = await uploadFile(photo.localFile);
+        assetIds.push(uploaded.asset_id);
+        continue;
+      }
+
+      if (photo.url) {
+        const imported = await importUrlAsAsset(photo.url);
+        assetIds.push(imported.asset_id);
       }
     }
 
-    try {
-      const requestMessage = normalizedText || (quickAction ? 'Быстрая команда' : '');
-      const body: any = { message: requestMessage };
-      if (assetIds.length > 0) body.asset_ids = assetIds;
-      if (fallbackPhotoUrls.length > 0) body.photo_urls = fallbackPhotoUrls;
-      if (quickAction) body.quick_action = quickAction;
+    return Array.from(new Set(assetIds.filter((assetId) => Number.isFinite(assetId) && assetId > 0)));
+  }, [upsertLibraryMedia]);
 
-      const res = await api.streamPhotoChat(body);
+  const applyStreamPayload = useCallback((
+    payload: PhotoChatSsePayload,
+    state: {
+      userMessageId: string;
+      botMessageId: string;
+      botAdded: boolean;
+      botContent: string;
+      botPhotos: PhotoMedia[];
+    },
+  ) => {
+    const syncThread = (nextThreadId: number) => {
+      if (Number.isFinite(nextThreadId) && nextThreadId > 0) {
+        setThreadId(nextThreadId);
+        setActiveThreadId(nextThreadId);
+      }
+    };
 
-      const reader = res.body?.getReader();
-      const dec = new TextDecoder();
-      let botContent = '';
-      let botPhotos: PhotoMedia[] = [];
-      let botMsgId = uid();
-      let botAdded = false;
+    const upsertBot = (type: ChatMessage['type'], loading = false) => {
+      if (!state.botAdded) {
+        state.botAdded = true;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: state.botMessageId,
+            role: 'assistant',
+            type,
+            content: state.botContent,
+            timestamp: new Date(),
+            photos: state.botPhotos.length > 0 ? [...state.botPhotos] : undefined,
+            isLoading: loading,
+            requestId: payload.request_id,
+            threadId: payload.thread_id,
+          },
+        ]);
+        return;
+      }
 
-      const addOrUpdateBot = (type: ChatMessage['type'] = 'text', loading = false) => {
-        if (!botAdded) {
-          botAdded = true;
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: botMsgId,
-              role: 'assistant',
-              type,
-              content: botContent,
-              timestamp: new Date(),
-              photos: botPhotos.length > 0 ? [...botPhotos] : undefined,
-              isLoading: loading,
-            },
-          ]);
-        } else {
-          setMessages((prev) => prev.map((m) =>
-            m.id === botMsgId
-              ? { ...m, type, content: botContent, photos: botPhotos.length > 0 ? [...botPhotos] : undefined, isLoading: loading }
-              : m,
-          ));
-        }
-      };
-
-      if (reader) {
-        let buf = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += dec.decode(value, { stream: true });
-          const lines = buf.split('\n');
-          buf = lines.pop() || '';
-
-          for (const ln of lines) {
-            if (!ln.startsWith('data: ')) continue;
-            try {
-              const d = JSON.parse(ln.slice(6));
-
-              if (d.type === 'ack') {
-                if (d.user_message_id) {
-                  setMessages((prev) => prev.map((m) =>
-                    m.id === userMsg.id ? { ...m, dbId: d.user_message_id } : m,
-                  ));
-                }
-              }
-              else if (d.type === 'chat' || d.type === 'question' || d.type === 'response') {
-                botContent = d.content || d.message || '';
-                addOrUpdateBot('text');
-              }
-              else if (d.type === 'text' || d.type === 'chunk') {
-                botContent += d.content || d.text || '';
-                addOrUpdateBot('text');
-              }
-              else if (d.type === 'error' || d.type === 'limit_reached') {
-                botContent = d.message || d.content || 'Произошла ошибка';
-                addOrUpdateBot('action-error');
-              }
-              else if (d.type === 'images_start') {
-                botContent = `Генерация ${d.total || 1} изображений...`;
-                addOrUpdateBot('action-progress', true);
-              }
-              else if (d.type === 'image_started') {
-                botContent = `Генерация изображения ${d.index}/${d.total}...`;
-                addOrUpdateBot('action-progress', true);
-              }
-              else if (d.type === 'generation_start') {
-                botContent = d.prompt
-                  ? `Выполняю: ${d.prompt}...`
-                  : 'Запускаю генерацию...';
-                addOrUpdateBot('action-progress', true);
-              }
-              else if (d.type === 'generation_complete') {
-                const newPhoto: PhotoMedia = {
-                  id: `gen-${d.asset_id || Date.now()}`,
-                  assetId: d.asset_id,
-                  url: toAbsoluteMediaUrl(d.image_url || d.url),
-                  fileName: d.file_name,
-                  type: 'image',
-                  prompt: d.prompt,
-                };
-                botPhotos.push(newPhoto);
-                setGeneratedPhotos((prev) => [newPhoto, ...prev]);
-                const total = Number(d.total || 1);
-                const index = Number(d.index || total);
-                const hasMore = index < total;
-                botContent = hasMore
-                  ? `Генерация ${index}/${total}...`
-                  : (d.prompt ? `Готово: ${d.prompt}` : 'Готово!');
-                addOrUpdateBot('action-complete', hasMore);
-              }
-              else if (d.type === 'media' || d.type === 'image') {
-                const u = toAbsoluteMediaUrl(d.url || d.image_url);
-                if (!u) continue;
-                botPhotos.push({
-                  id: uid(),
-                  assetId: Number(d.asset_id || d.assetId || 0) || undefined,
-                  url: u,
-                  type: 'image',
-                  fileName: d.filename,
-                });
-                addOrUpdateBot('text');
-              }
-            } catch {
-              // ignore broken chunk
-            }
+      setMessages((prev) => prev.map((message) => (
+        message.id === state.botMessageId
+          ? {
+            ...message,
+            type,
+            content: state.botContent,
+            photos: state.botPhotos.length > 0 ? [...state.botPhotos] : undefined,
+            isLoading: loading,
+            requestId: payload.request_id,
+            threadId: payload.thread_id,
           }
-        }
-      }
+          : message
+      )));
+    };
 
-      if (!botAdded) {
-        botContent = 'Готово.';
-        addOrUpdateBot('text');
+    syncThread(payload.thread_id);
+
+    switch (payload.type) {
+      case 'ack':
+        if (payload.user_message_id) {
+          setMessages((prev) => prev.map((message) => (
+            message.id === state.userMessageId
+              ? { ...message, dbId: Number(payload.user_message_id) }
+              : message
+          )));
+        }
+        setMessageCount((prev) => prev + 1);
+        break;
+      case 'chat':
+        state.botContent = payload.content || payload.message || '';
+        setThreadContext((prev) => ({ ...prev, pending_question: null }));
+        upsertBot('text');
+        break;
+      case 'question':
+        state.botContent = payload.content || payload.message || '';
+        setThreadContext((prev) => ({ ...prev, pending_question: state.botContent || null }));
+        upsertBot('question');
+        break;
+      case 'generation_start':
+        state.botContent = payload.prompt || t.generationStarted;
+        upsertBot('action-progress', true);
+        break;
+      case 'images_start':
+        state.botContent = payload.total && payload.total > 1 ? `${t.imagesStarted} ${payload.total}` : t.imagesStarted;
+        upsertBot('action-progress', true);
+        break;
+      case 'image_started':
+        state.botContent = payload.index && payload.total
+          ? `${t.imageStarted} ${payload.index}/${payload.total}`
+          : t.imageStarted;
+        upsertBot('action-progress', true);
+        break;
+      case 'generation_complete': {
+        const url = toAbsoluteMediaUrl(payload.image_url || '');
+        if (url) {
+          const media: PhotoMedia = {
+            id: payload.asset_id ? `asset-${payload.asset_id}` : uid(),
+            assetId: payload.asset_id || undefined,
+            url,
+            fileName: payload.file_name || fileNameFromUrl(url),
+            type: 'image',
+            prompt: payload.prompt || '',
+            source: 'generated',
+          };
+          state.botPhotos = [
+            ...state.botPhotos.filter((photo) => {
+              if (media.assetId && photo.assetId) return photo.assetId !== media.assetId;
+              return photo.url !== media.url;
+            }),
+            media,
+          ];
+          upsertLibraryMedia(media);
+        }
+        state.botContent = payload.prompt || t.generationComplete;
+        {
+          const total = Number(payload.total || 1);
+          const index = Number(payload.index || total);
+          upsertBot('action-complete', total > 1 && index < total);
+        }
+        break;
       }
+      case 'context_state':
+        setThreadContext(normalizeThreadContext(payload.context_state));
+        break;
+      case 'limit_reached': {
+        const message = payload.message || payload.content || t.limitReachedBody;
+        setIsThreadLocked(true);
+        setStreamError({ title: t.limitReachedTitle, message, retryable: false });
+        state.botContent = message;
+        upsertBot('action-error');
+        break;
+      }
+      case 'error': {
+        const message = payload.message || payload.error?.message || payload.content || t.genericError;
+        setStreamError({
+          title: t.retryBannerTitle,
+          message,
+          retryable: payload.retryable !== false,
+        });
+        state.botContent = message;
+        upsertBot('action-error');
+        break;
+      }
+    }
+  }, [t, upsertLibraryMedia]);
+
+  const runPreparedStream = useCallback(async (prepared: PreparedStreamRequest, userMessageId: string) => {
+    const res = await api.streamPhotoChat(prepared.payload);
+    const reader = res.body?.getReader();
+    if (!reader) {
+      throw new Error(t.genericError);
+    }
+
+    const decoder = createPhotoChatSseDecoder();
+    const textDecoder = new TextDecoder();
+    const state = {
+      userMessageId,
+      botMessageId: uid(),
+      botAdded: false,
+      botContent: '',
+      botPhotos: [] as PhotoMedia[],
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = textDecoder.decode(value, { stream: true });
+      for (const payload of decoder.push(chunk)) {
+        applyStreamPayload(payload, state);
+      }
+    }
+
+    for (const payload of decoder.flush()) {
+      applyStreamPayload(payload, state);
+    }
+
+    if (state.botAdded) {
+      setMessages((prev) => prev.map((message) => (
+        message.id === state.botMessageId
+          ? { ...message, isLoading: false }
+          : message
+      )));
+    }
+  }, [applyStreamPayload, t.genericError]);
+
+  const prepareStreamRequest = useCallback(async (draft: StreamRequestDraft): Promise<PreparedStreamRequest> => {
+    const normalizedText = draft.text.trim();
+    const assetIds = await resolveAssetIds(draft.photos);
+    const requestId = crypto.randomUUID?.() || `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return {
+      ...draft,
+      payload: {
+        message: normalizedText || '',
+        ...(assetIds.length > 0 ? { asset_ids: assetIds } : {}),
+        ...(draft.quickAction ? { quick_action: draft.quickAction } : {}),
+        ...(threadId ? { thread_id: threadId } : {}),
+        request_id: requestId,
+        locale: threadContext.locale || browserLocale,
+      },
+    };
+  }, [browserLocale, resolveAssetIds, threadContext.locale, threadId]);
+
+  const sendMessage = async ({ text, photos, quickAction }: StreamRequestDraft) => {
+    const normalizedText = (text || '').trim();
+    if ((!normalizedText && photos.length === 0 && !quickAction) || isStreaming || isThreadLocked) {
+      return;
+    }
+
+    setIsStreaming(true);
+    setStreamError(null);
+
+    try {
+      const prepared = await prepareStreamRequest({ text: normalizedText, photos, quickAction });
+      lastStreamDraftRef.current = prepared;
+
+      const userMsgId = uid();
+      setInputText('');
+      setAttachedPhotos([]);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: userMsgId,
+          role: 'user',
+          type: photos.length > 0 && !normalizedText ? 'image' : 'text',
+          content: normalizedText,
+          timestamp: new Date(),
+          photos: photos.length > 0 ? photos : undefined,
+          requestId: prepared.payload.request_id,
+          threadId: threadId || undefined,
+        },
+      ]);
+
+      await runPreparedStream(prepared, userMsgId);
     } catch (e) {
+      const message = e instanceof Error ? e.message : t.unsupportedAssetError;
+      setStreamError({
+        title: t.retryBannerTitle,
+        message,
+        retryable: true,
+      });
       setMessages((prev) => [
         ...prev,
         {
           id: uid(),
           role: 'assistant',
           type: 'action-error',
-          content: 'Ошибка соединения. Попробуйте ещё раз.',
+          content: message,
           timestamp: new Date(),
         },
       ]);
+      toast.error(message || t.unsupportedAssetError);
     } finally {
       setIsStreaming(false);
     }
@@ -980,8 +1368,8 @@ export default function PhotoStudioPage() {
   }, [products, productsQuery]);
 
   const canAttachMore = attachedPhotos.length < 3;
-  const historyPhotos = useMemo(() => generatedPhotos.filter((p) => p.type === 'image'), [generatedPhotos]);
-  const historyVideos = useMemo(() => generatedPhotos.filter((p) => p.type === 'video'), [generatedPhotos]);
+  const libraryPhotos = useMemo(() => libraryMedia.filter((p) => p.type === 'image'), [libraryMedia]);
+  const libraryVideos = useMemo(() => libraryMedia.filter((p) => p.type === 'video'), [libraryMedia]);
   const gallerySystemAssets = useMemo(
     () => galleryAssets.filter((a) => a.ownerType === 'system'),
     [galleryAssets],
@@ -994,6 +1382,35 @@ export default function PhotoStudioPage() {
     () => quickMenu.find((x) => x.id === quickActive) || quickMenu[0] || QUICK_MENU[0],
     [quickActive, quickMenu],
   );
+  const libraryAssetMap = useMemo(() => {
+    const map = new Map<number, PhotoMedia>();
+    for (const media of libraryMedia) {
+      if (media.assetId) {
+        map.set(media.assetId, media);
+      }
+    }
+    return map;
+  }, [libraryMedia]);
+  const activeWorkingAssetIds = useMemo(() => {
+    const ids = [...threadContext.working_asset_ids];
+    if (threadContext.last_generated_asset_id && !ids.includes(threadContext.last_generated_asset_id)) {
+      ids.unshift(threadContext.last_generated_asset_id);
+    }
+    return Array.from(new Set(ids.filter((value) => Number.isFinite(value) && value > 0)));
+  }, [threadContext.last_generated_asset_id, threadContext.working_asset_ids]);
+  const activeWorkingMedia = useMemo(
+    () => activeWorkingAssetIds.map((assetId) => libraryAssetMap.get(assetId)).filter(Boolean) as PhotoMedia[],
+    [activeWorkingAssetIds, libraryAssetMap],
+  );
+  const messageUsageLabel = useMemo(() => {
+    if (messageLimit === null || messageLimit <= 0) return null;
+    return `${messageCount}/${messageLimit}`;
+  }, [messageCount, messageLimit]);
+  const chatPlaceholder = attachedPhotos.length > 0
+    ? t.sendPlaceholderWithAttachments
+    : activeWorkingMedia.length > 0
+      ? t.sendPlaceholderWithActiveContext
+      : t.sendPlaceholder;
 
   const handleQuickPick = async (
     action: QuickMenuAction,
@@ -1037,15 +1454,55 @@ export default function PhotoStudioPage() {
     }
   };
 
-  const clearChat = async () => {
+  const clearChat = async (clearMode: PhotoChatClearMode = 'messages') => {
     try {
-      await api.clearPhotoChat();
-      setMessages([WELCOME_MSG]);
-      toast.success('История чата очищена');
+      const data = await api.clearPhotoChat({
+        threadId: threadId || undefined,
+        clearMode,
+      });
+      setThreadId(data.thread_id);
+      setActiveThreadId(data.active_thread_id);
+      setThreadContext(normalizeThreadContext(data.context_state));
+      setMessageCount(data.message_count || 0);
+      setMessageLimit(data.limit ?? null);
+      setIsThreadLocked(Boolean(data.locked));
+      setStreamError(null);
+      if (clearMode !== 'context') {
+        setMessages([]);
+        setSelectedMsgIds(new Set());
+        setChatSelectMode(false);
+      }
+      toast.success(t.clearSuccess);
     } catch (e) {
       console.error('Clear chat error', e);
-      toast.error('Не удалось очистить историю чата');
+      toast.error(t.genericError);
     }
+  };
+
+  const handleNewChat = async () => {
+    if (isStreaming) return;
+    try {
+      const data = await api.createPhotoChatThread();
+      hydrateHistory(data, { preserveLibraryIfEmpty: true });
+      setAttachedPhotos([]);
+      setInputText('');
+      setSelectedMsgIds(new Set());
+      setChatSelectMode(false);
+      toast.success(t.newChatSuccess);
+    } catch (e) {
+      console.error('New chat error', e);
+      toast.error(t.genericError);
+    }
+  };
+
+  const retryLastRequest = async () => {
+    const lastDraft = lastStreamDraftRef.current;
+    if (!lastDraft || isStreaming || isThreadLocked) return;
+    await sendMessage({
+      text: lastDraft.text,
+      photos: lastDraft.photos,
+      quickAction: lastDraft.quickAction,
+    });
   };
 
   const deleteSelectedMessages = async (ids: Set<string>) => {
@@ -1057,20 +1514,16 @@ export default function PhotoStudioPage() {
       .filter((id): id is number => id !== null);
     if (dbIds.length > 0) {
       try {
-        await api.deletePhotoChatMessages(dbIds);
+        await api.deletePhotoChatMessages(dbIds, threadId || undefined);
       } catch (e) {
         console.error('Delete messages error', e);
-        toast.error('Не удалось удалить выбранные сообщения');
+        toast.error(t.genericError);
       }
     }
     setMessages((prev) => prev.filter((m) => !ids.has(m.id)));
     setSelectedMsgIds(new Set());
     setChatSelectMode(false);
-  };
-
-  // Delete photo from history
-  const deleteHistoryPhoto = (photoId: string) => {
-    setGeneratedPhotos((prev) => prev.filter((p) => p.id !== photoId));
+    setMessageCount((prev) => Math.max(0, prev - dbIds.length));
   };
 
   // Add generated photo to gallery (scenes or models)
@@ -1667,28 +2120,45 @@ export default function PhotoStudioPage() {
           <div className="ps-chat-header ps-chat-header--v2">
             <div className="ps-chat-header-left">
               <Sparkles size={18} className="ps-accent" />
-              <h2>AI Фотостудия</h2>
+              <h2>{t.studioTitle}</h2>
               {selectedProduct ? (
                 <span className="ps-chat-product-badge">
                   {selectedProduct.title || `#${selectedProduct.nm_id}`}
                 </span>
               ) : null}
+              {messageUsageLabel ? (
+                <span className={`ps-msg-count ${isThreadLocked ? 'ps-msg-count--limit' : ''}`}>
+                  {messageUsageLabel}
+                </span>
+              ) : null}
             </div>
             <div className="ps-chat-header-center">
               <div className="ps-mode-toggle">
-                <button className={`ps-mode-btn ${mode === 'chat' ? 'active' : ''}`} onClick={() => setMode('chat')}>Чат</button>
-                <button className={`ps-mode-btn ${mode === 'generator' ? 'active' : ''}`} onClick={() => setMode('generator')}>Генератор</button>
+                <button className={`ps-mode-btn ${mode === 'chat' ? 'active' : ''}`} onClick={() => setMode('chat')}>
+                  {locale === 'ru' ? 'Чат' : 'Chat'}
+                </button>
+                <button className={`ps-mode-btn ${mode === 'generator' ? 'active' : ''}`} onClick={() => setMode('generator')}>
+                  {locale === 'uz' ? 'Generator' : locale === 'en' ? 'Generator' : 'Генератор'}
+                </button>
               </div>
             </div>
             <div className="ps-chat-header-right">
+              <button className="ps-choose-btn" onClick={() => void handleNewChat()} disabled={isStreaming}>
+                <Plus size={14} />
+                {t.newChat}
+              </button>
+              <button className="ps-choose-btn" onClick={() => void clearChat('messages')} disabled={isStreaming || (messages.length === 0 && !isThreadLocked)}>
+                <Trash2 size={14} />
+                {t.clearMessages}
+              </button>
               {chatSelectMode ? (
                 <button className="ps-choose-btn ps-choose-btn--cancel" onClick={() => { setChatSelectMode(false); setSelectedMsgIds(new Set()); }}>
-                  Отмена
+                  {t.cancel}
                 </button>
               ) : (
-                <button className="ps-choose-btn" onClick={() => setChatSelectMode(true)}>
+                <button className="ps-choose-btn" onClick={() => setChatSelectMode(true)} disabled={messages.length === 0}>
                   <CheckCircle2 size={14} />
-                  Выбрать
+                  {t.select}
                 </button>
               )}
             </div>
@@ -1696,33 +2166,142 @@ export default function PhotoStudioPage() {
 
           {mode === 'chat' ? (
             <>
+              <div className="ps-thread-panel">
+                <div className="ps-thread-panel-head">
+                  <div>
+                    <div className="ps-thread-label">
+                      {t.activeThread}: {threadId ? `#${threadId}` : '...'}
+                    </div>
+                    {sessionKey ? (
+                      <div className="ps-thread-subtitle">
+                        session {sessionKey}
+                        {activeThreadId && activeThreadId !== threadId ? ` • active #${activeThreadId}` : ''}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="ps-thread-meta">
+                    <span className="ps-thread-chip">
+                      {t.localeLabel}: {(threadContext.locale || browserLocale).split('-')[0]}
+                    </span>
+                    {threadContext.last_action ? (
+                      <span className="ps-thread-chip">
+                        {typeof threadContext.last_action === 'string'
+                          ? threadContext.last_action
+                          : String((threadContext.last_action as Record<string, unknown>)?.type || 'action')}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div className="ps-thread-active-row">
+                  <div className="ps-thread-active-copy">
+                    <span className="ps-thread-active-title">{t.activeImages}</span>
+                    <span className="ps-thread-active-hint">{t.activeHint}</span>
+                  </div>
+                  {activeWorkingMedia.length > 0 ? (
+                    <div className="ps-thread-active-grid">
+                      {activeWorkingMedia.map((photo) => (
+                        <button
+                          key={photo.id}
+                          className="ps-thread-active-card"
+                          onClick={() => setPreviewPhoto(photo)}
+                          title={photo.prompt || photo.fileName || ''}
+                        >
+                          <img src={photo.url} alt="" crossOrigin="anonymous" />
+                          <span className="ps-thread-active-badge">{t.activeBadge}</span>
+                          {threadContext.last_generated_asset_id && photo.assetId === threadContext.last_generated_asset_id ? (
+                            <span className="ps-thread-active-badge ps-thread-active-badge--accent">
+                              {t.lastGeneratedBadge}
+                            </span>
+                          ) : null}
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="ps-thread-empty">{t.noActiveImages}</div>
+                  )}
+                </div>
+
+                {threadContext.pending_question ? (
+                  <div className="ps-thread-question">
+                    <HelpCircle size={14} />
+                    <span>{t.pendingQuestion}: {threadContext.pending_question}</span>
+                  </div>
+                ) : null}
+              </div>
+
+              {streamError ? (
+                <div className={`ps-stream-banner ${isThreadLocked ? 'ps-stream-banner--limit' : ''}`}>
+                  <div className="ps-stream-banner-copy">
+                    <strong>{streamError.title}</strong>
+                    <span>{streamError.message}</span>
+                  </div>
+                  <div className="ps-stream-banner-actions">
+                    {streamError.retryable && !isThreadLocked ? (
+                      <button className="ps-stream-banner-btn" onClick={() => void retryLastRequest()} disabled={isStreaming}>
+                        {t.retry}
+                      </button>
+                    ) : null}
+                    {isThreadLocked ? (
+                      <>
+                        <button className="ps-stream-banner-btn" onClick={() => void clearChat('messages')} disabled={isStreaming}>
+                          {t.clearMessages}
+                        </button>
+                        <button className="ps-stream-banner-btn ps-stream-banner-btn--primary" onClick={() => void handleNewChat()} disabled={isStreaming}>
+                          {t.newChat}
+                        </button>
+                      </>
+                    ) : (
+                      <button className="ps-stream-banner-btn" onClick={() => setStreamError(null)}>
+                        {t.dismiss}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+
               <div className="ps-messages">
                 {chatSelectMode && (
                   <div className="ps-select-bar">
                     <button className="ps-select-bar-btn" onClick={() => {
-                      const allIds = new Set(messages.filter((m) => m.type !== 'welcome').map((m) => m.id));
+                      const allIds = new Set(messages.map((m) => m.id));
                       setSelectedMsgIds(allIds);
-                    }}>Выбрать все</button>
+                    }}>{t.chooseAll}</button>
                     <button
                       className="ps-select-bar-btn ps-select-bar-btn--danger"
                       disabled={selectedMsgIds.size === 0}
                       onClick={() => void deleteSelectedMessages(selectedMsgIds)}
                     >
-                      Удалить ({selectedMsgIds.size})
+                      {t.deleteSelected} ({selectedMsgIds.size})
                     </button>
                     <button
                       className="ps-select-bar-btn ps-select-bar-btn--danger"
                       onClick={() => {
-                        const allIds = new Set(messages.filter((m) => m.type !== 'welcome').map((m) => m.id));
+                        const allIds = new Set(messages.map((m) => m.id));
                         void deleteSelectedMessages(allIds);
                       }}
-                    >Удалить все</button>
+                    >{t.deleteAll}</button>
                   </div>
                 )}
+                {isHistoryLoading ? (
+                  <div className="ps-chat-empty">
+                    <Loader2 size={20} className="ps-spin" />
+                    <strong>{t.loadingHistory}</strong>
+                  </div>
+                ) : null}
+                {!isHistoryLoading && messages.length === 0 ? (
+                  <div className="ps-chat-empty">
+                    <Sparkles size={20} />
+                    <strong>{t.emptyConversationTitle}</strong>
+                    <span>{t.emptyConversationBody}</span>
+                  </div>
+                ) : null}
                 {messages.map((msg) => (
                   <MessageBubble
                     key={msg.id}
                     msg={msg}
+                    locale={locale}
+                    questionBadgeLabel={t.questionBadge}
                     onPhotoClick={(photo) => setPreviewPhoto(photo)}
                     onPhotoDragStart={handleChatPhotoDragStart}
                     selectMode={chatSelectMode}
@@ -1734,7 +2313,7 @@ export default function PhotoStudioPage() {
                     })}
                   />
                 ))}
-                {isStreaming && messages[messages.length - 1]?.role !== 'assistant' && (
+                {isStreaming && messages[messages.length - 1]?.role !== 'assistant' && !isHistoryLoading && (
                   <div className="ps-typing">
                     <div className="ps-typing-dots"><span /><span /><span /></div>
                   </div>
@@ -1746,13 +2325,15 @@ export default function PhotoStudioPage() {
                 <div ref={quickDropdownRef} className={`ps-dropdown ${quickOpen ? 'open' : ''}`}>
                   <button className="ps-action-chip" onClick={() => setQuickOpen((v) => !v)}>
                     <Sparkles size={14} />
-                    Быстрые команды
+                    {locale === 'uz' ? 'Tez buyruqlar' : locale === 'en' ? 'Quick actions' : 'Быстрые команды'}
                     <ChevronDown size={14} />
                   </button>
                   {quickOpen ? (
                     <div className="ps-dropdown-menu ps-dropdown-menu--matrix">
                       <div className="ps-quick-col">
-                        <div className="ps-quick-col-title">Выберите действие</div>
+                        <div className="ps-quick-col-title">
+                          {locale === 'uz' ? 'Amalni tanlang' : locale === 'en' ? 'Choose action' : 'Выберите действие'}
+                        </div>
                         {quickMenu.map((item) => (
                           <button
                             key={item.id}
@@ -1767,7 +2348,9 @@ export default function PhotoStudioPage() {
                         ))}
                       </div>
                       <div className="ps-quick-col">
-                        <div className="ps-quick-col-title">Выберите вариант</div>
+                        <div className="ps-quick-col-title">
+                          {locale === 'uz' ? 'Variantni tanlang' : locale === 'en' ? 'Choose option' : 'Выберите вариант'}
+                        </div>
                         <div className="ps-quick-options">
                           {activeQuickMenu.options.map((opt) => (
                             <button
@@ -1786,7 +2369,7 @@ export default function PhotoStudioPage() {
 
                 <button className="ps-action-chip" onClick={() => setSamplesOpen(true)}>
                   <GalleryHorizontal size={14} />
-                  Галерея образцов
+                  {locale === 'uz' ? 'Namunalar galereyasi' : locale === 'en' ? 'Sample gallery' : 'Галерея образцов'}
                   {attachedPhotos.length > 0 ? (
                     <span className="ps-chip-badge">{attachedPhotos.length}</span>
                   ) : null}
@@ -1795,7 +2378,7 @@ export default function PhotoStudioPage() {
 
                 <button className="ps-action-chip" onClick={() => setInstructionsOpen(true)}>
                   <HelpCircle size={14} />
-                  Инструкции
+                  {locale === 'uz' ? 'Ko‘rsatmalar' : locale === 'en' ? 'Instructions' : 'Инструкции'}
                 </button>
               </div>
 
@@ -1810,7 +2393,9 @@ export default function PhotoStudioPage() {
                         </button>
                       </div>
                       <div className="ps-attached-single-info">
-                        <span className="ps-attached-label-text">Фото прикреплено</span>
+                        <span className="ps-attached-label-text">
+                          {locale === 'uz' ? 'Rasm biriktirildi' : locale === 'en' ? 'Image attached' : 'Фото прикреплено'}
+                        </span>
                       </div>
                     </div>
                   ) : (
@@ -1831,7 +2416,7 @@ export default function PhotoStudioPage() {
               )}
 
               <form className="ps-input" onSubmit={(e) => { e.preventDefault(); void handleSend(); }}>
-                <button type="button" className="ps-icon-btn" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || !canAttachMore}>
+                <button type="button" className="ps-icon-btn" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || isThreadLocked || !canAttachMore}>
                   <Paperclip size={18} />
                 </button>
                 <input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={handleFileSelect} />
@@ -1841,15 +2426,15 @@ export default function PhotoStudioPage() {
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
                   onKeyDown={onKeyDown}
-                  placeholder={attachedPhotos.length ? 'Что сделать с фото?' : 'Напишите, что хотите сделать...'}
-                  disabled={isStreaming}
+                  placeholder={chatPlaceholder}
+                  disabled={isStreaming || isThreadLocked}
                   className="ps-text-input"
                 />
 
                 <button
                   type="submit"
                   className={`ps-send-btn ps-send-btn--pill ${(inputText.trim() || attachedPhotos.length) && !isStreaming ? 'ps-send-btn--active' : ''}`}
-                  disabled={(!inputText.trim() && !attachedPhotos.length) || isStreaming}
+                  disabled={(!inputText.trim() && !attachedPhotos.length) || isStreaming || isThreadLocked}
                 >
                   <Send size={18} />
                 </button>
@@ -2273,7 +2858,7 @@ export default function PhotoStudioPage() {
             <div className="ps-side-head">
               <div className="ps-side-title-row">
                 <Sparkles size={16} />
-                <span>История</span>
+                <span>{t.relatedMedia}</span>
               </div>
               <div className="ps-history-head-actions">
                 <button className="ps-side-collapse" onClick={() => setRightExpanded(v => !v)} title={rightExpanded ? 'Сжать' : 'Развернуть'}>
@@ -2287,36 +2872,38 @@ export default function PhotoStudioPage() {
 
             <div className="ps-sidebar-body">
               <div className="ps-history-hint">
-                Перетащите фото в карточку товара или выберите для редактирования
+                {t.persistentLibraryHint}
               </div>
 
               <div className="ps-history-counters">
                 <span className={`ps-history-counter ${historyTab === 'image' ? 'ps-history-counter--active' : ''}`} onClick={() => setHistoryTab('image')}>
                   <Camera size={12} />
-                  {historyPhotos.length}/100
+                  {libraryPhotos.length}
                 </span>
                 <span className={`ps-history-counter ${historyTab === 'video' ? 'ps-history-counter--active' : ''}`} onClick={() => setHistoryTab('video')}>
                   <Video size={12} />
-                  {historyVideos.length}/50
+                  {libraryVideos.length}
                 </span>
               </div>
 
               <div className="ps-history-subtitle">
-                {historyTab === 'image' ? `ФОТО (${historyPhotos.length})` : `ВИДЕО (${historyVideos.length})`}
+                {historyTab === 'image'
+                  ? `${t.libraryTabImages.toUpperCase()} (${libraryPhotos.length})`
+                  : `${t.libraryTabVideos.toUpperCase()} (${libraryVideos.length})`}
               </div>
 
-              {(historyTab === 'image' ? historyPhotos : historyVideos).length === 0 ? (
+              {(historyTab === 'image' ? libraryPhotos : libraryVideos).length === 0 ? (
                 <div className="ps-sidebar-empty">
                   <ImageIcon size={24} />
-                  <span>Нет {historyTab === 'image' ? 'фото' : 'видео'}</span>
-                  <span className="ps-empty-sub">Прикрепите фото и отправьте команду</span>
+                  <span>{t.emptyMedia}</span>
+                  <span className="ps-empty-sub">{t.emptyMediaSub}</span>
                 </div>
               ) : (
                 <div className="ps-history-grid">
-                  {(historyTab === 'image' ? historyPhotos : historyVideos).map((p) => (
+                  {(historyTab === 'image' ? libraryPhotos : libraryVideos).map((p) => (
                     <div
                       key={p.id}
-                      className="ps-history-item"
+                      className={`ps-history-item ${p.assetId && activeWorkingAssetIds.includes(p.assetId) ? 'ps-history-item--active' : ''}`}
                       onMouseEnter={(e) => handleHistoryMouseEnter(e, p)}
                       onMouseLeave={handleHistoryMouseLeave}
                     >
@@ -2335,13 +2922,13 @@ export default function PhotoStudioPage() {
                             <img src={p.url} alt="" crossOrigin="anonymous" />
                           )}
                         </button>
+                        {p.assetId && activeWorkingAssetIds.includes(p.assetId) ? (
+                          <div className="ps-history-active-pill">{t.activeBadge}</div>
+                        ) : null}
                         {/* Hover actions overlay */}
                         <div className={`ps-history-hover-actions ${hoveredHistoryId === p.id ? 'visible' : ''}`}>
                           <button onClick={() => handleDownload(p)} title="Скачать">
                             <Download size={13} />
-                          </button>
-                          <button onClick={() => deleteHistoryPhoto(p.id)} title="Удалить">
-                            <Trash2 size={13} />
                           </button>
                           <button onClick={() => { setGalleryAddPhoto(p); setGalleryAddType('scene'); }} title="В галерею">
                             <Plus size={13} />
@@ -2567,6 +3154,8 @@ export default function PhotoStudioPage() {
 
 function MessageBubble({
   msg,
+  locale,
+  questionBadgeLabel,
   onPhotoClick,
   onPhotoDragStart,
   selectMode = false,
@@ -2574,6 +3163,8 @@ function MessageBubble({
   onToggleSelect,
 }: {
   msg: ChatMessage;
+  locale: AppLocale;
+  questionBadgeLabel: string;
   onPhotoClick: (photo: PhotoMedia) => void;
   onPhotoDragStart: (e: React.DragEvent, photo: PhotoMedia) => void;
   selectMode?: boolean;
@@ -2581,12 +3172,12 @@ function MessageBubble({
   onToggleSelect?: (id: string) => void;
 }) {
   const isUser = msg.role === 'user';
-  const isWelcome = msg.type === 'welcome';
-  const isSelectable = selectMode && msg.type !== 'welcome';
+  const isQuestion = msg.type === 'question';
+  const isSelectable = selectMode;
 
   return (
     <div
-      className={`ps-msg ${isUser ? 'ps-msg--user' : 'ps-msg--bot'} ${isWelcome ? 'ps-msg--welcome' : ''} ${isSelectable ? 'ps-msg--selectable' : ''} ${isSelected ? 'ps-msg--selected' : ''}`}
+      className={`ps-msg ${isUser ? 'ps-msg--user' : 'ps-msg--bot'} ${isQuestion ? 'ps-msg--question' : ''} ${isSelectable ? 'ps-msg--selectable' : ''} ${isSelected ? 'ps-msg--selected' : ''}`}
       onClick={() => isSelectable && onToggleSelect?.(msg.id)}
     >
       <div className="ps-msg-avatar">
@@ -2598,6 +3189,9 @@ function MessageBubble({
         {!isSelectable && (isUser ? <User size={16} /> : <Bot size={16} />)}
       </div>
       <div className="ps-msg-body">
+        {isQuestion ? (
+          <div className="ps-msg-badge">{questionBadgeLabel}</div>
+        ) : null}
         {msg.content && (
           <div className="ps-msg-text">
             {msg.isLoading && <Loader2 size={14} className="ps-inline-loader ps-spin" />}
@@ -2627,7 +3221,7 @@ function MessageBubble({
           </div>
         )}
         <span className="ps-msg-time">
-          {msg.timestamp.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}
+          {msg.timestamp.toLocaleTimeString(locale === 'uz' ? 'uz-UZ' : locale === 'en' ? 'en-US' : 'ru-RU', { hour: '2-digit', minute: '2-digit' })}
         </span>
       </div>
     </div>

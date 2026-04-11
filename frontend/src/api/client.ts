@@ -1,3 +1,12 @@
+import type {
+  PhotoChatClearMode,
+  PhotoChatClearResponse,
+  PhotoChatDeleteResponse,
+  PhotoChatHistoryResponse,
+  PhotoChatStreamRequest,
+  PhotoChatUploadResponse,
+} from '../features/photo-studio/contract';
+
 const DEFAULT_API_BASE = '/api';
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
 const LOCAL_API_BASE_RE = /^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3})(?::\d+)?(?:\/.*)?$/i;
@@ -590,8 +599,13 @@ class ApiClient {
     return this.requestJson<any>(`/photo-assets/catalog?asset_type=${encodeURIComponent(assetType)}`);
   }
 
-  async getPhotoChatHistory() {
-    return this.requestJson<any>('/api/photo/chat/history');
+  async getPhotoChatHistory(threadId?: number) {
+    const params = threadId ? `?thread_id=${encodeURIComponent(String(threadId))}` : '';
+    return this.requestJson<PhotoChatHistoryResponse>(`/api/photo/chat/history${params}`);
+  }
+
+  async createPhotoChatThread() {
+    return this.requestJson<PhotoChatHistoryResponse>('/api/photo/threads/new', { method: 'POST' });
   }
 
   async uploadPhotoChatAsset(file: File) {
@@ -601,11 +615,11 @@ class ApiClient {
       method: 'POST',
       body: form,
     });
-    return resp.json();
+    return resp.json() as Promise<PhotoChatUploadResponse>;
   }
 
   async importPhotoChatAsset(sourceUrl: string) {
-    return this.requestJson<any>(
+    return this.requestJson<PhotoChatUploadResponse>(
       '/api/photo/assets/import',
       {
         method: 'POST',
@@ -615,7 +629,7 @@ class ApiClient {
     );
   }
 
-  async streamPhotoChat(payload: Record<string, any>) {
+  async streamPhotoChat(payload: PhotoChatStreamRequest) {
     return this.requestRaw(
       '/api/photo/chat/stream',
       {
@@ -626,16 +640,29 @@ class ApiClient {
     );
   }
 
-  async clearPhotoChat() {
-    return this.requestJson<any>('/api/photo/chat/clear', { method: 'POST' });
+  async clearPhotoChat(payload: { threadId?: number; clearMode: PhotoChatClearMode }) {
+    return this.requestJson<PhotoChatClearResponse>(
+      '/api/photo/chat/clear',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...(payload.threadId ? { thread_id: payload.threadId } : {}),
+          clear_mode: payload.clearMode,
+        }),
+      },
+      { contentType: 'application/json' },
+    );
   }
 
-  async deletePhotoChatMessages(messageIds: number[]) {
-    return this.requestJson<any>(
+  async deletePhotoChatMessages(messageIds: number[], threadId?: number) {
+    return this.requestJson<PhotoChatDeleteResponse>(
       '/api/photo/chat/messages/delete',
       {
         method: 'POST',
-        body: JSON.stringify({ message_ids: messageIds }),
+        body: JSON.stringify({
+          ...(threadId ? { thread_id: threadId } : {}),
+          message_ids: messageIds,
+        }),
       },
       { contentType: 'application/json' },
     );

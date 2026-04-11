@@ -28,6 +28,60 @@ _ASSET_REF_PATTERNS = (
     r"\b{n}\s*astest\b",
 )
 
+_LOCALE_ALIASES = {
+    "ru": "ru",
+    "ru-ru": "ru",
+    "russian": "ru",
+    "русский": "ru",
+    "en": "en",
+    "en-us": "en",
+    "en-gb": "en",
+    "english": "en",
+    "английский": "en",
+    "uz": "uz",
+    "uz-uz": "uz",
+    "uzbek": "uz",
+    "o'zbek": "uz",
+    "uzbekistan": "uz",
+    "узбек": "uz",
+}
+
+_LANGUAGE_LABELS = {
+    "ru": "Russian",
+    "en": "English",
+    "uz": "Uzbek",
+}
+
+_DEFAULT_CLARIFYING_QUESTION = {
+    "en": "Could you clarify exactly what you want me to change or create?",
+    "ru": "Уточните, пожалуйста, что именно нужно изменить или создать.",
+    "uz": "Iltimos, aynan nimani o'zgartirish yoki yaratish kerakligini aniqlashtirib bering.",
+}
+
+_UZ_LATIN_HINTS = (
+    "iltimos",
+    "rasm",
+    "surat",
+    "yana",
+    "qiling",
+    "qil",
+    "kerak",
+    "bo'lsin",
+    "bo‘lsin",
+    "kiyim",
+    "fon",
+    "bilan",
+    "uchun",
+    "o'zgartir",
+    "o‘zgartir",
+    "yorug'",
+    "yorug‘",
+    "qora",
+    "oq",
+)
+
+_SYSTEM_PLACEHOLDER_RE = re.compile(r"^\[user sent \d+ image\(s\) without text", flags=re.IGNORECASE)
+
 
 def _normalize_asset_refs(text: str, selected_asset_ids: List[int]) -> str:
     if not text or not selected_asset_ids:
@@ -40,6 +94,87 @@ def _normalize_asset_refs(text: str, selected_asset_ids: List[int]) -> str:
             rx = re.compile(pat.format(n=re.escape(str(int(aid)))), flags=re.IGNORECASE)
             out = rx.sub(label, out)
     return out
+
+
+def _normalize_locale(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    lowered = raw.replace("_", "-").lower()
+    if lowered in {"auto", "default"}:
+        return None
+
+    primary = lowered.split("-", 1)[0]
+    return _LOCALE_ALIASES.get(lowered) or _LOCALE_ALIASES.get(primary) or primary
+
+
+def _is_synthetic_user_message(text: str) -> bool:
+    raw = (text or "").strip()
+    return bool(raw and _SYSTEM_PLACEHOLDER_RE.match(raw))
+
+
+def _detect_message_locale(text: str) -> Optional[str]:
+    raw = (text or "").strip()
+    if not raw or _is_synthetic_user_message(raw):
+        return None
+
+    lowered = raw.lower()
+
+    if re.search(r"[қғҳў]", lowered):
+        return "uz"
+
+    if re.search(r"[а-яё]", lowered):
+        return "ru"
+
+    if re.search(r"[a-z]", lowered):
+        if any(hint in lowered for hint in _UZ_LATIN_HINTS):
+            return "uz"
+        return "en"
+
+    return None
+
+
+def resolve_photo_chat_locale(
+    *,
+    user_message: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+    thread_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    explicit_locale = _normalize_locale((thread_context or {}).get("locale"))
+    if explicit_locale:
+        return explicit_locale
+
+    candidate_texts: List[str] = []
+    if user_message and not _is_synthetic_user_message(user_message):
+        candidate_texts.append(user_message)
+
+    for item in reversed(history or []):
+        if str(item.get("role") or "") != "user":
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            candidate_texts.append(text)
+            break
+
+    for text in candidate_texts:
+        detected = _detect_message_locale(text)
+        if detected:
+            return detected
+
+    return "en"
+
+
+def _language_label(locale: str) -> str:
+    normalized = _normalize_locale(locale) or "en"
+    return _LANGUAGE_LABELS.get(normalized, normalized)
+
+
+def _default_clarifying_question(locale: str) -> str:
+    normalized = _normalize_locale(locale) or "en"
+    return _DEFAULT_CLARIFYING_QUESTION.get(normalized, _DEFAULT_CLARIFYING_QUESTION["en"])
 
 
 
@@ -108,26 +243,18 @@ class PhotoChatAgent:
         user_message: str,
         history: List[Dict[str, Any]],
         assets: List[Dict[str, Any]],
+        thread_context: Optional[Dict[str, Any]] = None,
+        trace_id: str = "-",
+        recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,
     ) -> Dict[str, Any]:
-        """
-        Enhanced planner that returns rich context for prompt generation.
-        Returns:
-        {
-            "intent": "edit_image" | "generate_image" | "chat" | "question",
-            "assistant_message": "...",
-            "selected_asset_ids": [33, 34] or None,
-            "image_prompt": "...",  # Basic prompt
-            "aspect_ratio": "1:1" | "16:9" | None,
-            "context": {  # NEW - rich context for prompt enhancement
-                "source_asset_id": 33,  # Kiyim olinadigan rasm
-                "target_asset_id": 34,  # Kiyim kiydiradigan model
-                "action": "transfer_clothing",  # or "edit", "enhance", etc.
-            }
-        }
-        """
-        # Your existing plan_action implementation
-        # Then add context extraction logic
-        pass
+        return await self.plan_action(
+            user_message=user_message,
+            history=history,
+            assets=assets,
+            thread_context=thread_context,
+            trace_id=trace_id,
+            recent_image_bytes=recent_image_bytes,
+        )
     
     def build_rich_prompt(
         self,
@@ -181,11 +308,9 @@ class PhotoChatAgent:
             "General rules:\n"
             "- Do ONLY what the task asks; keep everything else unchanged.\n"
             "- If the task involves combining images: preserve the target person's identity and pose unless requested.\n"
-            "- Keep the target background unless the task explicitly asks to change it.\n"
-            "- Ensure realistic lighting, shadows, and proportions."
-            "WB requirements:\n"
-            "- Output must be vertical 3:4.\n"
-            "- Keep the subject fully visible (no cropping), centered, clean background if not specified.\n"
+            "- Preserve the existing background, outfit, and framing unless the task explicitly asks to change them.\n"
+            "- Ensure realistic lighting, shadows, and proportions.\n"
+            "- Only apply marketplace/card styling when the user explicitly asks for it.\n"
         )
 
         return "\n\n".join(lines).strip()
@@ -336,6 +461,7 @@ class PhotoChatAgent:
         user_message: str,
         history: List[Dict[str, Any]],
         assets: List[Dict[str, Any]],
+        thread_context: Optional[Dict[str, Any]] = None,
         session_state: Optional[Dict[str, Any]] = None,
         trace_id: str = "-",
         recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,  # [(asset_id, bytes, mime_type), ...]
@@ -360,68 +486,49 @@ class PhotoChatAgent:
             "asset_ids": h.get("asset_ids") or None,
         } for h in history[-12:] if (h.get("text") or "").strip() or h.get("asset_ids")]
 
-        # ✅ "oxirgisi" default (keyword/regex emas, bu dialog konteksti):
-        # session_state: {"last_generated_asset_id": 12, "pending_asset_ids": [7], "pending_intent": "edit_image"}
-        st = session_state or {}
+        ctx = dict(thread_context or session_state or {})
+        response_locale = resolve_photo_chat_locale(
+            user_message=user_message,
+            history=history,
+            thread_context=ctx,
+        )
+        response_language = _language_label(response_locale)
 
         instruction = (
-            "Ты — фоторедактор и ассистент AVEMOD. "
-            "ВСЕГДА отвечай на русском языке, даже если пользователь пишет на другом языке.\n\n"
-
-            "Пользователь может попросить: «Сделай промпт подробно и максимально точно — красиво, идеально и профессионально» — "
-            "в таком случае ты обязан сформировать максимально детализированный image_prompt, чтобы результат соответствовал запросу.\n\n"
-
-            "НЕ используй правила, ключевые слова, команды, префиксы или regex в общении с пользователем — только естественный диалог.\n\n"
-
-            "Контекст:\n"
-            "- assets: список изображений в сессии.\n"
-            "- history: история диалога. history может содержать asset_ids — изображения, прикреплённые к сообщению.\n"
-            "- session_state: внутреннее состояние (например last_generated_asset_id, pending_asset_ids).\n\n"
-
-            "КРИТИЧЕСКИ ВАЖНО — УТОЧНЯЮЩИЕ ВОПРОСЫ:\n"
-            "- Если запрос слишком общий или неполный (например: 'сделай авот', 'создай изображение', 'нарисуй что-нибудь'), "
-            "НЕ генерируй изображение сразу!\n"
-            "- Вместо этого используй intent='question' и задай уточняющий вопрос:\n"
-            "  * Что именно создать? (тема, объект, стиль)\n"
-            "  * Какие цвета предпочтительны?\n"
-            "  * Какая композиция? (портрет, пейзаж, продукт)\n"
-            "  * Или предложи 2-3 конкретных варианта на выбор\n"
-            "- Только после получения конкретных деталей переходи к intent='generate_image'.\n\n"
-
-            "КАК ПИСАТЬ image_prompt (чтобы изображение получилось как пользователь хочет):\n"
-            "- image_prompt должен быть подробным и конкретным, не коротким.\n"
-            "- Всегда описывай: кто/что в кадре, действие/поза, одежда/внешность, фон/локация, композиция, ракурс, освещение, стиль, настроение, цвета, уровень детализации.\n"
-            "- Если это товар/каталог: описывай как для маркетплейса — чистый фон, точные материалы, фактуру, форму, цвет, без лишних объектов.\n"
-            "- Если это художественная сцена: уточняй атмосферу, окружение, время суток, свет (мягкий/жёсткий), глубину резкости.\n"
-            "- Избегай двусмысленных слов типа 'красиво', 'современно' без конкретики — заменяй конкретными деталями.\n"
-            "- Не добавляй выдуманные детали, если они критичны. Если без них нельзя — задай вопрос (intent='question'). Если можно — делай разумные допущения и отражай их в image_prompt аккуратно.\n"
-            "- Следи за отсутствием противоречий (например: 'ночь' и 'яркое полуденное солнце' одновременно).\n"
-            "- Не упоминай asset_id/seq или номера ассетов в image_prompt — только 'Image 1', 'Image 2', ...\n\n"
-
-            "Важно:\n"
-            "- Если пользователь просит несколько вариантов/изображений (например: \"2 варианта\", \"3 картинки\", \"ещё 4\", \"yana 2 ta rasm\"), укажи \"image_count\" = нужное число (1..4). Если не указано — поставь 1.\n"
-            "- Если ты ранее задавал уточняющий вопрос, следующее сообщение пользователя — ответ и продолжение.\n"
-            "- Если пользователь просит изменить цвет/деталь, но НЕ уточняет изображение, "
-            "используй session_state.last_generated_asset_id (или pending_asset_ids если есть).\n"
-            "- Выбирай нужные asset_id сам по смыслу.\n"
-            "- ВАЖНО ДЛЯ image_prompt: никогда не упоминай asset_id/seq или любые номера ассетов (например 41/42).\n"
-            "  Модель обработки изображений понимает только порядок прикреплённых картинок.\n"
-            "  Поэтому в image_prompt используй только позиционные ссылки: 'Image 1', 'Image 2', ...\n"
-            "- selected_asset_ids ОБЯЗАТЕЛЬНО должен быть в том же порядке, в каком ты называешь картинки в image_prompt.\n"
-            "  Например: если пишешь 'возьми одежду с Image 1 и надень на Image 2',\n"
-            "  то selected_asset_ids[0] — источник (одежда), selected_asset_ids[1] — цель (модель).\n\n"
-            "ДОПОЛНИТЕЛЬНЫЕ ПРОВЕРКИ ПЕРЕД edit_image:\n"
-            "- Если пользователь просит перенести полный образ (верх+низ), а Image 1 не в полный рост — задай вопрос и попроси фото в полный рост.\n"
-            "- Если Image 1 выглядит как карточка товара/баннер (есть крупный текст, иконки, коллаж, watermark) — предупреди, что нужно чистое фото модели без надписей, или предложи заменить на другое фото.\n"
-            "- При переносе одежды ВСЕГДА явно требуй: 'не менять лицо/прическу/телосложение/позу' и 'менять только одежду'.\n"
-
-            "Примеры правильного поведения:\n"
-            "Пользователь: 'сделай авот'\n"
-            "Ты: {\"intent\": \"question\", \"assistant_message\": \"Что именно вы хотите создать? Например: модная одежда на модели, пейзаж природы или товарное фото. Опишите подробнее: объект, стиль, фон и цвета.\", ...}\n\n"
-            "Пользователь: 'создай изображение девушки в красном платье на пляже'\n"
-            "Ты: {\"intent\": \"generate_image\", \"image_prompt\": \"Фотореалистичный портрет девушки 25–30 лет в красном летнем платье на песчаном пляже на закате, мягкий тёплый свет, лёгкий ветер развевает волосы, композиция по пояс, камера на уровне глаз, естественные цвета, высокая детализация кожи и ткани, спокойное настроение, без текста и водяных знаков.\", ...}\n\n"
-
-            "Верни СТРОГО JSON:\n"
+            "You are the AVEMOD Photo Studio planner. Decide whether the assistant should chat, ask a clarifying question, "
+            "edit existing image(s), or generate a brand-new image.\n\n"
+            f"Language:\n"
+            f"- If thread_context.locale is set, use it.\n"
+            f"- Otherwise respond in the language of the latest real user message.\n"
+            f"- For this request, write assistant_message and image_prompt in {response_language} (locale: {response_locale}) unless the user explicitly asked for another language.\n\n"
+            "Context inputs:\n"
+            "- history: recent thread-only conversation. A history item may include asset_ids.\n"
+            "- assets: only the images currently relevant to this thread/request.\n"
+            "- thread_context: {\n"
+            "    last_generated_asset_id,\n"
+            "    working_asset_ids,\n"
+            "    pending_question,\n"
+            "    last_action,\n"
+            "    locale\n"
+            "  }\n\n"
+            "Planning rules:\n"
+            "- Ambiguous, underspecified, or conflicting requests must return intent='question'. Do not guess.\n"
+            "- If pending_question is present, treat the user's latest message as a likely answer to that question.\n"
+            "- For follow-up edits like 'make it warmer', 'change the background', 'same but brighter', or 'use the last result', use thread_context to resolve the target image when it is clear.\n"
+            "- If it is not clear which image to edit, return intent='question' and ask which image to use.\n"
+            "- Use intent='edit_image' only when an existing image or images should be changed.\n"
+            "- Use intent='generate_image' only for brand-new images or when the user explicitly wants a new generation.\n"
+            "- Use intent='chat' for normal non-image conversation.\n"
+            "- If the user asks for multiple output variants, set image_count from 1 to 4. Otherwise use 1.\n\n"
+            "Prompt rules:\n"
+            "- image_prompt must be concrete, detailed, and faithful to the user's request.\n"
+            "- Do not invent critical missing details. Ask a question instead.\n"
+            "- Never mention raw asset_id or seq values in assistant_message or image_prompt.\n"
+            "- When referencing selected images inside image_prompt, preserve exact positional labels such as 'Image 1', 'Image 2', etc.\n"
+            "- Do not translate, rename, remove, or reorder 'Image N' references.\n"
+            "- selected_asset_ids must be in the exact same order as the 'Image N' references used in image_prompt.\n"
+            "- Do not force background, outfit, framing, or pose changes unless the user asked for them.\n\n"
+            "Return STRICT JSON only:\n"
             "{\n"
             "  \"intent\": \"chat\"|\"question\"|\"edit_image\"|\"generate_image\",\n"
             "  \"assistant_message\": string,\n"
@@ -435,7 +542,7 @@ class PhotoChatAgent:
         payload = {
             "history": history_compact,
             "assets": assets_compact,
-            "session_state": st,
+            "thread_context": ctx,
             "user_message": user_message,
         }
 
@@ -461,9 +568,10 @@ class PhotoChatAgent:
         generation_config = {"responseMimeType": "application/json", "temperature": 0.3}
 
         logger.info(
-            "[%s] plan_action: model=%s assets=%s hist=%s state=%s user=%s images=%s",
+            "[%s] plan_action: model=%s assets=%s hist=%s thread_context=%s locale=%s user=%s images=%s",
             trace_id, model, len(assets_compact), len(history_compact),
-            {k: st.get(k) for k in ("last_generated_asset_id", "pending_asset_ids", "pending_intent")},
+            {k: ctx.get(k) for k in ("last_generated_asset_id", "working_asset_ids", "pending_question", "last_action", "locale")},
+            response_locale,
             _truncate(user_message, 300),
             len(recent_image_bytes or []),
         )
@@ -489,6 +597,64 @@ class PhotoChatAgent:
         except Exception:
             cleaned = raw.strip().strip("`").replace("```json", "").replace("```", "").strip()
             plan = json.loads(cleaned)
+
+        if not isinstance(plan, dict):
+            raise GeminiApiError("Planner returned an invalid JSON object")
+
+        intent = str(plan.get("intent") or "chat").strip().lower()
+        if intent not in {"chat", "question", "edit_image", "generate_image"}:
+            intent = "chat"
+
+        assistant_message = str(plan.get("assistant_message") or "").strip()
+
+        raw_prompt = plan.get("image_prompt")
+        image_prompt = str(raw_prompt).strip() if isinstance(raw_prompt, str) else None
+        image_prompt = image_prompt or None
+
+        raw_selected_ids = plan.get("selected_asset_ids")
+        selected_asset_ids: List[int] | None = None
+        if isinstance(raw_selected_ids, list):
+            normalized_ids: List[int] = []
+            seen_ids: set[int] = set()
+            for item in raw_selected_ids:
+                try:
+                    asset_id = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if asset_id in seen_ids:
+                    continue
+                seen_ids.add(asset_id)
+                normalized_ids.append(asset_id)
+            selected_asset_ids = normalized_ids or None
+
+        raw_image_count = plan.get("image_count")
+        image_count: Optional[int]
+        try:
+            image_count = int(raw_image_count) if raw_image_count is not None else None
+        except (TypeError, ValueError):
+            image_count = None
+        if image_count is not None:
+            image_count = max(1, min(image_count, 4))
+
+        raw_aspect_ratio = plan.get("aspect_ratio")
+        aspect_ratio = str(raw_aspect_ratio).strip() if raw_aspect_ratio is not None else None
+        aspect_ratio = aspect_ratio or None
+
+        if intent in {"edit_image", "generate_image"} and not image_prompt:
+            intent = "question"
+            assistant_message = assistant_message or _default_clarifying_question(response_locale)
+
+        if intent == "question" and not assistant_message:
+            assistant_message = _default_clarifying_question(response_locale)
+
+        plan = {
+            "intent": intent,
+            "assistant_message": assistant_message,
+            "selected_asset_ids": selected_asset_ids,
+            "image_prompt": image_prompt,
+            "image_count": image_count,
+            "aspect_ratio": aspect_ratio,
+        }
 
         logger.info("[%s] plan_action: parsed=%s", trace_id, plan)
         return plan

@@ -32,13 +32,18 @@ def save_generated_file(content: bytes, kind: str = "image", prefix: str = "") -
     return rel_path
 
 
-def get_file_url(rel_path: str) -> str:
+def get_file_url(rel_path: str, base_url: str | None = None) -> str:
     """
     Always returns public URL to backend media:
       <PUBLIC_BASE_URL>/media/<rel_path>
     """
     rel_path = (rel_path or "").lstrip("/").replace("\\", "/")
-    return f"{settings.PUBLIC_BASE_URL}/media/{rel_path}"
+    resolved_base_url = (
+        (base_url or "").strip().rstrip("/")
+        or (settings.MEDIA_PUBLIC_BASE_URL or "").strip().rstrip("/")
+        or (settings.PUBLIC_BASE_URL or "").strip().rstrip("/")
+    )
+    return f"{resolved_base_url}/media/{rel_path}"
 
 
 def delete_generated_file(rel_path: str) -> bool:

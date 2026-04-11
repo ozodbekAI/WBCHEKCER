@@ -6,7 +6,7 @@ from .issue import CardIssue, IssueRule, IssueSeverity, IssueCategory, IssueStat
 from .task import AnalysisTask, ActivityLog
 from .promotion import PromotionCompany, PromotionPhoto, PromotionStatus
 from .photo_asset import PhotoAsset, AssetType, AssetOwnerType
-from .photo_chat import PhotoChatSession, PhotoChatMessage, PhotoChatMedia
+from .photo_chat import PhotoChatSession, PhotoChatThread, PhotoChatMessage, PhotoChatMedia
 from .approval import CardApproval, ApprovalStatus
 from .generator import (
     TaskStatus, TaskType,
@@ -62,6 +62,7 @@ __all__ = [
     "AssetType",
     "AssetOwnerType",
     "PhotoChatSession",
+    "PhotoChatThread",
     "PhotoChatMessage",
     "PhotoChatMedia",
     "CardApproval",

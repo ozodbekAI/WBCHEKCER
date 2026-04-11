@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db_dependency
 from app.core.dependencies import get_current_user
 from app.controllers.photo_chat_controller import PhotoChatController
+from app.schemas.photo_chat import PhotoChatAssetImportRequest, PhotoChatStreamRequest
 from app.services.model_repository import ModelRepository
 from app.services.scence_repositories import PoseRepository, SceneCategoryRepository
 from app.models.generator import VideoScenario
@@ -41,6 +42,15 @@ class CatalogAllResponse(BaseModel):
     poses: List[CatalogItem]
     models: List[CatalogItem]
     videos: List[CatalogItem]
+
+
+class PhotoChatClearRequest(BaseModel):
+    thread_id: Optional[int] = None
+    clear_mode: str = "messages"
+
+
+def _request_base_url(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
 
 
 @router.get("/catalog/all", response_model=CatalogAllResponse)
@@ -132,6 +142,7 @@ async def get_all_catalogs(
 
 @router.post("/assets/upload")
 async def upload_chat_asset(
+    request: Request,
     file: UploadFile = File(...),
     # client_session_id is deprecated: session is always per-user.
     # Keep it optional for backward compatibility with older frontends.
@@ -147,6 +158,7 @@ async def upload_chat_asset(
                 user=current_user,
                 db=db,
                 client_session_id=(client_session_id or ""),
+                base_url=_request_base_url(request),
                 content=content,
                 filename=file.filename or "upload.jpg",
                 content_type=file.content_type or "image/jpeg",
@@ -163,13 +175,13 @@ async def upload_chat_asset(
 
 @router.post("/assets/import")
 async def import_chat_asset(
-    payload: Dict[str, Any],
+    request: Request,
+    payload: PhotoChatAssetImportRequest,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_dependency),
 ):
-    # client_session_id is deprecated: session is always per-user.
-    client_session_id = (payload.get("client_session_id") or "").strip()
-    source_url = (payload.get("source_url") or "").strip()
+    client_session_id = (payload.client_session_id or "").strip()
+    source_url = payload.source_url.strip()
     if not source_url:
         raise _mapped_photo_http_exception("source_url is required", context="assets_import", default_status=400)
 
@@ -180,6 +192,7 @@ async def import_chat_asset(
             db=db,
             client_session_id=client_session_id,
             source_url=source_url,
+            base_url=_request_base_url(request),
         )
     except HTTPException:
         raise
@@ -193,15 +206,18 @@ async def import_chat_asset(
 
 @router.post("/chat/stream")
 async def chat_stream(
-    payload: Dict[str, Any],
+    request: Request,
+    payload: PhotoChatStreamRequest,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_dependency),
 ):
     controller = PhotoChatController()
+    payload_dict = payload.model_dump(exclude_none=True)
+    payload_dict.setdefault("base_url", _request_base_url(request))
 
     async def event_gen() -> AsyncGenerator[str, None]:
         try:
-            async for chunk in controller.chat_stream(user=current_user, db=db, payload=payload):
+            async for chunk in controller.chat_stream(user=current_user, db=db, payload=payload_dict):
                 yield chunk
         finally:
             await controller.close()
@@ -209,15 +225,44 @@ async def chat_stream(
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
-@router.get("/chat/history")
-async def get_chat_history(
+@router.post("/threads/new")
+async def create_chat_thread(
+    request: Request,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_dependency),
 ):
-    """Return full chat history for the current user (stable across reloads/browsers)."""
     controller = PhotoChatController()
     try:
-        return await controller.get_chat_history(user=current_user, db=db)
+        return await controller.create_new_thread(
+            user=current_user,
+            db=db,
+            base_url=_request_base_url(request),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("photo threads/new failed")
+        raise _mapped_photo_http_exception(e, context="threads_new", default_status=400)
+    finally:
+        await controller.close()
+
+
+@router.get("/chat/history")
+async def get_chat_history(
+    request: Request,
+    thread_id: Optional[int] = Query(None),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_dependency),
+):
+    controller = PhotoChatController()
+    try:
+        return await controller.get_chat_history(
+            user=current_user,
+            db=db,
+            thread_id=thread_id,
+            base_url=_request_base_url(request),
+        )
     finally:
         await controller.close()
 
@@ -244,12 +289,17 @@ async def delete_chat_messages(
 
 @router.post("/chat/clear")
 async def clear_chat_history(
+    payload: Optional[PhotoChatClearRequest] = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_dependency),
 ):
     controller = PhotoChatController()
     try:
-        return await controller.clear_history(user=current_user, db=db)
+        return await controller.clear_history(
+            user=current_user,
+            db=db,
+            payload=(payload.model_dump(exclude_none=True) if payload else {}),
+        )
     except HTTPException:
         raise
     except Exception as e:

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-from typing import Optional, List, Iterable
+from typing import Any, Iterable, List, Optional
 
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
-from sqlalchemy import select, func, update, delete
 
-from app.models.photo_chat import PhotoChatSession, PhotoChatMessage, PhotoChatMedia
+from app.models.photo_chat import (
+    PhotoChatMedia,
+    PhotoChatMessage,
+    PhotoChatSession,
+    PhotoChatThread,
+    default_photo_chat_thread_context,
+    normalize_photo_chat_thread_context,
+)
 
 
 class PhotoChatRepository:
@@ -38,6 +45,7 @@ class PhotoChatRepository:
             sess = PhotoChatSession(user_id=user_id, client_session_id=stable_csid)
             self.db.add(sess)
             self.db.flush()
+            self.get_or_create_active_thread(sess.id)
             return sess
 
         canonical = sessions[0]
@@ -63,6 +71,12 @@ class PhotoChatRepository:
                 .where(PhotoChatMedia.session_id.in_(other_ids))
                 .values(session_id=canonical.id)
             )
+            # Preserve legacy session history as separate threads under the canonical session.
+            self.db.execute(
+                update(PhotoChatThread)
+                .where(PhotoChatThread.session_id.in_(other_ids))
+                .values(session_id=canonical.id, is_active=False)
+            )
             # Prefer last generated relpath from the newest session that has it.
             if not canonical.last_generated_relpath:
                 for s in sessions:
@@ -79,6 +93,7 @@ class PhotoChatRepository:
 
         # Re-sequence media so UI ordering remains consistent.
         self._resequence_media(canonical.id)
+        self.get_or_create_active_thread(canonical.id)
         self.db.flush()
         return canonical
 
@@ -101,30 +116,128 @@ class PhotoChatRepository:
         )
         return self.db.execute(stmt).scalars().first()
 
+    def get_or_create_active_thread(self, session_id: int) -> PhotoChatThread:
+        stmt = (
+            select(PhotoChatThread)
+            .where(PhotoChatThread.session_id == session_id)
+            .order_by(PhotoChatThread.is_active.desc(), PhotoChatThread.updated_at.desc(), PhotoChatThread.id.desc())
+        )
+        threads = list(self.db.execute(stmt).scalars().all())
+        if not threads:
+            return self.create_new_thread(session_id)
+
+        active = next((thread for thread in threads if thread.is_active), None)
+        if active is None:
+            active = threads[0]
+            active.is_active = True
+            self.db.add(active)
+
+        for thread in threads:
+            if thread.id != active.id and thread.is_active:
+                thread.is_active = False
+                self.db.add(thread)
+
+        normalized = normalize_photo_chat_thread_context(active.context)
+        if active.context != normalized:
+            active.context = normalized
+            self.db.add(active)
+            flag_modified(active, "context")
+
+        self.db.flush()
+        return active
+
+    def create_new_thread(self, session_id: int, context: dict[str, Any] | None = None) -> PhotoChatThread:
+        existing_threads = list(
+            self.db.execute(
+                select(PhotoChatThread).where(
+                    PhotoChatThread.session_id == session_id,
+                    PhotoChatThread.is_active.is_(True),
+                )
+            ).scalars().all()
+        )
+        for thread in existing_threads:
+            thread.is_active = False
+            self.db.add(thread)
+
+        thread = PhotoChatThread(
+            session_id=session_id,
+            is_active=True,
+            context=normalize_photo_chat_thread_context(context),
+        )
+        self.db.add(thread)
+        self.db.flush()
+        return thread
+
+    def get_thread(self, thread_id: int, session_id: int | None = None) -> Optional[PhotoChatThread]:
+        thread = self.db.get(PhotoChatThread, thread_id)
+        if thread is None:
+            return None
+        if session_id is not None and int(thread.session_id) != int(session_id):
+            return None
+        return thread
+
+    def list_thread_messages(self, thread_id: int, limit: int | None = 30) -> List[PhotoChatMessage]:
+        stmt = (
+            select(PhotoChatMessage)
+            .where(PhotoChatMessage.thread_id == thread_id)
+            .order_by(PhotoChatMessage.id.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(int(limit))
+        return list(self.db.execute(stmt).scalars().all())
+
+    def clear_thread_messages(self, thread_id: int) -> int:
+        res = self.db.execute(delete(PhotoChatMessage).where(PhotoChatMessage.thread_id == thread_id))
+        return int(getattr(res, "rowcount", 0) or 0)
+
+    def get_thread_context(self, thread_id: int) -> dict[str, Any]:
+        thread = self.get_thread(thread_id)
+        if thread is None:
+            return default_photo_chat_thread_context()
+
+        normalized = normalize_photo_chat_thread_context(thread.context)
+        if thread.context != normalized:
+            thread.context = normalized
+            self.db.add(thread)
+            flag_modified(thread, "context")
+            self.db.flush()
+        return normalized
+
+    def update_thread_context(
+        self,
+        thread_id: int,
+        context: dict[str, Any] | None = None,
+        **changes: Any,
+    ) -> dict[str, Any]:
+        thread = self.get_thread(thread_id)
+        if thread is None:
+            raise ValueError(f"Photo chat thread {thread_id} not found")
+
+        merged_context = self.get_thread_context(thread_id)
+        if context:
+            merged_context.update(context)
+        if changes:
+            merged_context.update(changes)
+
+        thread.context = normalize_photo_chat_thread_context(merged_context)
+        self.db.add(thread)
+        flag_modified(thread, "context")
+        self.db.flush()
+        return dict(thread.context or {})
+
+    def reset_thread_context(self, thread_id: int) -> dict[str, Any]:
+        return self.update_thread_context(thread_id, context=default_photo_chat_thread_context())
+
     def set_pending_assets(self, session_id: int, asset_ids: list[int] | None) -> None:
-        sess = self.db.get(PhotoChatSession, session_id)
-        if not sess:
-            return
-        sess.pending_asset_ids = [int(x) for x in (asset_ids or [])]
-        self.db.add(sess)
-        # если pending_asset_ids хранится в JSON колонке — полезно:
-        try:
-            flag_modified(sess, "pending_asset_ids")
-        except Exception:
-            pass
+        thread = self.get_or_create_active_thread(session_id)
+        self.update_thread_context(thread.id, working_asset_ids=asset_ids or [])
 
     def pop_pending_assets(self, session_id: int) -> list[int]:
-        sess = self.db.get(PhotoChatSession, session_id)
-        if not sess:
-            return []
-        ids = list(sess.pending_asset_ids or [])
-        sess.pending_asset_ids = []
-        self.db.add(sess)
-        try:
-            flag_modified(sess, "pending_asset_ids")
-        except Exception:
-            pass
-        return ids
+        thread = self.get_or_create_active_thread(session_id)
+        context = self.get_thread_context(thread.id)
+        working_asset_ids = list(context.get("working_asset_ids") or [])
+        self.update_thread_context(thread.id, working_asset_ids=[])
+        return working_asset_ids
 
     def find_media_by_source_url(self, session_id: int, source_url: str) -> Optional[PhotoChatMedia]:
         su = (source_url or "").strip()
@@ -176,10 +289,12 @@ class PhotoChatRepository:
 
         sess = self.get_session(user_id, csid)
         if sess:
+            self.get_or_create_active_thread(sess.id)
             return sess
         sess = PhotoChatSession(user_id=user_id, client_session_id=csid)
         self.db.add(sess)
         self.db.flush()
+        self.get_or_create_active_thread(sess.id)
         return sess
 
     def set_last_generated(self, session_id: int, relpath: str) -> None:
@@ -198,9 +313,21 @@ class PhotoChatRepository:
         content: str | None,
         msg_type: str = "text",
         meta: dict | None = None,
+        thread_id: int | None = None,
+        request_id: str | None = None,
     ) -> PhotoChatMessage:
+        thread = (
+            self.get_or_create_active_thread(session_id)
+            if thread_id is None
+            else self.get_thread(thread_id, session_id=session_id)
+        )
+        if thread is None:
+            raise ValueError(f"Photo chat thread {thread_id} not found for session {session_id}")
+
         msg = PhotoChatMessage(
             session_id=session_id,
+            thread_id=thread.id,
+            request_id=(request_id or None),
             role=role,
             msg_type=msg_type,
             content=content,
@@ -211,17 +338,12 @@ class PhotoChatRepository:
         return msg
 
     def list_messages(self, session_id: int, limit: int = 30) -> List[PhotoChatMessage]:
-        stmt = (
-            select(PhotoChatMessage)
-            .where(PhotoChatMessage.session_id == session_id)
-            .order_by(PhotoChatMessage.id.asc())
-        )
-        if limit is not None:
-            stmt = stmt.limit(int(limit))
-        return list(self.db.execute(stmt).scalars().all())
+        thread = self.get_or_create_active_thread(session_id)
+        return self.list_thread_messages(thread.id, limit=limit)
 
     def count_messages(self, session_id: int) -> int:
-        stmt = select(func.count()).select_from(PhotoChatMessage).where(PhotoChatMessage.session_id == session_id)
+        thread = self.get_or_create_active_thread(session_id)
+        stmt = select(func.count()).select_from(PhotoChatMessage).where(PhotoChatMessage.thread_id == thread.id)
         try:
             return int(self.db.execute(stmt).scalar_one() or 0)
         except Exception:
@@ -231,8 +353,10 @@ class PhotoChatRepository:
         ids = [int(x) for x in message_ids if str(x).strip().isdigit()]
         if not ids:
             return []
+        thread = self.get_or_create_active_thread(session_id)
         stmt = select(PhotoChatMessage).where(
             PhotoChatMessage.session_id == session_id,
+            PhotoChatMessage.thread_id == thread.id,
             PhotoChatMessage.id.in_(ids),
         )
         return list(self.db.execute(stmt).scalars().all())
@@ -286,9 +410,11 @@ class PhotoChatRepository:
         ids = [int(x) for x in message_ids if str(x).strip().isdigit()]
         if not ids:
             return 0
+        thread = self.get_or_create_active_thread(session_id)
         res = self.db.execute(
             delete(PhotoChatMessage).where(
                 PhotoChatMessage.session_id == session_id,
+                PhotoChatMessage.thread_id == thread.id,
                 PhotoChatMessage.id.in_(ids),
             )
         )

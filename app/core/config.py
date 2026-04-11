@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     # Media / public URL (used by photo chat + photo assets)
     MEDIA_ROOT: str = str((BASE_DIR / "media").resolve())
     PUBLIC_BASE_URL: str = "http://localhost:8002"
+    MEDIA_PUBLIC_BASE_URL: str = ""
 
     # Frontend URL (used in email invite links)
     FRONTEND_URL: str = "http://localhost:3001"
@@ -140,6 +141,13 @@ class Settings(BaseSettings):
         if isinstance(value, (list, tuple, set)):
             return [str(item).strip() for item in value if str(item).strip()]
         raise TypeError("Invalid CORS_ALLOWED_ORIGINS value")
+
+    @field_validator("PUBLIC_BASE_URL", "MEDIA_PUBLIC_BASE_URL", mode="before")
+    @classmethod
+    def _normalize_public_base_url(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip().rstrip("/")
 
 
 @lru_cache()
