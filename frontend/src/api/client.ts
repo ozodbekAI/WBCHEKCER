@@ -8,6 +8,7 @@ const API_BASE =
 const API_URL = new URL(API_BASE, window.location.origin);
 export const API_ROOT = API_URL.toString().replace(/\/+$/, '');
 export const API_ORIGIN = API_URL.origin;
+export const AUTH_REQUIRED_EVENT = 'avemod:auth-required';
 
 class ApiClient {
   private token: string | null = null;
@@ -144,7 +145,9 @@ class ApiClient {
     if (res.status === 401 && auth && !this.isAuthEndpoint(path)) {
       this.logout();
       if (window.location.pathname !== '/login') {
-        window.location.href = '/login';
+        const next = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+        const to = next && next !== '/login' ? `/login?next=${encodeURIComponent(next)}` : '/login';
+        window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT, { detail: { to } }));
       }
     }
 
@@ -650,6 +653,17 @@ class ApiClient {
       {
         method: 'POST',
         body: JSON.stringify({ message_ids: messageIds, thread_id: threadId }),
+      },
+      { contentType: 'application/json' },
+    );
+  }
+
+  async deletePhotoChatAssets(assetIds: number[], threadId?: number) {
+    return this.requestJson<any>(
+      '/photo/chat/assets/delete',
+      {
+        method: 'POST',
+        body: JSON.stringify({ asset_ids: assetIds, thread_id: threadId }),
       },
       { contentType: 'application/json' },
     );

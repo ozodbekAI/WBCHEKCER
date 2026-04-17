@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import React, { useMemo, useState } from 'react';
+import { useNavigate, Link, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useIsMobile } from '../hooks/use-mobile';
 import { Eye, EyeOff, Sparkles, LogIn } from 'lucide-react';
@@ -7,12 +7,20 @@ import { Eye, EyeOff, Sparkles, LogIn } from 'lucide-react';
 export default function LoginPage() {
   const { login } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const isMobile = useIsMobile();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const nextPath = useMemo(() => {
+    const raw = (searchParams.get('next') || '').trim();
+    if (!raw.startsWith('/')) return null;
+    if (raw.startsWith('//')) return null;
+    if (raw === '/login') return null;
+    return raw;
+  }, [searchParams]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -20,12 +28,8 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await login(email, password);
-      // Mobile → go straight to photo studio
-      if (window.innerWidth < 768) {
-        navigate('/photo-studio');
-      } else {
-        navigate('/workspace');
-      }
+      const target = nextPath || (window.innerWidth < 768 ? '/photo-studio' : '/workspace');
+      navigate(target, { replace: true });
     } catch (err: any) {
       if (err?.code === 'ACCOUNT_NOT_VERIFIED' || /не активирован/i.test(String(err?.message || ''))) {
         localStorage.setItem('pending_verify_email', err?.email || email);

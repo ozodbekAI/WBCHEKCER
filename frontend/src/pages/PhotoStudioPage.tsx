@@ -1474,8 +1474,77 @@ export default function PhotoStudioPage() {
   };
 
   // Delete photo from history
-  const deleteHistoryPhoto = (photoId: string) => {
-    setGeneratedPhotos((prev) => prev.filter((p) => p.id !== photoId));
+  const deleteHistoryPhoto = async (photo: PhotoMedia) => {
+    if (!photo.assetId) {
+      setGeneratedPhotos((prev) => prev.filter((p) => p.id !== photo.id));
+      setMessages((prev) => prev.filter((msg) => !msg.photos?.some((item) => item.id === photo.id)));
+      setPreviewPhoto((prev) => (prev?.id === photo.id ? null : prev));
+      return;
+    }
+
+    try {
+      const result = await api.deletePhotoChatAssets([photo.assetId], activeThreadId || undefined);
+      const deletedMessageIds = new Set<number>(
+        (Array.isArray(result?.deleted_message_ids) ? result.deleted_message_ids : [])
+          .map((value: any) => Number(value))
+          .filter((value: number) => Number.isFinite(value)),
+      );
+
+      setGeneratedPhotos((prev) => prev.filter((p) => p.id !== photo.id));
+      setMessages((prev) => prev.reduce<ChatMessage[]>((acc, msg) => {
+        if (msg.id === WELCOME_MSG.id) {
+          acc.push(msg);
+          return acc;
+        }
+
+        if (msg.dbId && deletedMessageIds.has(msg.dbId)) {
+          return acc;
+        }
+
+        if (!msg.photos?.length) {
+          acc.push(msg);
+          return acc;
+        }
+
+        const remainingPhotos = msg.photos.filter((item) => item.assetId !== photo.assetId);
+        if (remainingPhotos.length === msg.photos.length) {
+          acc.push(msg);
+          return acc;
+        }
+
+        if (msg.type === 'image' && remainingPhotos.length === 0) {
+          return acc;
+        }
+
+        acc.push({
+          ...msg,
+          photos: remainingPhotos.length ? remainingPhotos : undefined,
+        });
+        return acc;
+      }, []));
+
+      if (result?.context_state) {
+        setContextState(result.context_state);
+      }
+      if (typeof result?.message_count === 'number') {
+        const threadId = Number(result?.thread_id || activeThreadId || 0);
+        if (threadId > 0) {
+          setThreadList((prev) => {
+            const next = prev.map((item) => (
+              item.id === threadId
+                ? { ...item, messageCount: result.message_count }
+                : item
+            ));
+            saveStoredThreads(next);
+            return next;
+          });
+        }
+      }
+      setPreviewPhoto((prev) => (prev?.id === photo.id ? null : prev));
+    } catch (e) {
+      console.error('Delete history asset error', e);
+      toast.error('Не удалось удалить фото из истории');
+    }
   };
 
   // Add generated photo to gallery (scenes or models)
@@ -2538,7 +2607,7 @@ export default function PhotoStudioPage() {
                       <div className="ps-mobile-history-actions">
                         <button onClick={(e) => { e.stopPropagation(); handleDownload(p); }}><Download size={14} /></button>
                         <button onClick={(e) => { e.stopPropagation(); attachByUrl(p.url, p.assetId); setMobileTab('chat'); }}><Paperclip size={14} /></button>
-                        <button onClick={(e) => { e.stopPropagation(); deleteHistoryPhoto(p.id); }}><Trash2 size={14} /></button>
+                        <button onClick={(e) => { e.stopPropagation(); void deleteHistoryPhoto(p); }}><Trash2 size={14} /></button>
                       </div>
                     </div>
                   ))}
@@ -3797,7 +3866,7 @@ export default function PhotoStudioPage() {
                           <button onClick={() => handleDownload(p)} title="Скачать">
                             <Download size={13} />
                           </button>
-                          <button onClick={() => deleteHistoryPhoto(p.id)} title="Удалить">
+                          <button onClick={() => { void deleteHistoryPhoto(p); }} title="Удалить">
                             <Trash2 size={13} />
                           </button>
                           <button onClick={(e) => { setGalleryAddRect((e.currentTarget as HTMLElement).getBoundingClientRect()); setGalleryAddPhoto(p); setGalleryAddType('scene'); }} title="В галерею">

@@ -305,6 +305,25 @@ async def delete_chat_messages(
         await controller.close()
 
 
+@router.post("/chat/assets/delete")
+async def delete_chat_assets(
+    payload: Dict[str, Any],
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_dependency),
+):
+    controller = PhotoChatController()
+    try:
+        return await controller.delete_assets(user=current_user, db=db, payload=payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("photo chat/assets/delete failed")
+        raise _mapped_photo_http_exception(e, context="chat_delete_assets", default_status=400)
+    finally:
+        await controller.close()
+
+
 @router.post("/chat/clear")
 async def clear_chat_history(
     payload: Optional[PhotoChatClearRequest] = None,

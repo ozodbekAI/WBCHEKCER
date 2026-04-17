@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.core.config import settings
 from app.services.photo_chat_repository import PhotoChatRepository
@@ -24,7 +24,7 @@ from app.services.media_storage import (
     save_generated_metadata,
 )
 from app.services.photo_chat_agent import PhotoChatAgent, resolve_photo_chat_locale
-from app.models.photo_chat import PhotoChatMedia, PhotoChatMessage
+from app.models.photo_chat import PhotoChatMedia, PhotoChatMessage, PhotoChatThread
 
 from app.services.scence_repositories import SceneCategoryRepository, PoseRepository
 from app.services.model_repository import ModelRepository
@@ -274,6 +274,18 @@ def _resolve_local_media_path(source_url: str, *, base_url: str | None = None) -
 
 def _is_chat_locked(message_count: int) -> bool:
     return MAX_CHAT_MESSAGES is not None and message_count >= MAX_CHAT_MESSAGES
+
+
+def _resolve_media_relpath(relpath: str | None) -> Path | None:
+    raw = (relpath or "").strip().replace("\\", "/")
+    if not raw or ".." in Path(raw).parts:
+        return None
+
+    media_root = Path(settings.MEDIA_ROOT).resolve()
+    full_path = (media_root / raw).resolve()
+    if not str(full_path).startswith(str(media_root) + os.sep) and full_path != media_root:
+        return None
+    return full_path
 
 
 async def _download_image_bytes(source_url: str, *, base_url: str | None = None) -> Tuple[bytes, str]:
@@ -2207,6 +2219,152 @@ class PhotoChatController:
             "message_count": msg_count,
             "limit": MAX_CHAT_MESSAGES,
             "locked": _is_chat_locked(msg_count),
+        }
+
+    async def delete_assets(self, *, user: Any, db, payload: Dict[str, Any]) -> Dict[str, Any]:
+        uid = _user_id(user)
+        if uid is None:
+            return {"deleted": 0, "deleted_media": 0, "message_count": 0, "limit": MAX_CHAT_MESSAGES, "locked": False}
+
+        ids_raw = payload.get("asset_ids") or payload.get("media_ids") or payload.get("ids") or []
+        if not isinstance(ids_raw, list):
+            ids_raw = [ids_raw]
+
+        asset_ids: list[int] = []
+        for item in ids_raw:
+            try:
+                asset_ids.append(int(item))
+            except Exception:
+                pass
+        asset_ids = list(dict.fromkeys(asset_ids))
+        if not asset_ids:
+            return {"deleted": 0, "deleted_media": 0, "message_count": 0, "limit": MAX_CHAT_MESSAGES, "locked": False}
+
+        repo = PhotoChatRepository(db)
+        sess = repo.get_or_create_user_session(uid)
+        active_thread = repo.get_or_create_active_thread(sess.id)
+        thread = self._resolve_thread(repo, session_id=sess.id, requested_thread_id=_coerce_int(payload.get("thread_id")))
+
+        deleted_media = repo.delete_media_by_ids(sess.id, asset_ids)
+        if not deleted_media:
+            msg_count = self._thread_message_count(repo, thread.id)
+            return {
+                "thread_id": thread.id,
+                "active_thread_id": active_thread.id,
+                "deleted": 0,
+                "deleted_media": 0,
+                "deleted_message_ids": [],
+                "deleted_asset_ids": [],
+                "message_count": msg_count,
+                "limit": MAX_CHAT_MESSAGES,
+                "locked": _is_chat_locked(msg_count),
+                "context_state": repo.get_thread_context(thread.id),
+            }
+
+        deleted_asset_ids = [int(item.id) for item in deleted_media]
+        deleted_asset_id_set = set(deleted_asset_ids)
+        deleted_message_ids: list[int] = []
+
+        session_messages = list(
+            db.execute(
+                select(PhotoChatMessage).where(PhotoChatMessage.session_id == sess.id)
+            ).scalars().all()
+        )
+        for message in session_messages:
+            meta = message.meta if isinstance(message.meta, dict) else None
+            asset_refs = meta.get("asset_ids") if meta else None
+            if not isinstance(asset_refs, list):
+                continue
+
+            normalized_refs: list[int] = []
+            for item in asset_refs:
+                try:
+                    normalized_refs.append(int(item))
+                except Exception:
+                    continue
+
+            if not any(asset_id in deleted_asset_id_set for asset_id in normalized_refs):
+                continue
+
+            remaining_refs = [asset_id for asset_id in normalized_refs if asset_id not in deleted_asset_id_set]
+            if message.msg_type == "image" and not remaining_refs:
+                deleted_message_ids.append(int(message.id))
+                db.delete(message)
+                continue
+
+            next_meta = dict(meta or {})
+            next_meta["asset_ids"] = remaining_refs
+            message.meta = next_meta
+            db.add(message)
+
+        remaining_last_media = repo.get_last_media(sess.id)
+        if getattr(sess, "last_generated_relpath", None) in {item.relpath for item in deleted_media}:
+            sess.last_generated_relpath = remaining_last_media.relpath if remaining_last_media else None
+            db.add(sess)
+
+        all_threads = list(
+            db.execute(
+                select(PhotoChatThread).where(PhotoChatThread.session_id == sess.id)
+            ).scalars().all()
+        )
+        for session_thread in all_threads:
+            context_state = repo.get_thread_context(session_thread.id)
+            working_asset_ids = [
+                int(asset_id)
+                for asset_id in (context_state.get("working_asset_ids") or [])
+                if str(asset_id).strip().isdigit() and int(asset_id) not in deleted_asset_id_set
+            ]
+
+            last_generated_asset_id = _coerce_int(context_state.get("last_generated_asset_id"))
+            if last_generated_asset_id in deleted_asset_id_set:
+                last_generated_asset_id = remaining_last_media.id if remaining_last_media else None
+
+            last_action = context_state.get("last_action")
+            if isinstance(last_action, dict):
+                cleaned_last_action: dict[str, Any] = {}
+                for key, value in last_action.items():
+                    if key in {"asset_ids", "source_asset_ids", "generated_asset_ids"} and isinstance(value, list):
+                        filtered_ids: list[int] = []
+                        for item in value:
+                            try:
+                                asset_id = int(item)
+                            except Exception:
+                                continue
+                            if asset_id not in deleted_asset_id_set:
+                                filtered_ids.append(asset_id)
+                        cleaned_last_action[key] = filtered_ids
+                    else:
+                        cleaned_last_action[key] = value
+                last_action = cleaned_last_action
+
+            repo.update_thread_context(
+                session_thread.id,
+                working_asset_ids=working_asset_ids,
+                last_generated_asset_id=last_generated_asset_id,
+                last_action=last_action,
+            )
+
+        db.commit()
+
+        for media in deleted_media:
+            file_path = _resolve_media_relpath(media.relpath)
+            if file_path is None:
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                file_path.unlink()
+
+        msg_count = self._thread_message_count(repo, thread.id)
+        return {
+            "thread_id": thread.id,
+            "active_thread_id": active_thread.id,
+            "deleted": len(deleted_message_ids),
+            "deleted_media": len(deleted_asset_ids),
+            "deleted_message_ids": deleted_message_ids,
+            "deleted_asset_ids": deleted_asset_ids,
+            "message_count": msg_count,
+            "limit": MAX_CHAT_MESSAGES,
+            "locked": _is_chat_locked(msg_count),
+            "context_state": repo.get_thread_context(thread.id),
         }
 
     async def clear_history(self, *, user: Any, db, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:

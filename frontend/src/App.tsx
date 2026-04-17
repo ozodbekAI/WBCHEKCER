@@ -1,8 +1,9 @@
 import React, { Suspense, useCallback, useEffect } from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { StoreProvider, useStore } from './contexts/StoreContext';
 import { initWorkTrackerListeners } from './hooks/useWorkTracker';
+import { AUTH_REQUIRED_EVENT } from './api/client';
 import SyncProgressBanner from './components/SyncProgressBanner';
 import StoreFeatureBlockedState from './components/StoreFeatureBlockedState';
 import AdAnalysisBootstrapGate from './components/AdAnalysisBootstrapGate';
@@ -116,6 +117,24 @@ function AppRoutes() {
   );
 }
 
+function AuthNavigationBridge() {
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    const handleAuthRequired = (event: Event) => {
+      const detail = (event as CustomEvent<{ to?: string }>).detail;
+      navigate(detail?.to || '/login', { replace: true });
+    };
+
+    window.addEventListener(AUTH_REQUIRED_EVENT, handleAuthRequired as EventListener);
+    return () => {
+      window.removeEventListener(AUTH_REQUIRED_EVENT, handleAuthRequired as EventListener);
+    };
+  }, [navigate]);
+
+  return null;
+}
+
 export default function App() {
   useEffect(() => {
     const cleanup = initWorkTrackerListeners();
@@ -124,6 +143,7 @@ export default function App() {
 
   return (
     <BrowserRouter>
+      <AuthNavigationBridge />
       <AuthProvider>
         <StoreProvider>
           <AppRoutes />
