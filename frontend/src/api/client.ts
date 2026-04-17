@@ -1,13 +1,4 @@
-import type {
-  PhotoChatClearMode,
-  PhotoChatClearResponse,
-  PhotoChatDeleteResponse,
-  PhotoChatHistoryResponse,
-  PhotoChatStreamRequest,
-  PhotoChatUploadResponse,
-} from '../features/photo-studio/contract';
-
-const DEFAULT_API_BASE = '/api';
+const DEFAULT_API_BASE = 'https://rlvzhwmf-8002.euw.devtunnels.ms/api';
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
 const LOCAL_API_BASE_RE = /^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3})(?::\d+)?(?:\/.*)?$/i;
 const API_BASE =
@@ -82,6 +73,8 @@ class ApiClient {
     if (auth && this.token && !next.has('Authorization')) {
       next.set('Authorization', `Bearer ${this.token}`);
     }
+    // ngrok free tier shows a browser warning page for requests without this header
+    next.set('ngrok-skip-browser-warning', '1');
     if (options?.storeId && !next.has('X-Store-Id')) {
       next.set('X-Store-Id', String(options.storeId));
     }
@@ -592,7 +585,7 @@ class ApiClient {
   }
 
   async getPhotoCatalogAll() {
-    return this.requestJson<any>('/api/photo/catalog/all');
+    return this.requestJson<any>('/photo/catalog/all');
   }
 
   async getPhotoGalleryAssets(assetType: 'scene' | 'model') {
@@ -600,27 +593,27 @@ class ApiClient {
   }
 
   async getPhotoChatHistory(threadId?: number) {
-    const params = threadId ? `?thread_id=${encodeURIComponent(String(threadId))}` : '';
-    return this.requestJson<PhotoChatHistoryResponse>(`/api/photo/chat/history${params}`);
+    const params = threadId ? `?thread_id=${threadId}` : '';
+    return this.requestJson<any>(`/photo/chat/history${params}`);
   }
 
-  async createPhotoChatThread() {
-    return this.requestJson<PhotoChatHistoryResponse>('/api/photo/threads/new', { method: 'POST' });
+  async createNewPhotoThread() {
+    return this.requestJson<any>('/photo/threads/new', { method: 'POST' });
   }
 
   async uploadPhotoChatAsset(file: File) {
     const form = new FormData();
     form.append('file', file);
-    const resp = await this.requestRaw('/api/photo/assets/upload', {
+    const resp = await this.requestRaw('/photo/assets/upload', {
       method: 'POST',
       body: form,
     });
-    return resp.json() as Promise<PhotoChatUploadResponse>;
+    return resp.json();
   }
 
   async importPhotoChatAsset(sourceUrl: string) {
-    return this.requestJson<PhotoChatUploadResponse>(
-      '/api/photo/assets/import',
+    return this.requestJson<any>(
+      '/photo/assets/import',
       {
         method: 'POST',
         body: JSON.stringify({ source_url: sourceUrl }),
@@ -629,9 +622,9 @@ class ApiClient {
     );
   }
 
-  async streamPhotoChat(payload: PhotoChatStreamRequest) {
+  async streamPhotoChat(payload: Record<string, any>) {
     return this.requestRaw(
-      '/api/photo/chat/stream',
+      '/photo/chat/stream',
       {
         method: 'POST',
         body: JSON.stringify(payload),
@@ -640,29 +633,23 @@ class ApiClient {
     );
   }
 
-  async clearPhotoChat(payload: { threadId?: number; clearMode: PhotoChatClearMode }) {
-    return this.requestJson<PhotoChatClearResponse>(
-      '/api/photo/chat/clear',
+  async clearPhotoChat(threadId?: number, clearMode: 'messages' | 'context' | 'all' = 'all') {
+    return this.requestJson<any>(
+      '/photo/chat/clear',
       {
         method: 'POST',
-        body: JSON.stringify({
-          ...(payload.threadId ? { thread_id: payload.threadId } : {}),
-          clear_mode: payload.clearMode,
-        }),
+        body: JSON.stringify({ thread_id: threadId, clear_mode: clearMode }),
       },
       { contentType: 'application/json' },
     );
   }
 
   async deletePhotoChatMessages(messageIds: number[], threadId?: number) {
-    return this.requestJson<PhotoChatDeleteResponse>(
-      '/api/photo/chat/messages/delete',
+    return this.requestJson<any>(
+      '/photo/chat/messages/delete',
       {
         method: 'POST',
-        body: JSON.stringify({
-          ...(threadId ? { thread_id: threadId } : {}),
-          message_ids: messageIds,
-        }),
+        body: JSON.stringify({ message_ids: messageIds, thread_id: threadId }),
       },
       { contentType: 'application/json' },
     );

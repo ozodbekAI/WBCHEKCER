@@ -211,6 +211,17 @@ async def chat_stream(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_dependency),
 ):
+    quick_action = payload.quick_action
+    logger.info(
+        "photo chat stream endpoint called | user=%s request_id=%s thread=%s quick_action=%s photo_urls=%s asset_ids=%s",
+        getattr(current_user, "id", None) if not isinstance(current_user, dict) else current_user.get("id") or current_user.get("user_id"),
+        payload.request_id,
+        payload.thread_id,
+        bool(quick_action),
+        payload.photo_urls or payload.photo_url,
+        payload.asset_ids,
+    )
+
     controller = PhotoChatController()
     payload_dict = payload.model_dump(exclude_none=True)
     payload_dict.setdefault("base_url", _request_base_url(request))
@@ -222,7 +233,14 @@ async def chat_stream(
         finally:
             await controller.close()
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/threads/new")

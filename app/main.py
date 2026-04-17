@@ -1,4 +1,6 @@
 import os
+import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -73,6 +75,109 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+http_debug_logger = logging.getLogger("http.debug")
+http_debug_logger.setLevel(logging.INFO)
+
+
+def _configure_debug_loggers() -> None:
+    debug_logger_names = (
+        "http.debug",
+        "photo.chat.controller",
+        "photo.chat.router",
+        "photo.chat.agent",
+        "app.services.kie_service.kie_services",
+        "app.services.kie_service.translator",
+        "photo.studio.cards.router",
+    )
+
+    fallback_handlers = list(logging.getLogger("uvicorn.error").handlers)
+    if not fallback_handlers:
+        fallback_handlers = list(logging.getLogger().handlers)
+
+    # Если приложение запущено не через uvicorn, добавим fallback-обработчик в stdout,
+    # чтобы INFO-логи всегда были видны в терминале.
+    created_default_handler = None
+    if not fallback_handlers:
+        created_default_handler = logging.StreamHandler()
+        created_default_handler.setLevel(logging.INFO)
+        created_default_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        fallback_handlers = [created_default_handler]
+
+    for logger_name in debug_logger_names:
+        logging.getLogger(logger_name).setLevel(logging.INFO)
+        logger = logging.getLogger(logger_name)
+        if not logger.handlers and fallback_handlers:
+            logger.handlers.clear()
+            for handler in fallback_handlers:
+                logger.addHandler(handler)
+        logger.propagate = False
+
+    if created_default_handler is not None and not logging.getLogger().handlers:
+        logging.getLogger().addHandler(created_default_handler)
+
+
+_configure_debug_loggers()
+
+
+@app.middleware("http")
+async def _http_debug_log(request: Request, call_next):
+    """Optional debug logger for investigating frontend/backend mismatches."""
+    if not getattr(settings, "HTTP_DEBUG_LOG", False):
+        return await call_next(request)
+
+    path = request.url.path
+    if not (
+        path.startswith("/stores")
+        or path.startswith("/api/stores")
+        or path.startswith("/auth")
+        or path.startswith("/api/auth")
+        or path.startswith("/photo")
+        or path.startswith("/api/photo")
+        or path.startswith("/photo-assets")
+        or path.startswith("/api/photo-assets")
+    ):
+        return await call_next(request)
+
+    start = time.perf_counter()
+    qs = request.url.query
+    full_path = f"{path}?{qs}" if qs else path
+    origin = request.headers.get("origin")
+    auth_present = bool(request.headers.get("authorization"))
+    x_store_id = request.headers.get("x-store-id")
+    client_host = getattr(getattr(request, "client", None), "host", None)
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        dt_ms = (time.perf_counter() - start) * 1000.0
+        http_debug_logger.exception(
+            "HTTP %s %s -> EXC ms=%.1f client=%s origin=%s auth=%s x-store=%s",
+            request.method,
+            full_path,
+            dt_ms,
+            client_host,
+            origin,
+            "yes" if auth_present else "no",
+            x_store_id,
+        )
+        raise
+
+    dt_ms = (time.perf_counter() - start) * 1000.0
+    http_debug_logger.info(
+        "HTTP %s %s -> %s ms=%.1f client=%s origin=%s auth=%s x-store=%s",
+        request.method,
+        full_path,
+        int(getattr(response, "status_code", 0) or 0),
+        dt_ms,
+        client_host,
+        origin,
+        "yes" if auth_present else "no",
+        x_store_id,
+    )
+    return response
+
 # CORS
 app.add_middleware(
     CORSMiddleware,
@@ -89,20 +194,39 @@ app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
 # Include routers
 app.include_router(auth_router)
+# Compatibility alias for deployments/frontends that prefix all API calls with `/api`.
+# This keeps the existing `/auth/*` routes working while also supporting `/api/auth/*`.
+app.include_router(auth_router, prefix="/api")
 app.include_router(stores_router)
+app.include_router(stores_router, prefix="/api")
 app.include_router(cards_router)
+app.include_router(cards_router, prefix="/api")
 app.include_router(issues_router)
+app.include_router(issues_router, prefix="/api")
 app.include_router(card_issues_router)
+app.include_router(card_issues_router, prefix="/api")
 app.include_router(dashboard_router)
+app.include_router(dashboard_router, prefix="/api")
 app.include_router(admin_router)
+app.include_router(admin_router, prefix="/api")
 app.include_router(promotion_router)
+app.include_router(promotion_router, prefix="/api")
 app.include_router(photo_assets_router)
+app.include_router(photo_assets_router, prefix="/api")
 app.include_router(photo_chat_router)
+# Compatibility alias for older builds that already include `/api` in Photo Studio paths while also using API base `/api`.
+# This enables `/api/api/photo/*` in addition to the canonical `/api/photo/*`.
+app.include_router(photo_chat_router, prefix="/api")
 app.include_router(team_router)
+app.include_router(team_router, prefix="/api")
 app.include_router(sync_router)
+app.include_router(sync_router, prefix="/api")
 app.include_router(fixed_files_router)
+app.include_router(fixed_files_router, prefix="/api")
 app.include_router(scheduler_router)
+app.include_router(scheduler_router, prefix="/api")
 app.include_router(sku_economics_router)
+app.include_router(sku_economics_router, prefix="/api")
 
 # Serve frontend static files (built React app)
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"

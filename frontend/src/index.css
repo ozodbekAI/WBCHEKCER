@@ -2,7 +2,7 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Definition of the design system. All colors use full hsl() format
+/* Definition of the design system. All colors use full hex/hsl format
    so they work both as Tailwind classes AND as direct var(--name) references.
 */
 

@@ -22,8 +22,12 @@ import {
   TrendingUp,
   Upload,
 } from 'lucide-react';
+import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 
+import api from '@/api/client';
+import DataReadinessCard, { getPrimaryCTA } from '@/components/ad-analysis/DataReadinessCard';
+import AdSpendAccuracyBar from '@/components/ad-analysis/AdSpendAccuracyBar';
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -32,15 +36,6 @@ import { Progress } from '@/components/ui/progress';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useStore } from '@/contexts/StoreContext';
-import {
-  SourceHealthCard,
-} from '@/features/ad-analysis/components/SourceHealthCard';
-import { buildSkuExportRows } from '@/features/ad-analysis/export';
-import {
-  useAdAnalysisOverview,
-  type AdAnalysisUploadKind,
-  type SchedulerStatus,
-} from '@/features/ad-analysis/hooks/useAdAnalysisOverview';
 import { cn } from '@/lib/utils';
 import type {
   AdAnalysisCampaign,
@@ -51,6 +46,9 @@ import type {
   AdAnalysisSourceStatus,
   AdAnalysisTrendSignal,
   AdAnalysisUploadResult,
+  AdAnalysisDecisionLabel,
+  MetricLineage,
+  SourceMode,
 } from '@/types';
 
 type PeriodPreset = '7d' | '14d' | '30d' | '90d' | 'all' | 'custom';
@@ -62,9 +60,16 @@ const PERIOD_OPTIONS: Array<{ id: PeriodPreset; label: string }> = [
   { id: 'all', label: 'Весь период' },
 ];
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
-type UploadKind = AdAnalysisUploadKind;
-type ViewMode = 'simple' | 'explanation' | 'analytics';
+type UploadKind = 'costs' | 'spend' | 'finance';
+type ViewMode = 'decisions' | 'data' | 'products';
 type DrawerTab = 'action' | 'why' | 'analytics';
+type SchedulerStatus = {
+  is_running: boolean;
+  interval_sec: number;
+  last_tick_at: string | null;
+  next_tick_at: string | null;
+  next_tick_in_sec: number | null;
+};
 
 const STATUS_META: Record<AdAnalysisItemStatus, { label: string; tileClass: string; chipClass: string; dotClass: string }> = {
   stop: {
@@ -92,22 +97,25 @@ const STATUS_META: Record<AdAnalysisItemStatus, { label: string; tileClass: stri
     dotClass: 'bg-emerald-500',
   },
   low_data: {
-    label: 'Нужно добрать',
+    label: 'Пока рано принимать решение',
     tileClass: 'border-slate-200 bg-slate-50 text-slate-700',
     chipClass: 'border-slate-200 bg-slate-50 text-slate-700',
     dotClass: 'bg-slate-500',
   },
 };
 
-const SOURCE_MODE_META: Record<AdAnalysisSourceStatus['mode'], string> = {
+const SOURCE_MODE_META: Record<string, string> = {
   automatic: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+  ok: 'border-emerald-200 bg-emerald-50 text-emerald-700',
   partial: 'border-amber-200 bg-amber-50 text-amber-700',
   manual: 'border-sky-200 bg-sky-50 text-sky-700',
   manual_required: 'border-rose-200 bg-rose-50 text-rose-700',
   failed: 'border-rose-200 bg-rose-50 text-rose-700',
+  error: 'border-rose-200 bg-rose-50 text-rose-700',
   pending: 'border-slate-200 bg-slate-50 text-slate-600',
   running: 'border-indigo-200 bg-indigo-50 text-indigo-700',
   missing: 'border-slate-200 bg-slate-50 text-slate-600',
+  empty: 'border-slate-200 bg-slate-50 text-slate-600',
 };
 
 const PRIORITY_META: Record<AdAnalysisPriority, { label: string; className: string }> = {
@@ -394,7 +402,23 @@ function downloadTemplate(fileName: string, rows: string[][]) {
 }
 
 function downloadSkuExport(items: AdAnalysisItem[]) {
-  const rows = buildSkuExportRows(items, displayStatusLabel);
+  const rows = items.map((item) => ({
+    'Артикул ВБ': item.nm_id,
+    'Артикул поставщика': item.vendor_code || '',
+    'Название': item.title || '',
+    'Статус': displayStatusLabel(item),
+    'Причина': item.status_reason,
+    'Действие': item.action_title,
+    'Чистая прибыль, руб': Math.round(item.metrics.net_profit),
+    'Факт. CPO, руб': Math.round(item.metrics.actual_cpo),
+    'Лимит CPO, руб': Math.round(item.metrics.max_cpo),
+    'Запас, руб': Math.round(item.metrics.profit_delta),
+    'Выручка, руб': Math.round(item.metrics.revenue),
+    'Расходы WB, руб': Math.round(item.metrics.wb_costs),
+    'Себестоимость, руб': Math.round(item.metrics.cost_price),
+    'Прибыль до рекламы, руб': Math.round(item.metrics.gross_profit_before_ads),
+    'Реклама, руб': Math.round(item.metrics.ad_cost),
+  }));
   const worksheet = XLSX.utils.json_to_sheet(rows);
   worksheet['!cols'] = Object.keys(rows[0] || {
     'Артикул ВБ': '',
@@ -489,44 +513,48 @@ function getGuideLiveHint(kind: UploadKind, overview: AdAnalysisOverview | null)
     : 'Финансы WB доступны. Этот файл нужен только как резервный сценарий или сверка.';
 }
 
-function getSourceModeLabel(mode: AdAnalysisSourceStatus['mode']) {
+function getSourceModeLabel(mode: string) {
   switch (mode) {
     case 'automatic':
-      return 'Загружено';
+    case 'ok':
+      return 'Полностью загружено';
     case 'partial':
-      return 'Частично';
+      return 'Частично загружено';
     case 'manual':
-      return 'Есть файл';
+      return 'Загружено вручную';
     case 'manual_required':
       return 'Нужен файл';
     case 'failed':
-      return 'Ошибка';
+    case 'error':
+      return 'Ошибка загрузки';
+    case 'running':
+      return 'Обновляется';
     case 'pending':
       return 'В очереди';
-    case 'running':
-      return 'Загрузка';
     case 'missing':
+      return 'Нет данных';
+    case 'empty':
     default:
-      return 'Не загружали';
+      return 'Нет данных';
   }
 }
 
 function getViewModeCopy(mode: ViewMode) {
-  if (mode === 'simple') {
+  if (mode === 'decisions') {
     return {
-      title: 'Обзор',
-      description: 'Сначала действие, потом ключевые SKU.',
+      title: 'Решения',
+      description: 'Ключевые выводы и рекомендуемые действия.',
     };
   }
-  if (mode === 'explanation') {
+  if (mode === 'data') {
     return {
-      title: 'Источники',
-      description: 'Что уже есть в backend и какой файл еще нужен.',
+      title: 'Данные',
+      description: 'Откуда взялись данные и что ещё нужно загрузить.',
     };
   }
   return {
-    title: 'Excel',
-    description: 'Только таблица, фильтры и экспорт.',
+    title: 'Товары',
+    description: 'Таблица SKU, фильтры и экспорт.',
   };
 }
 
@@ -634,58 +662,129 @@ export default function AdAnalysisPage() {
   const [periodPreset, setPeriodPreset] = useState<PeriodPreset>('14d');
   const [customPeriodStart, setCustomPeriodStart] = useState<string>(initialCustomRange.start);
   const [customPeriodEnd, setCustomPeriodEnd] = useState<string>(initialCustomRange.end);
-  const [viewMode, setViewMode] = useState<ViewMode>('simple');
+  const [viewMode, setViewMode] = useState<ViewMode>('decisions');
+  const [loading, setLoading] = useState(false);
+  const [bootstrapping, setBootstrapping] = useState(false);
+  const [overview, setOverview] = useState<AdAnalysisOverview | null>(null);
+  const [error, setError] = useState('');
   const [statusFilter, setStatusFilter] = useState<AdAnalysisItemStatus | 'all'>('all');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(25);
   const [selectedItem, setSelectedItem] = useState<AdAnalysisItem | null>(null);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>('action');
+  const [uploading, setUploading] = useState<UploadKind | null>(null);
+  const [schedulerStatus, setSchedulerStatus] = useState<SchedulerStatus | null>(null);
+  const [lastUploadResult, setLastUploadResult] = useState<{ kind: UploadKind; result: AdAnalysisUploadResult } | null>(null);
   const [showTableDetails, setShowTableDetails] = useState(false);
 
   const deferredSearch = useDeferredValue(search);
   const costsInputRef = useRef<HTMLInputElement>(null);
   const spendInputRef = useRef<HTMLInputElement>(null);
   const financeInputRef = useRef<HTMLInputElement>(null);
-  const requestedPeriod = periodPreset === 'custom'
-    ? { period_start: customPeriodStart, period_end: customPeriodEnd }
-    : fallbackPeriod(periodPresetToDays(periodPreset));
-
-  const {
-    loading,
-    bootstrapping,
-    overview,
-    error,
-    uploading,
-    schedulerStatus,
-    lastUploadResult,
-    loadOverview,
-    handleUpload,
-  } = useAdAnalysisOverview({
-    storeId: activeStore?.id,
-    days: periodPreset === 'custom' ? undefined : periodPresetToDays(periodPreset),
-    periodPreset,
-    periodStart: customPeriodStart,
-    periodEnd: customPeriodEnd,
-    page,
-    pageSize,
-    statusFilter,
-    search: deferredSearch,
-    selectedItemNmId: selectedItem?.nm_id ?? null,
-    onSelectedItemRefresh: setSelectedItem,
-  });
+  const autoBootstrapStoreRef = useRef<number | null>(null);
 
   const scrollToSection = (id: string) => {
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
+  const loadOverview = async (force = false) => {
+    if (!activeStore) return;
+    setLoading(true);
+    setError('');
+    try {
+      const data = await api.getAdAnalysisOverview(activeStore.id, {
+        days: periodPreset === 'custom' ? undefined : periodPresetToDays(periodPreset),
+        preset: periodPreset,
+        period_start: periodPreset === 'custom' ? customPeriodStart : undefined,
+        period_end: periodPreset === 'custom' ? customPeriodEnd : undefined,
+        page,
+        page_size: pageSize,
+        status: statusFilter !== 'all' ? statusFilter : undefined,
+        search: deferredSearch.trim() || undefined,
+        force,
+      });
+      setOverview(data);
+      if (selectedItem) {
+        const pooledItems = [...data.items, ...data.critical_preview, ...data.growth_preview];
+        const fresh = pooledItems.find((item) => item.nm_id === selectedItem.nm_id) || null;
+        setSelectedItem(fresh);
+      }
+      if (force) {
+        try {
+          const freshSchedulerStatus = await api.getSchedulerStatus();
+          setSchedulerStatus(freshSchedulerStatus);
+        } catch {
+          // scheduler hint is optional here
+        }
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Не удалось загрузить SKU economics';
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!activeStore) return;
+    void loadOverview(false);
+  }, [
+    activeStore?.id,
+    periodPreset,
+    customPeriodStart,
+    customPeriodEnd,
+    page,
+    pageSize,
+    statusFilter,
+    deferredSearch,
+  ]);
+
+  useEffect(() => {
+    autoBootstrapStoreRef.current = null;
+  }, [activeStore?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!activeStore) return;
+    void api.getSchedulerStatus()
+      .then((status) => {
+        if (!cancelled) setSchedulerStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setSchedulerStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeStore?.id]);
+
+  useEffect(() => {
+    if (!activeStore || !overview || loading || bootstrapping) return;
+    const hasArchive = Boolean(overview.available_period_start && overview.available_period_end);
+    if (overview.snapshot_ready || hasArchive) return;
+    if (autoBootstrapStoreRef.current === activeStore.id) return;
+    autoBootstrapStoreRef.current = activeStore.id;
+    setBootstrapping(true);
+    void loadOverview(true).finally(() => setBootstrapping(false));
+  }, [activeStore, overview, loading, bootstrapping]);
+
   useEffect(() => {
     setPage(1);
   }, [periodPreset, customPeriodStart, customPeriodEnd, statusFilter, deferredSearch, pageSize]);
 
+  // §5.4 — default tab: if decision_ready=false → Данные, else → Решения
+  useEffect(() => {
+    if (overview?.data_quality && !overview.data_quality.decision_ready) {
+      setViewMode('data');
+    }
+  }, [overview?.data_quality?.decision_ready]);
+
   const currentPeriod = overview
     ? { period_start: overview.period_start, period_end: overview.period_end }
-    : requestedPeriod;
+    : periodPreset === 'custom'
+      ? { period_start: customPeriodStart, period_end: customPeriodEnd }
+      : fallbackPeriod(periodPresetToDays(periodPreset));
 
   const items = overview?.items || [];
   const snapshotReady = Boolean(overview?.snapshot_ready);
@@ -706,69 +805,70 @@ export default function AdAnalysisPage() {
         ...(overview.upload_needs.needs_manual_finance ? (['finance'] as const) : []),
       ]
     : [];
-  const isSimpleMode = viewMode === 'simple';
-  const isExplanationMode = viewMode === 'explanation';
-  const isAnalyticsMode = viewMode === 'analytics';
-  const shouldShowManualFiles = Boolean(lastUploadResult || requiredUploadKinds.length > 0 || isAnalyticsMode);
-  const readySourceCount = overview?.source_statuses.filter((source) => source.mode === 'automatic' || source.mode === 'manual' || source.mode === 'partial').length || 0;
-  const attentionSourceCount = overview?.source_statuses.filter((source) => source.mode === 'failed' || source.mode === 'manual_required' || source.mode === 'missing').length || 0;
+  const isDecisionsMode = viewMode === 'decisions';
+  const isDataMode = viewMode === 'data';
+  const isProductsMode = viewMode === 'products';
+  const shouldShowManualFiles = Boolean(lastUploadResult || requiredUploadKinds.length > 0 || isDataMode);
+  const readySourceCount = overview?.source_statuses.filter((source) => ['automatic', 'ok', 'manual', 'partial'].includes(source.mode)).length || 0;
+  const attentionSourceCount = overview?.source_statuses.filter((source) => ['error', 'failed', 'manual_required'].includes(source.mode)).length || 0;
   const nextAction = (() => {
     if (!overview) return null;
+    // §3.4 — blocked sources first
+    const blockedSources = overview.data_quality?.blocked_sources || [];
+    if (blockedSources.length > 0) {
+      return {
+        tone: 'border-rose-200 bg-rose-50 text-rose-900',
+        title: 'Сначала разблокируйте источники данных',
+        description: `Заблокировано: ${blockedSources.join(', ')}. Без них рекомендации не могут быть точными.`,
+        actionLabel: 'Перейти к данным',
+        action: () => setViewMode('data'),
+      };
+    }
     if (overview.upload_needs.missing_costs_count > 0) {
       return {
         tone: 'border-amber-200 bg-amber-50 text-amber-900',
-        eyebrow: 'Шаг 1',
-        title: `Сначала загрузите себестоимость для ${overview.upload_needs.missing_costs_count} SKU`,
-        description: 'Без себестоимости система будет показывать приблизительный Net Profit и Max CPO. Это первый обязательный шаг.',
+        title: `Загрузите себестоимость для ${overview.upload_needs.missing_costs_count} SKU`,
+        description: 'Без себестоимости прибыль и Max CPO будут приблизительными.',
         actionLabel: 'Загрузить себестоимость',
         action: () => triggerUpload('costs'),
-        sectionId: 'step-files',
       };
     }
     if (overview.upload_needs.needs_manual_finance) {
       return {
         tone: 'border-sky-200 bg-sky-50 text-sky-900',
-        eyebrow: 'Шаг 1',
-        title: 'Добавьте финансовый файл за выбранный период',
-        description: 'WB не отдал достаточный финансовый слой. Без него итоговая прибыль будет недостоверной.',
+        title: 'Сначала добавьте финансовый файл',
+        description: 'Без него чистая прибыль и убыточные SKU могут определяться неточно.',
         actionLabel: 'Загрузить финансы',
         action: () => triggerUpload('finance'),
-        sectionId: 'step-files',
       };
     }
     if (overview.upload_needs.needs_manual_spend) {
       return {
         tone: 'border-amber-200 bg-amber-50 text-amber-900',
-        eyebrow: 'Шаг 2',
         title: `Разнесите остаток расходов: ${formatMoney(overview.unallocated_spend)}`,
-        description: 'WB не привязал часть spend к nmID. Если загрузить ручное распределение, вывод станет точнее.',
-        actionLabel: 'Загрузить распределение',
+        description: 'WB не привязал часть расходов к SKU. Ручное распределение сделает вывод точнее.',
+        actionLabel: 'Разнести расходы',
         action: () => triggerUpload('spend'),
-        sectionId: 'step-files',
       };
     }
-    if (topProblemItems[0]) {
+    if (topProblemItems[0] && overview.data_quality?.decision_ready) {
       return {
         tone: 'border-rose-200 bg-rose-50 text-rose-900',
-        eyebrow: 'Шаг 3',
         title: `Разберите самый срочный SKU: ${topProblemItems[0].title || `nmID ${topProblemItems[0].nm_id}`}`,
         description: topProblemItems[0].action_title,
-        actionLabel: 'Открыть SKU',
+        actionLabel: 'Открыть самый срочный SKU',
         action: () => {
           setDrawerTab('action');
           setSelectedItem(topProblemItems[0]);
         },
-        sectionId: 'step-actions',
       };
     }
     return {
       tone: 'border-emerald-200 bg-emerald-50 text-emerald-900',
-      eyebrow: 'Готово',
       title: 'Данные собраны. Можно переходить к решениям по SKU.',
-      description: 'Откройте список SKU ниже и идите по статусам: остановить, спасти, контролировать или растить.',
-      actionLabel: 'Перейти к SKU',
-      action: () => scrollToSection('step-skus'),
-      sectionId: 'step-skus',
+      description: 'Идите по статусам: остановить, спасти, контролировать или растить.',
+      actionLabel: 'Посмотреть товары',
+      action: () => setViewMode('products'),
     };
   })();
   const modeCopy = getViewModeCopy(viewMode);
@@ -783,6 +883,32 @@ export default function AdAnalysisPage() {
     if (kind === 'finance') financeInputRef.current?.click();
   };
 
+  const handleUpload = async (kind: UploadKind, file?: File | null) => {
+    if (!activeStore || !file) return;
+    setUploading(kind);
+    try {
+      const result =
+        kind === 'costs'
+          ? await api.uploadAdAnalysisCosts(activeStore.id, file)
+          : kind === 'spend'
+            ? await api.uploadAdAnalysisManualSpend(activeStore.id, file, currentPeriod.period_start, currentPeriod.period_end)
+            : await api.uploadAdAnalysisFinance(activeStore.id, file, currentPeriod.period_start, currentPeriod.period_end);
+      setLastUploadResult({ kind, result });
+      toast(`${result.imported + result.updated} строк обработано.`);
+      (result.notes || []).forEach((note) => {
+        if (note) toast(note);
+      });
+      if (result.unresolved_count > 0) {
+        toast.error(`Осталось ${result.unresolved_count} несопоставленных строк. Ниже показан превью проблемных строк.`);
+      }
+      await loadOverview(true);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Upload failed');
+    } finally {
+      setUploading(null);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-[#fafaf8]">
       <input
@@ -791,7 +917,7 @@ export default function AdAnalysisPage() {
         accept=".xlsx,.xls,.csv"
         className="hidden"
         onChange={(e) => {
-          void handleUpload('costs', e.target.files?.[0], currentPeriod);
+          void handleUpload('costs', e.target.files?.[0]);
           e.currentTarget.value = '';
         }}
       />
@@ -801,7 +927,7 @@ export default function AdAnalysisPage() {
         accept=".xlsx,.xls,.csv"
         className="hidden"
         onChange={(e) => {
-          void handleUpload('spend', e.target.files?.[0], currentPeriod);
+          void handleUpload('spend', e.target.files?.[0]);
           e.currentTarget.value = '';
         }}
       />
@@ -811,7 +937,7 @@ export default function AdAnalysisPage() {
         accept=".xlsx,.xls,.csv"
         className="hidden"
         onChange={(e) => {
-          void handleUpload('finance', e.target.files?.[0], currentPeriod);
+          void handleUpload('finance', e.target.files?.[0]);
           e.currentTarget.value = '';
         }}
       />
@@ -940,190 +1066,190 @@ export default function AdAnalysisPage() {
               />
             ) : (
               <>
+                {/* ===== 1. KPI Row — immediately visible ===== */}
                 <section className="rounded-[20px] border border-black/5 bg-white px-4 py-4 shadow-[0_8px_24px_rgba(15,23,42,0.03)]">
-                  <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                     <div>
-                      <h2 className="text-lg font-semibold leading-tight text-foreground">Что делать сейчас</h2>
-                      <p className="mt-1 text-xs text-muted-foreground">{summarySubtitle}</p>
+                      <h2 className="text-lg font-semibold leading-tight text-foreground">Экономика SKU</h2>
+                      <p className="mt-0.5 text-xs text-muted-foreground">{summarySubtitle}</p>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       <Button variant="ghost" className="h-9 gap-2 rounded-xl text-sm" onClick={() => downloadSkuExport(filteredItems.length ? filteredItems : items)}>
                         <Download size={15} />
                         Скачать Excel
                       </Button>
-                      <Button variant="ghost" className="h-9 gap-2 rounded-xl text-sm" onClick={() => void loadOverview(true)}>
-                        <RefreshCcw size={15} className={cn(loading && 'animate-spin')} />
-                        Обновить данные
-                      </Button>
                     </div>
                   </div>
 
-                  <div className="mt-4 grid gap-2 md:grid-cols-3 xl:grid-cols-7">
+                  <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-4">
                     <OverviewMetricCard label="SKU всего" value={String(overview.total_skus)} />
-                    <OverviewMetricCard label="Прибыльные" value={String(overview.profitable_count)} accent="text-emerald-600" />
-                    <OverviewMetricCard label="Проблемные" value={String(overview.problematic_count)} accent="text-amber-600" />
-                    <OverviewMetricCard label="Убыточные" value={String(overview.loss_count)} accent="text-rose-600" />
                     <OverviewMetricCard label="Выручка" value={formatMoney(overview.total_revenue)} large />
                     <OverviewMetricCard label="Реклама" value={formatMoney(overview.total_ad_spend)} large />
                     <OverviewMetricCard label="Чистая прибыль" value={formatMoney(overview.total_net_profit)} accent={overview.total_net_profit >= 0 ? 'text-emerald-600' : 'text-rose-600'} large />
                   </div>
 
-                  <div className="mt-3 rounded-[16px] border border-black/5 bg-slate-50/70 px-3 py-3">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Data quality</span>
-                      <Badge
-                        className={cn(
-                          'rounded-full border px-2.5 py-0.5 text-[10px] font-medium',
-                          overview.data_quality.confidence === 'high' && 'border-emerald-200 bg-emerald-50 text-emerald-700',
-                          overview.data_quality.confidence === 'medium' && 'border-amber-200 bg-amber-50 text-amber-700',
-                          overview.data_quality.confidence === 'low' && 'border-rose-200 bg-rose-50 text-rose-700',
-                        )}
-                      >
-                        {overview.data_quality.confidence === 'high' ? 'Высокая уверенность' : overview.data_quality.confidence === 'medium' ? 'Средняя уверенность' : 'Низкая уверенность'}
-                      </Badge>
-                      <Badge
-                        variant="outline"
-                        className={cn(
-                          'rounded-full px-2.5 py-0.5 text-[10px]',
-                          overview.data_quality.decision_ready ? 'border-emerald-300 text-emerald-700' : 'border-amber-300 text-amber-700',
-                        )}
-                      >
-                        {overview.data_quality.decision_ready ? 'Decision-ready' : 'Preliminary / blocked'}
-                      </Badge>
-                    </div>
-                    {(overview.data_quality.partial_sources.length > 0 || overview.data_quality.blocked_sources.length > 0 || overview.data_quality.notes.length > 0) && (
-                      <div className="mt-2 space-y-1.5 text-[12px] text-muted-foreground">
-                        {overview.data_quality.partial_sources.length > 0 && (
-                          <p>Частичные источники: {overview.data_quality.partial_sources.join(', ')}</p>
-                        )}
-                        {overview.data_quality.blocked_sources.length > 0 && (
-                          <p>Заблокированные источники: {overview.data_quality.blocked_sources.join(', ')}</p>
-                        )}
-                        {overview.data_quality.notes.slice(0, 2).map((note, idx) => (
-                          <p key={`${note}-${idx}`}>{note}</p>
-                        ))}
-                      </div>
-                    )}
+                  {/* Status summary row */}
+                  <div className="mt-2 grid gap-2 md:grid-cols-3">
+                    <OverviewMetricCard
+                      label="Готовы к росту"
+                      value={String(overview.profitable_count + (overview.status_counts.grow || 0))}
+                      accent="text-emerald-600"
+                    />
+                    <OverviewMetricCard
+                      label="Нужны действия"
+                      value={String((overview.status_counts.stop || 0) + (overview.status_counts.rescue || 0) + (overview.status_counts.control || 0))}
+                      accent="text-amber-600"
+                    />
+                    <OverviewMetricCard
+                      label="Недостаточно данных"
+                      value={String(overview.status_counts.low_data || 0)}
+                      accent="text-slate-500"
+                    />
                   </div>
-
-                  <div className="mt-3 flex flex-col gap-3 rounded-[16px] border border-black/5 bg-slate-50/70 px-3 py-3 xl:flex-row xl:items-center xl:justify-between">
-                    <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Режим экрана</p>
-                      <p className="mt-1 text-xs text-muted-foreground">{modeCopy.description}</p>
-                    </div>
-                    <Tabs value={viewMode} onValueChange={(value) => setViewMode(value as ViewMode)} className="w-full xl:w-auto">
-                      <TabsList className="grid h-auto w-full grid-cols-3 rounded-xl bg-white p-1 xl:w-[300px]">
-                        <TabsTrigger value="simple" className="rounded-lg px-2.5 py-1.5 text-xs data-[state=active]:bg-foreground data-[state=active]:text-background">Обзор</TabsTrigger>
-                        <TabsTrigger value="explanation" className="rounded-lg px-2.5 py-1.5 text-xs data-[state=active]:bg-foreground data-[state=active]:text-background">Источники</TabsTrigger>
-                        <TabsTrigger value="analytics" className="rounded-lg px-2.5 py-1.5 text-xs data-[state=active]:bg-foreground data-[state=active]:text-background">Excel</TabsTrigger>
-                      </TabsList>
-                    </Tabs>
-                  </div>
-
-                  {overview.main_takeaway && (
-                    <div className="mt-3 rounded-[16px] border border-black/5 bg-slate-50/60 px-4 py-3">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Главный вывод</p>
-                      <p className="mt-1.5 text-[13px] leading-5 text-foreground">{overview.main_takeaway}</p>
-                    </div>
-                  )}
-
-                  {headlineAlert && (
-                    <div className="mt-3 rounded-[16px] border border-amber-200 bg-amber-50/75 px-4 py-3 text-amber-900">
-                      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                        <div className="flex items-start gap-3">
-                          <CircleAlert size={18} className="mt-0.5 text-amber-500" />
-                          <div>
-                            <p className="text-sm font-semibold">{headlineAlert.title}</p>
-                            <p className="mt-1 text-[13px] leading-5">{headlineAlert.description}</p>
-                            {overview.upload_needs.missing_costs_count > 0 && (
-                              <p className="mt-2 text-xs leading-5 text-amber-800/80">
-                                Подготовьте Excel с тремя колонками: Артикул поставщика, Артикул ВБ и Себестоимость, руб.
-                              </p>
-                            )}
-                          </div>
-                        </div>
-                        {overview.upload_needs.missing_costs_count > 0 && (
-                          <div className="flex flex-col gap-2 sm:min-w-[230px]">
-                            <Button
-                              variant="outline"
-                              className="gap-2 rounded-2xl border-amber-300 bg-white/80 text-amber-900 hover:bg-white"
-                              onClick={() => downloadTemplate(costGuide.templateFileName, costGuide.templateRows)}
-                            >
-                              <Download size={14} />
-                              Скачать шаблон Excel
-                            </Button>
-                            <Button
-                              className="gap-2 rounded-2xl bg-amber-900 text-white hover:bg-amber-950"
-                              onClick={() => triggerUpload('costs')}
-                              disabled={uploading === 'costs'}
-                            >
-                              {uploading === 'costs' ? <RefreshCcw size={14} className="animate-spin" /> : <Upload size={14} />}
-                              {uploading === 'costs' ? 'Загружаем...' : 'Загрузить себестоимость'}
-                            </Button>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-5">
-                    <StatusTile status="stop" count={overview.status_counts.stop || 0} active={statusFilter === 'stop'} onClick={() => setStatusFilter('stop')} />
-                    <StatusTile status="rescue" count={overview.status_counts.rescue || 0} active={statusFilter === 'rescue'} onClick={() => setStatusFilter('rescue')} />
-                    <StatusTile status="control" count={overview.status_counts.control || 0} active={statusFilter === 'control'} onClick={() => setStatusFilter('control')} />
-                    <StatusTile status="grow" count={overview.status_counts.grow || 0} active={statusFilter === 'grow'} onClick={() => setStatusFilter('grow')} />
-                    <StatusTile status="low_data" count={overview.status_counts.low_data || 0} active={statusFilter === 'low_data'} onClick={() => setStatusFilter('low_data')} />
-                  </div>
-
-                  {overview.budget_moves.length > 0 && (
-                    <div className="mt-4 rounded-[16px] border border-black/5 bg-slate-50/55 px-4 py-3">
-                      <div className="flex items-start gap-3">
-                        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-amber-100 text-amber-700">
-                          <Link2 size={15} />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <p className="text-sm font-semibold">Перераспределение бюджета</p>
-                          <p className="mt-1 text-[13px] text-muted-foreground">
-                            Остановив убыточные SKU, можно освободить {formatMoney(overview.budget_moves.reduce((sum, move) => sum + move.from_amount, 0))} и направить на рост:
-                          </p>
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            {overview.budget_moves.slice(0, 6).map((move, index) => (
-                              <span key={`${move.from_nm_id}-${move.to_nm_id}-${index}`} className="rounded-full bg-emerald-50 px-3 py-1.5 text-xs text-emerald-700">
-                                {move.to_title} → +{move.uplift_percent || 10}%
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
                 </section>
 
-                {isSimpleMode && (
-                  <section id="step-next">
-                    <NextActionCard
-                      nextAction={nextAction}
-                      schedulerStatus={schedulerStatus}
-                      generatedAt={overview.generated_at}
-                      onOpenSection={scrollToSection}
-                    />
+                {/* ===== 2. Tabs — right below KPI ===== */}
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <Tabs value={viewMode} onValueChange={(value) => setViewMode(value as ViewMode)} className="w-full sm:w-auto">
+                    <TabsList className="grid h-auto w-full grid-cols-3 rounded-xl bg-muted p-1 sm:w-[340px]">
+                      <TabsTrigger value="decisions" className="rounded-lg px-3 py-2 text-sm font-medium data-[state=active]:bg-foreground data-[state=active]:text-background">Решения</TabsTrigger>
+                      <TabsTrigger value="data" className="rounded-lg px-3 py-2 text-sm font-medium data-[state=active]:bg-foreground data-[state=active]:text-background">Данные</TabsTrigger>
+                      <TabsTrigger value="products" className="rounded-lg px-3 py-2 text-sm font-medium data-[state=active]:bg-foreground data-[state=active]:text-background">Товары</TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+
+                  {/* Compact metadata */}
+                  <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
+                    <span>Обновлено: {formatDateTime(overview.generated_at)}</span>
+                    {schedulerStatus && (
+                      <>
+                        <span className="h-3 w-px bg-border" />
+                        <span>{schedulerStatus.is_running ? 'Автообновление активно' : 'Автообновление выключено'}</span>
+                        {schedulerStatus.next_tick_in_sec != null && schedulerStatus.next_tick_in_sec > 0 && (
+                          <>
+                            <span className="h-3 w-px bg-border" />
+                            <span>~{Math.max(Math.round(schedulerStatus.next_tick_in_sec / 60), 1)} мин</span>
+                          </>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* ===== 3. DataReadinessCard — collapsible, below tabs ===== */}
+                <DataReadinessCard
+                  overview={overview}
+                  primaryCTA={(() => {
+                    const cta = getPrimaryCTA(overview, {
+                      onGoToData: () => {
+                        setViewMode('data');
+                        setTimeout(() => document.getElementById('step-files')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 150);
+                      },
+                      onUploadCosts: () => triggerUpload('costs'),
+                      onUploadFinance: () => triggerUpload('finance'),
+                      onUploadSpend: () => triggerUpload('spend'),
+                      onOpenCriticalSKU: () => {
+                        const item = overview.critical_preview[0];
+                        if (item) { setDrawerTab('action'); setSelectedItem(item); }
+                      },
+                      onOpenGrowth: () => {
+                        const item = overview.growth_preview[0];
+                        if (item) { setDrawerTab('action'); setSelectedItem(item); }
+                      },
+                      onOpenProducts: () => setViewMode('products'),
+                    });
+                    return cta;
+                  })()}
+                />
+
+                {/* ===== 4. Decisions tab — Резюме + status tiles + accuracy bar ===== */}
+                {isDecisionsMode && (
+                  <section className="space-y-4">
+                    {overview.main_takeaway && (
+                      <div className="rounded-[16px] border border-border bg-muted/40 px-4 py-3">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Резюме</p>
+                        <p className="mt-1.5 text-[13px] leading-5 text-foreground">{overview.main_takeaway}</p>
+                      </div>
+                    )}
+
+                    <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-5">
+                      <StatusTile status="stop" count={overview.status_counts.stop || 0} active={statusFilter === 'stop'} onClick={() => setStatusFilter('stop')} />
+                      <StatusTile status="rescue" count={overview.status_counts.rescue || 0} active={statusFilter === 'rescue'} onClick={() => setStatusFilter('rescue')} />
+                      <StatusTile status="control" count={overview.status_counts.control || 0} active={statusFilter === 'control'} onClick={() => setStatusFilter('control')} />
+                      <StatusTile status="grow" count={overview.status_counts.grow || 0} active={statusFilter === 'grow'} onClick={() => setStatusFilter('grow')} />
+                      <StatusTile status="low_data" count={overview.status_counts.low_data || 0} active={statusFilter === 'low_data'} onClick={() => setStatusFilter('low_data')} />
+                    </div>
+
+                    <AdSpendAccuracyBar overview={overview} />
+
+                    {overview.budget_moves.length > 0 && (
+                      <div className="rounded-[16px] border border-black/5 bg-slate-50/55 px-4 py-3">
+                        <div className="flex items-start gap-3">
+                          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-amber-100 text-amber-700">
+                            <Link2 size={15} />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-semibold">Перераспределение бюджета</p>
+                            <p className="mt-1 text-[13px] text-muted-foreground">
+                              Остановив убыточные SKU, можно освободить {formatMoney(overview.budget_moves.reduce((sum, move) => sum + move.from_amount, 0))} и направить на рост:
+                            </p>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {overview.budget_moves.slice(0, 6).map((move, index) => (
+                                <span key={`${move.from_nm_id}-${move.to_nm_id}-${index}`} className="rounded-full bg-emerald-50 px-3 py-1.5 text-xs text-emerald-700">
+                                  {move.to_title} → +{move.uplift_percent || 10}%
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </section>
                 )}
 
-                {isExplanationMode && (
+                {isDecisionsMode && (
+                  <section id="step-next">
+                    <NextActionCard nextAction={nextAction} />
+                  </section>
+                )}
+
+                {isDataMode && shouldShowManualFiles && (
+                  <section id="step-files" className="space-y-3 rounded-xl border border-black/5 bg-white p-4 shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-sm font-semibold">Загрузить файлы</h3>
+                        <p className="mt-0.5 text-xs text-muted-foreground">Файлы, которые нужны для точных расчётов</p>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 md:grid-cols-3">
+                      {FILE_GUIDES.map((guide) => (
+                        <UploadGuideCard
+                          key={`guide-${guide.key}`}
+                          guide={guide}
+                          overview={overview}
+                          active={uploading === guide.key}
+                          neededText={getGuideNeedText(guide.key, overview)}
+                          onUpload={() => triggerUpload(guide.key)}
+                          onTemplate={() => downloadTemplate(guide.templateFileName, guide.templateRows)}
+                        />
+                      ))}
+                    </div>
+                    {lastUploadResult && (
+                      <UploadResultPanel kind={lastUploadResult.kind} result={lastUploadResult.result} />
+                    )}
+                  </section>
+                )}
+
+                {isDataMode && (
                   <section id="step-sources" className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,0.85fr)]">
                     <SourceHealthCard overview={overview} schedulerStatus={schedulerStatus} viewMode={viewMode} />
                     <div className="grid gap-4">
-                      <NextActionCard
-                        nextAction={nextAction}
-                        schedulerStatus={schedulerStatus}
-                        generatedAt={overview.generated_at}
-                        onOpenSection={scrollToSection}
-                      />
+                      <NextActionCard nextAction={nextAction} />
                     </div>
                   </section>
                 )}
 
-                {isExplanationMode && (
+                {isDataMode && (
                   <section className="grid gap-4 xl:grid-cols-2">
                     <TrendColumn
                       title="Что ухудшается прямо сейчас"
@@ -1144,7 +1270,7 @@ export default function AdAnalysisPage() {
                   </section>
                 )}
 
-                {isSimpleMode && (
+                {isDecisionsMode && (
                   <section id="step-actions" className="grid gap-4 xl:grid-cols-2">
                     <SummaryColumn
                       title="Критичные проблемы"
@@ -1152,6 +1278,8 @@ export default function AdAnalysisPage() {
                       icon={<TrendingDown size={18} />}
                       items={criticalList.length ? criticalList : topProblemItems.slice(0, 4)}
                       emptyText="Сейчас нет критичных SKU."
+                      isCritical
+                      decisionReady={overview.data_quality?.decision_ready}
                       onOpen={(item) => {
                         setSelectedItem(item);
                       }}
@@ -1161,7 +1289,10 @@ export default function AdAnalysisPage() {
                       subtitle="Где можно аккуратно увеличивать бюджет"
                       icon={<TrendingUp size={18} />}
                       items={growthList}
-                      emptyText="Пока нет явных SKU для роста."
+                      emptyText={overview.data_quality?.decision_ready === false
+                        ? 'Кандидаты на рост пока не показываются: сначала нужно завершить данные.'
+                        : 'Сейчас нет SKU с безопасным потенциалом для роста.'}
+                      decisionReady={overview.data_quality?.decision_ready}
                       onOpen={(item) => {
                         setSelectedItem(item);
                       }}
@@ -1169,7 +1300,7 @@ export default function AdAnalysisPage() {
                   </section>
                 )}
 
-                {isAnalyticsMode && overview.campaigns.length > 0 && (
+                {isProductsMode && overview.campaigns.length > 0 && (
                   <section className="rounded-[28px] border border-black/5 bg-white p-5 shadow-[0_24px_64px_rgba(15,23,42,0.06)]">
                     <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
                       <div>
@@ -1189,7 +1320,7 @@ export default function AdAnalysisPage() {
                   </section>
                 )}
 
-                {isAnalyticsMode && (
+                {isProductsMode && (
                 <section id="step-skus" className="rounded-[20px] border border-black/5 bg-white px-4 py-4 shadow-[0_8px_24px_rgba(15,23,42,0.03)]">
                   <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
                     <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
@@ -1244,7 +1375,7 @@ export default function AdAnalysisPage() {
                       <p className="text-lg font-semibold">SKU не найдены</p>
                       <p className="mt-2 text-sm text-muted-foreground">Попробуйте снять фильтр или изменить поисковый запрос.</p>
                     </div>
-                  ) : isAnalyticsMode ? (
+                  ) : isProductsMode ? (
                     <SkuTable
                       items={filteredItems}
                       showDetails={showTableDetails}
@@ -1315,32 +1446,8 @@ export default function AdAnalysisPage() {
                 </section>
                 )}
 
-                {isAnalyticsMode && <MetricsHelpCard />}
+                {isProductsMode && <MetricsHelpCard />}
 
-                {isExplanationMode && shouldShowManualFiles && (
-                  <section id="step-files" className="space-y-4 rounded-[28px] border border-black/5 bg-white p-5 shadow-[0_20px_60px_rgba(15,23,42,0.05)]">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Ручные файлы</p>
-                      <h3 className="mt-2 text-lg font-semibold">Файлы, которые могут понадобиться</h3>
-                    </div>
-                    <div className="grid gap-3 lg:grid-cols-3">
-                      {FILE_GUIDES.map((guide) => (
-                        <UploadGuideCard
-                          key={`guide-${guide.key}`}
-                          guide={guide}
-                          overview={overview}
-                          active={uploading === guide.key}
-                          neededText={getGuideNeedText(guide.key, overview)}
-                          onUpload={() => triggerUpload(guide.key)}
-                          onTemplate={() => downloadTemplate(guide.templateFileName, guide.templateRows)}
-                        />
-                      ))}
-                    </div>
-                    {lastUploadResult && (
-                      <UploadResultPanel kind={lastUploadResult.kind} result={lastUploadResult.result} />
-                    )}
-                  </section>
-                )}
               </>
             )}
           </div>
@@ -1384,6 +1491,17 @@ export default function AdAnalysisPage() {
                       {selectedItem.status !== 'low_data' && (
                         <Badge variant="outline" className="rounded-full px-2.5 py-1 text-[11px]">
                           {selectedItem.precision_label}
+                        </Badge>
+                      )}
+                      {/* Decision badge */}
+                      {selectedItem.decision_label && (
+                        <Badge className={cn('rounded-full px-2.5 py-1 text-[11px]',
+                          selectedItem.decision_label === 'ready' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' :
+                          selectedItem.decision_label === 'preliminary' ? 'border-amber-200 bg-amber-50 text-amber-700' :
+                          'border-rose-200 bg-rose-50 text-rose-700'
+                        )}>
+                          {selectedItem.decision_label === 'ready' ? 'Готово к решению' :
+                           selectedItem.decision_label === 'preliminary' ? 'Предварительно' : 'Заблокировано'}
                         </Badge>
                       )}
                     </div>
@@ -1506,11 +1624,57 @@ export default function AdAnalysisPage() {
                             ['CR', formatPct(selectedItem.metrics.cr)],
                           ]}
                         />
+                        {/* Lineage chips */}
+                        <div>
+                          <p className="text-sm font-semibold uppercase tracking-[0.16em] text-muted-foreground">Происхождение данных</p>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <LineageChip label="Выручка" lineage={selectedItem.revenue_lineage} />
+                            <LineageChip label="Заказы" lineage={selectedItem.orders_lineage} />
+                          </div>
+                        </div>
+
+                        {/* Ad cost confidence */}
+                        {selectedItem.metrics.ad_cost_confidence && (
+                          <div>
+                            <p className="text-sm font-semibold uppercase tracking-[0.16em] text-muted-foreground">Точность рекламных данных</p>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <Badge className={cn('rounded-full border px-3 py-1',
+                                selectedItem.metrics.ad_cost_confidence === 'high' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' :
+                                selectedItem.metrics.ad_cost_confidence === 'medium' ? 'border-amber-200 bg-amber-50 text-amber-700' :
+                                'border-rose-200 bg-rose-50 text-rose-700'
+                              )}>
+                                {selectedItem.metrics.ad_cost_confidence === 'high' ? 'Достаточная точность' :
+                                 selectedItem.metrics.ad_cost_confidence === 'medium' ? 'Оценка / частично' : 'Нужна проверка'}
+                              </Badge>
+                              {(selectedItem.metrics.ad_cost_exact ?? 0) > 0 && (
+                                <span className="text-xs text-muted-foreground">Точные: {formatMoney(selectedItem.metrics.ad_cost_exact)}</span>
+                              )}
+                              {(selectedItem.metrics.ad_cost_estimated ?? 0) > 0 && (
+                                <span className="text-xs text-muted-foreground">Оценочные: {formatMoney(selectedItem.metrics.ad_cost_estimated)}</span>
+                              )}
+                              {(selectedItem.metrics.ad_cost_manual ?? 0) > 0 && (
+                                <span className="text-xs text-muted-foreground">Ручные: {formatMoney(selectedItem.metrics.ad_cost_manual)}</span>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
                         <div>
                           <p className="text-sm font-semibold uppercase tracking-[0.16em] text-muted-foreground">Покрытие данных</p>
                           <div className="mt-3 flex flex-wrap gap-2">
-                            <Badge className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-emerald-700">Доходы/Расходы</Badge>
-                            <Badge className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-emerald-700">Воронка</Badge>
+                            {selectedItem.source_lineage && Object.entries(selectedItem.source_lineage).map(([key, mode]) => {
+                              const lineageMeta = mode === 'automatic' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' :
+                                mode === 'manual' ? 'border-sky-200 bg-sky-50 text-sky-700' :
+                                mode === 'partial' ? 'border-amber-200 bg-amber-50 text-amber-700' :
+                                'border-rose-200 bg-rose-50 text-rose-700';
+                              const keyLabel = key === 'advert' ? 'Реклама' : key === 'finance' ? 'Финансы' : key === 'funnel' ? 'Воронка' : key;
+                              const modeLabel = mode === 'automatic' ? 'полностью' : mode === 'manual' ? 'вручную' : mode === 'partial' ? 'частично' : 'ошибка';
+                              return (
+                                <Badge key={key} className={cn('rounded-full border px-3 py-1', lineageMeta)}>
+                                  {keyLabel}: {modeLabel}
+                                </Badge>
+                              );
+                            })}
                             <Badge className={cn(
                               'rounded-full border px-3 py-1',
                               selectedItem.metrics.cost_price > 0 ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-700',
@@ -1524,6 +1688,18 @@ export default function AdAnalysisPage() {
                             ))}
                           </div>
                         </div>
+
+                        {/* Decision readiness */}
+                        {selectedItem.decision_label && selectedItem.decision_label !== 'ready' && (
+                          <div className={cn(
+                            'rounded-[16px] border px-4 py-3 text-[13px]',
+                            selectedItem.decision_label === 'preliminary' ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-rose-200 bg-rose-50 text-rose-800',
+                          )}>
+                            {selectedItem.decision_label === 'preliminary'
+                              ? 'Выводы предварительные. Данных пока не достаточно для окончательного решения.'
+                              : 'Решение заблокировано. Загрузите недостающие данные для точной аналитики.'}
+                          </div>
+                        )}
                       </div>
                     </AccordionContent>
                   </AccordionItem>
@@ -1624,12 +1800,12 @@ function EmptyAnalysisState({
   const automaticSources = setupSources.filter((source) => source.automatic);
   const readyCount = setupSources.filter((source) => {
     const status = sourceMap.get(source.id);
-    return status && ['automatic', 'manual', 'partial'].includes(status.mode);
+    return status && ['automatic', 'ok', 'manual', 'partial'].includes(status.mode);
   }).length;
   const snapshotReady = Boolean(overview?.snapshot_ready);
   const automaticReadyCount = automaticSources.filter((source) => {
     const status = sourceMap.get(source.id);
-    return status && ['automatic', 'partial'].includes(status.mode);
+    return status && ['automatic', 'ok', 'partial'].includes(status.mode);
   }).length;
   const showBootstrapStage = !snapshotReady && automaticReadyCount === 0;
   const isLoadingStage = showBootstrapStage && (loading || bootstrapping || !overview);
@@ -1927,61 +2103,121 @@ function GuidedStepCard({
 
 function NextActionCard({
   nextAction,
-  schedulerStatus,
-  generatedAt,
-  onOpenSection,
 }: {
   nextAction: {
     tone: string;
-    eyebrow: string;
     title: string;
     description: string;
     actionLabel: string;
     action: () => void;
-    sectionId: string;
   } | null;
-  schedulerStatus: SchedulerStatus | null;
-  generatedAt: string | null;
-  onOpenSection: (id: string) => void;
 }) {
   return (
-    <div className="rounded-[20px] border border-black/5 bg-white p-4 shadow-[0_10px_28px_rgba(15,23,42,0.04)]">
-      <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Первый шаг</p>
+    <div className="rounded-[20px] border border-border bg-card p-4 shadow-sm">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Что сделать сейчас</p>
       {nextAction ? (
         <div className={cn('mt-3 rounded-[18px] border p-4', nextAction.tone)}>
-          <p className="text-[10px] font-semibold uppercase tracking-[0.16em]">{nextAction.eyebrow}</p>
-          <h3 className="mt-1.5 text-base font-semibold leading-6">{nextAction.title}</h3>
+          <h3 className="text-base font-semibold leading-6">{nextAction.title}</h3>
           <p className="mt-2 text-[13px] leading-5 opacity-90">{nextAction.description}</p>
-          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+          <div className="mt-4">
             <Button className="h-9 gap-2 rounded-xl text-sm" onClick={nextAction.action}>
               <ArrowRight size={15} />
               {nextAction.actionLabel}
             </Button>
-            <Button variant="outline" className="h-9 gap-2 rounded-xl text-sm" onClick={() => onOpenSection(nextAction.sectionId)}>
-              <ExternalLink size={15} />
-              Открыть нужный блок
-            </Button>
           </div>
         </div>
       ) : (
-        <div className="mt-3 rounded-[18px] border border-black/5 bg-slate-50 p-4">
-          <p className="text-sm font-semibold">Ждем данные для первого шага</p>
+        <div className="mt-3 rounded-[18px] border border-border bg-muted p-4">
+          <p className="text-sm font-semibold">Ждём данные</p>
           <p className="mt-1.5 text-[13px] text-muted-foreground">Как только snapshot будет готов, здесь появится рекомендуемое действие.</p>
         </div>
       )}
+    </div>
+  );
+}
 
-      <div className="mt-3 grid gap-3 sm:grid-cols-2">
-        <div className="rounded-[16px] border border-black/5 bg-slate-50 p-3.5">
-          <p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Снимок</p>
-          <p className="mt-1.5 text-sm font-semibold">{formatDateTime(generatedAt)}</p>
-          <p className="mt-1.5 text-xs text-muted-foreground">Время сохраненного snapshot.</p>
+function SourceHealthCard({
+  overview,
+  schedulerStatus,
+  viewMode,
+}: {
+  overview: AdAnalysisOverview | null;
+  schedulerStatus: SchedulerStatus | null;
+  viewMode: ViewMode;
+}) {
+  const sources = overview?.source_statuses || [];
+
+  return (
+    <div className="rounded-[20px] border border-black/5 bg-white p-4 shadow-[0_10px_28px_rgba(15,23,42,0.04)]">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Источники</p>
+          <h3 className="mt-1.5 text-base font-semibold">Что уже сохранено</h3>
         </div>
-        <div className="rounded-[16px] border border-black/5 bg-slate-50 p-3.5">
-          <p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Фоновая синхронизация</p>
-          <p className="mt-1.5 text-sm font-semibold">{schedulerStatus?.is_running ? 'Активна' : 'Не активна'}</p>
-          <p className="mt-1.5 text-xs text-muted-foreground">{formatSchedulerHint(schedulerStatus)}</p>
-        </div>
+        <Badge variant="outline" className="rounded-full px-3 py-1 text-[11px]">
+          {schedulerStatus?.last_tick_at ? `Фон. цикл: ${formatDateTime(schedulerStatus.last_tick_at)}` : 'Без данных о фоновом цикле'}
+        </Badge>
       </div>
+
+      <div className="mt-3">
+        {sources.length === 0 && (
+          <div className="rounded-[16px] border border-dashed border-black/10 bg-slate-50 px-4 py-6 text-sm text-muted-foreground">
+            Источники появятся после первого успешного запроса overview.
+          </div>
+        )}
+
+        {sources.length > 0 && (
+          <Accordion type="single" collapsible className="space-y-2">
+            {sources.map((source) => (
+              <AccordionItem key={source.id} value={source.id} className="overflow-hidden rounded-[16px] border border-black/5 bg-slate-50 px-0">
+                <AccordionTrigger className="px-4 py-3 hover:no-underline">
+                  <div className="flex w-full items-center justify-between gap-3 pr-3 text-left">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-semibold">{source.label}</p>
+                        <Badge className={cn('rounded-full border px-2.5 py-0.5 text-[10px] font-medium', SOURCE_MODE_META[source.mode])}>
+                          {getSourceModeLabel(source.mode)}
+                        </Badge>
+                      </div>
+                      <p className="mt-1 text-xs text-muted-foreground">{source.automatic ? 'WB API' : 'Ручной файл'}</p>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Записей</div>
+                      <div className="mt-1 text-sm font-semibold">{source.records}</div>
+                    </div>
+                  </div>
+                </AccordionTrigger>
+                <AccordionContent className="border-t border-black/5 px-4 py-3 text-[13px] leading-5 text-muted-foreground space-y-2">
+                  <p>{source.detail || '—'}</p>
+                  {source.synced_at && <p className="text-[11px]">Синхронизировано: {formatDateTime(source.synced_at)}</p>}
+                  {source.coverage_ratio != null && source.coverage_ratio < 1 && (
+                    <p className="text-[11px]">Покрытие: {Math.round(source.coverage_ratio * 100)}%</p>
+                  )}
+                  {source.coverage_start && source.coverage_end && (
+                    <p className="text-[11px]">Охват: {source.coverage_start} — {source.coverage_end}</p>
+                  )}
+                  {source.expected_start && source.expected_end && (
+                    <p className="text-[11px]">Ожидалось: {source.expected_start} — {source.expected_end}</p>
+                  )}
+                  {source.blocked && (
+                    <p className="text-[11px] font-medium text-rose-600">⚠ Источник заблокирован</p>
+                  )}
+                </AccordionContent>
+              </AccordionItem>
+            ))}
+          </Accordion>
+        )}
+      </div>
+
+      {viewMode !== 'decisions' && (
+        <div className="mt-3 rounded-[16px] border border-black/5 bg-[linear-gradient(180deg,#ffffff_0%,#fafafa_100%)] p-3.5">
+          <p className="text-sm font-semibold">Как читать блок</p>
+          <p className="mt-1.5 text-[13px] leading-5 text-muted-foreground">
+            Если здесь все зеленое или частично закрыто ручным слоем, можно переходить к решениям по SKU. Если есть `Нужен файл` или `Ошибка`,
+            система покажет ниже ровно тот файл, которого не хватает.
+          </p>
+        </div>
+      )}
     </div>
   );
 }
@@ -2178,23 +2414,9 @@ function SkuTable({
                   </div>
                 </td>
                 <td className="border-b border-r border-black/5 px-3 py-2.5 align-top">
-                  <div className="flex flex-col items-start gap-1.5">
-                    <Badge className={cn('rounded-full px-3 py-1 text-xs', STATUS_META[item.status].chipClass)}>
-                      {displayStatusLabel(item)}
-                    </Badge>
-                    <Badge
-                      variant="outline"
-                      className={cn(
-                        'rounded-full px-2.5 py-0.5 text-[10px]',
-                        item.decision_ready ? 'border-emerald-300 text-emerald-700' : 'border-amber-300 text-amber-700',
-                      )}
-                    >
-                      {item.decision_label}
-                    </Badge>
-                    <div className="text-[10px] text-muted-foreground">
-                      rev:{item.revenue_lineage} · ord:{item.orders_lineage}
-                    </div>
-                  </div>
+                  <Badge className={cn('rounded-full px-3 py-1 text-xs', STATUS_META[item.status].chipClass)}>
+                    {displayStatusLabel(item)}
+                  </Badge>
                 </td>
                 <td className="border-b border-r border-black/5 px-3 py-2.5 align-top">
                   <div className="max-w-[200px] leading-5 text-slate-700">{item.action_title}</div>
@@ -2439,73 +2661,43 @@ function UploadGuideCard({
   const stateMeta = getGuideStateMeta(guide.key, overview);
 
   return (
-    <div className="rounded-[24px] border border-black/5 bg-[linear-gradient(180deg,#ffffff_0%,#fbfbfa_100%)] p-4 shadow-sm">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-        <div className="flex items-start gap-3">
-          <div className={cn('flex h-12 w-12 items-center justify-center rounded-2xl', active ? 'bg-foreground text-background' : 'bg-slate-100 text-foreground')}>
-            {active ? <RefreshCcw size={18} className="animate-spin" /> : <FileSpreadsheet size={18} />}
-          </div>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <p className="text-lg font-semibold">{guide.title}</p>
-              <Badge variant="outline" className="rounded-full px-3 py-1 text-[11px]">
-                {guide.shortLabel}
-              </Badge>
-              <Badge className={cn('rounded-full border px-3 py-1 text-[11px] font-medium', stateMeta.className)}>
-                {stateMeta.label}
-              </Badge>
-            </div>
-            <p className="mt-2 text-sm leading-6 text-muted-foreground">{guide.description}</p>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {guide.minimumColumns.map((column) => (
-                <span key={column} className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700">
-                  {column}
-                </span>
-              ))}
-            </div>
-          </div>
+    <div className="rounded-xl border border-black/5 bg-white p-4 shadow-sm">
+      {/* Header row */}
+      <div className="flex items-center gap-3">
+        <div className={cn('flex h-9 w-9 shrink-0 items-center justify-center rounded-xl', active ? 'bg-foreground text-background' : 'bg-slate-100 text-foreground')}>
+          {active ? <RefreshCcw size={16} className="animate-spin" /> : <FileSpreadsheet size={16} />}
         </div>
-
-        <div className="flex flex-col gap-2 sm:flex-row lg:flex-col xl:flex-row">
-          <Button variant="outline" className="gap-2 rounded-2xl" onClick={onTemplate}>
-            <Download size={14} />
-            Шаблон Excel
-          </Button>
-          <Button className="gap-2 rounded-2xl" onClick={onUpload}>
-            <Upload size={14} />
-            Загрузить
-          </Button>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <p className="text-sm font-semibold">{guide.title}</p>
+            <Badge className={cn('rounded-full border px-2 py-0.5 text-[10px] font-medium', stateMeta.className)}>
+              {stateMeta.label}
+            </Badge>
+          </div>
+          <p className="mt-0.5 text-xs text-muted-foreground line-clamp-1">{guide.description}</p>
         </div>
       </div>
 
-      <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,0.9fr)]">
-        <div className="rounded-[20px] bg-slate-50 px-4 py-4">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Когда нужен</p>
-          <p className="mt-2 text-sm leading-6 text-foreground">{neededText}</p>
-          <p className="mt-3 text-sm text-muted-foreground">{guide.autoFallback}</p>
-        </div>
-        <div className="rounded-[20px] border border-black/5 bg-white px-4 py-4">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Где взять</p>
-          <p className="mt-2 text-sm leading-6 text-foreground">{guide.sourceFrom}</p>
-          <div className="mt-3 space-y-2">
-            {guide.sourceRoutes.map((route) => (
-              <div key={route} className="rounded-2xl bg-slate-50 px-3 py-2 text-sm text-slate-700">
-                {route}
-              </div>
-            ))}
-          </div>
-        </div>
-        <div className="rounded-[20px] border border-black/5 bg-white px-4 py-4">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Система примет</p>
-          <p className="mt-2 text-sm leading-6 text-foreground">{guide.acceptAsIs}</p>
-          <div className="mt-3 flex flex-wrap gap-2">
-            {guide.acceptedHeaders.map((header) => (
-              <span key={header} className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700">
-                {header}
-              </span>
-            ))}
-          </div>
-        </div>
+      {/* Need text */}
+      <p className="mt-2 text-xs leading-5 text-muted-foreground">{neededText}</p>
+
+      {/* Minimum columns */}
+      <div className="mt-2 flex flex-wrap gap-1">
+        {guide.minimumColumns.map((col) => (
+          <span key={col} className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">{col}</span>
+        ))}
+      </div>
+
+      {/* Actions */}
+      <div className="mt-3 flex gap-2">
+        <Button variant="outline" size="sm" className="h-8 gap-1.5 rounded-lg text-xs" onClick={onTemplate}>
+          <Download size={12} />
+          Шаблон
+        </Button>
+        <Button size="sm" className="h-8 gap-1.5 rounded-lg text-xs" onClick={onUpload}>
+          <Upload size={12} />
+          Загрузить
+        </Button>
       </div>
     </div>
   );
@@ -2645,6 +2837,8 @@ function SummaryColumn({
   icon,
   items,
   emptyText,
+  isCritical: isCriticalProp,
+  decisionReady,
   onOpen,
 }: {
   title: string;
@@ -2652,15 +2846,21 @@ function SummaryColumn({
   icon: React.ReactNode;
   items: AdAnalysisItem[];
   emptyText: string;
+  isCritical?: boolean;
+  decisionReady?: boolean;
   onOpen: (item: AdAnalysisItem) => void;
 }) {
-  const isCritical = title.toLowerCase().includes('крит');
+  const isCritical = isCriticalProp ?? title.toLowerCase().includes('крит');
+
+  const DECISION_BADGE_META: Record<string, { label: string; cls: string }> = {
+    ready: { label: 'Готово', cls: 'border-emerald-200 bg-emerald-50 text-emerald-700' },
+    preliminary: { label: 'Предварительно', cls: 'border-amber-200 bg-amber-50 text-amber-700' },
+    blocked: { label: 'Заблокировано', cls: 'border-rose-200 bg-rose-50 text-rose-700' },
+  };
+
   return (
-    <div className="overflow-hidden rounded-[16px] border border-black/5 bg-white shadow-[0_8px_20px_rgba(15,23,42,0.025)]">
-      <div className={cn(
-        'flex items-center gap-3 border-b border-black/5 px-4 py-3',
-        isCritical ? 'bg-white' : 'bg-white',
-      )}>
+    <div className="overflow-hidden rounded-[16px] border border-border bg-card shadow-sm">
+      <div className="flex items-center gap-3 border-b border-border px-4 py-3">
         <div className={cn('h-2.5 w-2.5 rounded-full', isCritical ? 'bg-rose-500' : 'bg-emerald-500')} />
         <div>
           <p className="text-sm font-semibold">{title}</p>
@@ -2673,27 +2873,44 @@ function SummaryColumn({
             {emptyText}
           </div>
         )}
-        {items.map((item) => (
-          <button
-            key={item.nm_id}
-            onClick={() => onOpen(item)}
-            className="grid w-full grid-cols-[minmax(0,1fr)_auto] gap-4 border-b border-black/5 px-4 py-3 text-left transition-colors hover:bg-slate-50/70 last:border-b-0"
-          >
-            <div className="min-w-0">
-              <p className="truncate text-[13px] font-semibold">{item.title || `nmID ${item.nm_id}`}</p>
-              <p className="mt-1 text-xs text-slate-700">{item.action_title}</p>
-              <p className="mt-1 line-clamp-2 text-[11px] leading-[18px] text-muted-foreground">
-                {isCritical ? item.status_reason : item.status_hint}
-              </p>
-            </div>
-            <div className="w-[112px] text-right">
-              <p className={cn('text-sm font-semibold', item.metrics.net_profit >= 0 ? 'text-emerald-700' : 'text-rose-700')}>
-                {isCritical ? formatMoney(item.metrics.net_profit) : `${item.metrics.profit_delta >= 0 ? '+' : ''}${Math.round(item.metrics.profit_delta).toLocaleString('ru-RU')} ₽/заказ`}
-              </p>
-              <p className="mt-1 text-[10px] text-muted-foreground">{isCritical ? 'чистая прибыль' : 'запас'}</p>
-            </div>
-          </button>
-        ))}
+        {items.map((item) => {
+          const decBadge = item.decision_label ? DECISION_BADGE_META[item.decision_label] : null;
+          return (
+            <button
+              key={item.nm_id}
+              onClick={() => onOpen(item)}
+              className="grid w-full grid-cols-[minmax(0,1fr)_auto] gap-4 border-b border-border px-4 py-3 text-left transition-colors hover:bg-muted/50 last:border-b-0"
+            >
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <p className="truncate text-[13px] font-semibold">{item.title || `nmID ${item.nm_id}`}</p>
+                  {/* §1.10 — status + decision badges */}
+                  <Badge className={cn('rounded-full px-2 py-0.5 text-[10px]', STATUS_META[item.status].chipClass)}>
+                    {displayStatusLabel(item)}
+                  </Badge>
+                  {decBadge && (
+                    <Badge className={cn('rounded-full border px-2 py-0.5 text-[10px]', decBadge.cls)}>
+                      {decBadge.label}
+                    </Badge>
+                  )}
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {isCritical ? item.status_reason : item.status_hint}
+                </p>
+              </div>
+              <div className="w-[112px] text-right">
+                <p className={cn('text-sm font-semibold', item.metrics.net_profit >= 0 ? 'text-emerald-700' : 'text-rose-700')}>
+                  {isCritical ? formatMoney(item.metrics.net_profit) : `${item.metrics.profit_delta >= 0 ? '+' : ''}${Math.round(item.metrics.profit_delta).toLocaleString('ru-RU')} ₽/заказ`}
+                </p>
+                <p className="mt-1 text-[10px] text-muted-foreground">
+                  {isCritical
+                    ? (item.decision_label === 'preliminary' ? 'предварительно' : 'чистая прибыль')
+                    : 'запас'}
+                </p>
+              </div>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -2735,7 +2952,7 @@ function SkuCard({
   onOpenAnalytics: () => void;
 }) {
   const statusMeta = STATUS_META[item.status];
-  const metricsToShow = mode === 'simple'
+  const metricsToShow = mode === 'decisions'
     ? ([
         { icon: <CircleDollarSign size={14} />, label: 'Чистая прибыль', value: formatMoney(item.metrics.net_profit), accent: item.metrics.net_profit >= 0 ? 'text-emerald-700' : 'text-rose-700' },
         { icon: <ShieldCheck size={14} />, label: 'Лимит CPO', value: formatMoney(item.metrics.max_cpo) },
@@ -2748,10 +2965,10 @@ function SkuCard({
         { icon: <BarChart3 size={14} />, label: 'CTR', value: formatPct(item.metrics.ctr) },
         { icon: <ClipboardList size={14} />, label: 'CR', value: formatPct(item.metrics.cr) },
       ] as const);
-  const showPriorityBadge = mode !== 'simple';
-  const showDiagnosisBadge = mode !== 'simple';
-  const showTrendBadge = mode === 'analytics' || mode === 'explanation';
-  const showPrecisionBadge = mode === 'analytics';
+  const showPriorityBadge = mode !== 'decisions';
+  const showDiagnosisBadge = mode !== 'decisions';
+  const showTrendBadge = mode === 'products' || mode === 'data';
+  const showPrecisionBadge = mode === 'products';
 
   return (
     <div className="rounded-[18px] border border-black/5 bg-white p-4 shadow-[0_8px_20px_rgba(15,23,42,0.025)]">
@@ -2774,15 +2991,6 @@ function SkuCard({
               <div className="flex flex-wrap items-center gap-2">
                 {showPriorityBadge && <Badge className={cn('rounded-full px-2.5 py-1 text-[11px]', PRIORITY_META[item.priority].className)}>{item.priority_label}</Badge>}
                 <Badge className={cn('rounded-full px-2.5 py-1 text-[11px]', statusMeta.chipClass)}>{displayStatusLabel(item)}</Badge>
-                <Badge
-                  variant="outline"
-                  className={cn(
-                    'rounded-full px-2.5 py-1 text-[11px]',
-                    item.decision_ready ? 'border-emerald-300 text-emerald-700' : 'border-amber-300 text-amber-700',
-                  )}
-                >
-                  {item.decision_label}
-                </Badge>
                 {showDiagnosisBadge && <Badge variant="outline" className="rounded-full px-2.5 py-1 text-[11px]">{item.diagnosis_label}</Badge>}
                 {showTrendBadge && (
                   <Badge className={cn('rounded-full px-2.5 py-1 text-[11px]', TREND_META[item.trend.signal].className)}>
@@ -2791,33 +2999,20 @@ function SkuCard({
                   </Badge>
                 )}
                 {showPrecisionBadge && <Badge variant="outline" className="rounded-full px-2.5 py-1 text-[11px]">{item.precision_label}</Badge>}
-                {showPrecisionBadge && (
-                  <Badge
-                    variant="outline"
-                    className={cn(
-                      'rounded-full px-2.5 py-1 text-[11px]',
-                      item.metrics.ad_cost_confidence === 'high' && 'border-emerald-300 text-emerald-700',
-                      item.metrics.ad_cost_confidence === 'medium' && 'border-amber-300 text-amber-700',
-                      item.metrics.ad_cost_confidence === 'low' && 'border-rose-300 text-rose-700',
-                    )}
-                  >
-                    ad confidence: {item.metrics.ad_cost_confidence}
-                  </Badge>
-                )}
               </div>
               <h4 className="mt-2 max-w-2xl text-base font-semibold leading-snug">{item.title || `nmID ${item.nm_id}`}</h4>
               <p className="mt-1 text-[13px] text-muted-foreground">
                 nmID: {item.nm_id}
                 {item.vendor_code ? ` · ${item.vendor_code}` : ''}
               </p>
-              <p className="mt-2 max-w-3xl text-[13px] leading-6 text-muted-foreground">{mode === 'simple' ? item.action_title : item.status_reason}</p>
-              {mode !== 'simple' && (
+              <p className="mt-2 max-w-3xl text-[13px] leading-6 text-muted-foreground">{mode === 'decisions' ? item.action_title : item.status_reason}</p>
+              {mode !== 'decisions' && (
                 <p className="mt-1 max-w-3xl text-[13px] leading-6 text-foreground/80">{item.action_title}</p>
               )}
             </div>
           </div>
 
-          <div className={cn('grid flex-1 grid-cols-2 gap-3', mode === 'simple' ? 'lg:grid-cols-3' : 'lg:grid-cols-5')}>
+          <div className={cn('grid flex-1 grid-cols-2 gap-3', mode === 'decisions' ? 'lg:grid-cols-3' : 'lg:grid-cols-5')}>
             {metricsToShow.map((metric) => (
               <MiniMetric key={metric.label} icon={metric.icon} label={metric.label} value={metric.value} accent={metric.accent} />
             ))}
@@ -2825,7 +3020,7 @@ function SkuCard({
         </div>
       </button>
 
-      {mode !== 'simple' && (
+      {mode !== 'decisions' && (
         <div className="mt-4 flex flex-col gap-3 border-t border-black/5 pt-4 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex flex-wrap gap-2">
             {item.issue_summary.top_titles.slice(0, 3).map((issue) => (
@@ -2965,5 +3160,30 @@ function DrawerSection({
         ))}
       </div>
     </div>
+  );
+}
+
+const LINEAGE_LABELS: Record<string, string> = {
+  finance: 'Финансы',
+  manual_finance: 'Ручные финансы',
+  funnel: 'Воронка',
+  advert: 'Реклама',
+  missing: 'Нет данных',
+};
+
+const LINEAGE_COLORS: Record<string, string> = {
+  finance: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+  manual_finance: 'border-sky-200 bg-sky-50 text-sky-700',
+  funnel: 'border-indigo-200 bg-indigo-50 text-indigo-700',
+  advert: 'border-violet-200 bg-violet-50 text-violet-700',
+  missing: 'border-slate-200 bg-slate-50 text-slate-600',
+};
+
+function LineageChip({ label, lineage }: { label: string; lineage?: string }) {
+  if (!lineage) return null;
+  return (
+    <span className={cn('inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium', LINEAGE_COLORS[lineage] || LINEAGE_COLORS.missing)}>
+      {label}: {LINEAGE_LABELS[lineage] || lineage}
+    </span>
   );
 }

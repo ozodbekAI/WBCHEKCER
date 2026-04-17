@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "WB Card Optimizer"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
+    HTTP_DEBUG_LOG: bool = False
     
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/wb_optimizer"
@@ -77,6 +78,8 @@ class Settings(BaseSettings):
     
     # KIE AI Service
     KIE_API_KEY: str = ""
+    KIE_POLL_INTERVAL_SECONDS: int = 10
+    KIE_MAX_POLL_ATTEMPTS: int = 0
     
     # WB Advert API (for promotion/AB tests)
     WB_API_KEY: str = ""

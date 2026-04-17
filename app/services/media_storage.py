@@ -1,6 +1,8 @@
 import json
 import os
+import ipaddress
 import uuid
+from urllib.parse import urlparse
 from app.core.config import settings
 
 
@@ -37,12 +39,42 @@ def get_file_url(rel_path: str, base_url: str | None = None) -> str:
     Always returns public URL to backend media:
       <PUBLIC_BASE_URL>/media/<rel_path>
     """
+
+    def _is_private_or_local_host(url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+        except Exception:
+            return True
+
+        if not host:
+            return True
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            return True
+
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_link_local
+        )
+
     rel_path = (rel_path or "").lstrip("/").replace("\\", "/")
-    resolved_base_url = (
-        (base_url or "").strip().rstrip("/")
-        or (settings.MEDIA_PUBLIC_BASE_URL or "").strip().rstrip("/")
-        or (settings.PUBLIC_BASE_URL or "").strip().rstrip("/")
-    )
+    candidates = [
+        (base_url or "").strip().rstrip("/"),
+        (settings.MEDIA_PUBLIC_BASE_URL or "").strip().rstrip("/"),
+        (settings.PUBLIC_BASE_URL or "").strip().rstrip("/"),
+    ]
+
+    public_candidates = [url for url in candidates if url and not _is_private_or_local_host(url)]
+    resolved_base_url = public_candidates[0] if public_candidates else (candidates[0] if candidates[0] else "")
+
     return f"{resolved_base_url}/media/{rel_path}"
 
 

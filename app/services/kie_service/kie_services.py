@@ -5,7 +5,7 @@ import asyncio
 import requests
 import json
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import Any, List, Dict, Tuple, Optional
 
 from app.core.config import settings
 from app.core.database import SessionLocal
@@ -31,6 +31,27 @@ class KIEService:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+
+    @staticmethod
+    def _short(value: Any, max_len: int = 1000) -> str:
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(value)
+        if len(text) <= max_len:
+            return text
+        return f"{text[:max_len]}...(+{len(text) - max_len} chars)"
+
+    @staticmethod
+    def _safe_headers(headers: Dict[str, str]) -> Dict[str, str]:
+        return {
+            "Content-Type": headers.get("Content-Type", ""),
+            "Authorization": "Bearer ***",
+        }
+
+    def _ensure_api_key(self) -> None:
+        if not self.api_key:
+            raise PermissionError("KIE API key is not configured. Set KIE_API_KEY in .env")
 
     # ===== DEFAULT PROMPTS (fallback uchun) =====
 
@@ -93,15 +114,46 @@ class KIEService:
         return model.split("/")[0]
 
     def create_task(self, model: str, input_data: dict) -> str:
+        self._ensure_api_key()
         payload = {"model": model, "input": input_data}
-        logger.info(f"Creating task with model: {model}")
-        logger.info(f"Input data: {json.dumps(input_data, ensure_ascii=False)[:500]}...")
+        logger.info(
+            "KIE create_task request | model=%s url=%s headers=%s payload=%s",
+            model,
+            self.create_url,
+            self._safe_headers(self.headers),
+            self._short(payload, max_len=3000),
+        )
 
-        response = requests.post(self.create_url, headers=self.headers, data=json.dumps(payload))
-        logger.info(f"KIE HTTP status: {response.status_code}, body: {response.text[:500]}")
+        try:
+            response = requests.post(
+                self.create_url,
+                headers=self.headers,
+                data=json.dumps(payload),
+                timeout=(10, 60),
+            )
+        except requests.RequestException as exc:
+            logger.error("KIE create_task network error | model=%s url=%s error=%s", model, self.create_url, exc)
+            raise
+
+        logger.info(
+            "KIE create_task http_response | status=%s body=%s",
+            response.status_code,
+            self._short(response.text, max_len=3000),
+        )
         response.raise_for_status()
-        result = response.json()
-        logger.info(f"Create task response parsed: {result}")
+        try:
+            result = response.json()
+        except ValueError as exc:
+            logger.error("KIE create_task invalid JSON | model=%s body=%s", model, self._short(response.text, max_len=3000))
+            raise
+
+        logger.info(
+            "KIE create_task response parsed | taskId=%s code=%s msg=%s data=%s",
+            result.get("data", {}).get("taskId"),
+            result.get("code"),
+            result.get("msg"),
+            self._short(result.get("data", {}), max_len=1500),
+        )
 
         code = result.get("code")
 
@@ -124,21 +176,113 @@ class KIEService:
             raise ValueError(f"Failed to extract taskId: {result}")
         return task_id
 
+    def _try_create_task_with_size_fallback(
+        self,
+        model: str,
+        input_data: dict,
+        *,
+        image_sizes: list[Optional[str]],
+    ) -> str:
+        """
+        KIE ba'zi modellarda image_size parametri cheklangan bo'ladi.
+        To'g'ri variantni topish uchun ketma-ket sinovdan o'tkazamiz.
+        """
+        last_error: Optional[Exception] = None
+        logger.info(
+            "KIE create_task_with_size_fallback start | model=%s image_sizes=%s input=%s",
+            model,
+            image_sizes,
+            self._short(input_data, max_len=1200),
+        )
+        for image_size in image_sizes:
+            logger.info("KIE create_task_with_size_fallback attempt | model=%s image_size=%s", model, image_size)
+            payload = dict(input_data)
+            if image_size:
+                payload["image_size"] = image_size
+            try:
+                task_id = self.create_task(model, payload)
+                logger.info("KIE create_task_with_size_fallback success | model=%s image_size=%s task_id=%s", model, image_size, task_id)
+                return task_id
+            except ValueError as e:
+                last_error = e
+                msg = str(e).lower()
+                if "image_size is not within the range of allowed options" in msg:
+                    logger.warning(
+                        "KIE create_task image_size rejected | model=%s image_size=%s err=%s",
+                        model,
+                        image_size,
+                        e,
+                    )
+                    continue
+                raise
+
+        raise last_error or ValueError("Failed to create task: image_size is not within the allowed options")
+
+    def create_task_with_fallback(self, model: str, input_data: dict, *, image_sizes: Optional[List[Optional[str]]] = None) -> str:
+        """
+        If input_data contains image_size and model rejects some variants,
+        try a safe list before failing.
+        """
+        logger.info(
+            "KIE create_task_with_fallback start | model=%s has_image_size=%s input=%s",
+            model,
+            "image_size" in input_data,
+            self._short(input_data, max_len=1000),
+        )
+        if "image_size" not in input_data:
+            return self.create_task(model, input_data)
+
+        preferred_sizes: list[Optional[str]] = [
+            *(image_sizes or []),
+            "3:4",
+            "1:1",
+            "2:3",
+            "768:1024",
+            "1024:768",
+            "1024:1024",
+            None,
+        ]
+
+        return self._try_create_task_with_size_fallback(
+            model,
+            input_data,
+            image_sizes=preferred_sizes,
+        )
+
     def get_task_status(self, task_id: str) -> dict:
         if not task_id:
             raise ValueError("Task ID cannot be None")
 
         params = {"taskId": task_id}
-        response = requests.get(self.query_url, params=params, headers=self.headers)
-        logger.info(f"Status request URL: {response.url}, status: {response.status_code}")
-        logger.info(f"Raw response: {response.text[:500]}")
+        logger.info("KIE get_task_status request | task_id=%s url=%s", task_id, self.query_url)
+        try:
+            response = requests.get(
+                self.query_url,
+                params=params,
+                headers=self.headers,
+                timeout=(10, 60),
+            )
+        except requests.RequestException as exc:
+            logger.error("KIE get_task_status network error | task_id=%s url=%s error=%s", task_id, self.query_url, exc)
+            raise
+
+        logger.info("KIE get_task_status response | status=%s body=%s", response.status_code, self._short(response.text, max_len=3000))
         response.raise_for_status()
-        result = response.json()
-        logger.info(f"Status response parsed: {result}")
+        try:
+            result = response.json()
+        except ValueError as exc:
+            logger.error("KIE get_task_status invalid JSON | task_id=%s body=%s", task_id, self._short(response.text, max_len=3000))
+            raise
 
         if result.get("code") != 200:
             error_msg = result.get("message") or result.get("msg", "Unknown error")
-            logger.error(f"API status error: {result}")
+            logger.error(
+                "KIE get_task_status API error | task_id=%s code=%s msg=%s result=%s",
+                task_id,
+                result.get("code"),
+                error_msg,
+                self._short(result, max_len=1200),
+            )
             raise ValueError(f"Failed to get status: {error_msg}")
 
         data = result.get("data", {})
@@ -155,18 +299,51 @@ class KIEService:
         if state in ["fail", "failed", "error"]:
             fail_msg = data.get("failMsg", "Unknown error")
             fail_code = data.get("failCode", "Unknown")
-            logger.error(f"Task failed - Code: {fail_code}, Message: {fail_msg}")
+            logger.error(
+                "KIE task failed | task_id=%s code=%s state=%s msg=%s data=%s",
+                task_id,
+                fail_code,
+                state,
+                fail_msg,
+                self._short(data, max_len=1500),
+            )
             raise Exception(f"Task failed: {fail_msg} (code: {fail_code})")
 
+        logger.info("KIE get_task_status success state=%s data=%s", state, self._short(data, max_len=1500))
         return {"status": state, "result": result_dict}
 
-    async def poll_task(self, task_id: str, max_attempts: int = 120) -> dict:
-        for attempt in range(max_attempts):
+    async def poll_task(
+        self,
+        task_id: str,
+        max_attempts: int | None = None,
+        poll_interval_seconds: int | None = None,
+    ) -> dict:
+        if max_attempts is None:
+            cfg_attempts = int(settings.KIE_MAX_POLL_ATTEMPTS or 0)
+            max_attempts = None if cfg_attempts <= 0 else cfg_attempts
+        else:
+            max_attempts = None if max_attempts <= 0 else max_attempts
+
+        if poll_interval_seconds is None or poll_interval_seconds < 1:
+            poll_interval_seconds = max(1, int(settings.KIE_POLL_INTERVAL_SECONDS or 10))
+        attempt = 0
+        max_attempts = None if max_attempts is not None and max_attempts <= 0 else max_attempts
+        attempt_limit_label = "∞" if max_attempts is None else str(max_attempts)
+        started_at = asyncio.get_running_loop().time()
+        while True:
+            attempt += 1
+            if max_attempts is not None and attempt > max_attempts:
+                break
             try:
                 status_info = await asyncio.to_thread(self.get_task_status, task_id)
+                elapsed = round(asyncio.get_running_loop().time() - started_at, 1)
                 logger.info(
-                    f"Poll attempt {attempt + 1}/{max_attempts} for {task_id}: "
-                    f"status={status_info['status']}"
+                    "KIE poll attempt | task_id=%s attempt=%s/%s status=%s elapsed=%ss",
+                    task_id,
+                    attempt,
+                    attempt_limit_label,
+                    status_info["status"],
+                    elapsed,
                 )
                 if status_info["status"] == "success":
                     logger.info(f"Task {task_id} completed successfully!")
@@ -174,17 +351,21 @@ class KIEService:
                 elif status_info["status"] in ["fail", "failed", "error"]:
                     logger.error(f"Task {task_id} failed with status: {status_info['status']}")
                     raise Exception(f"Task failed: {status_info}")
-                logger.info("Task still processing, waiting 10 seconds...")
-                await asyncio.sleep(10)
+                logger.info("Task still processing, waiting %s seconds...", poll_interval_seconds)
+                await asyncio.sleep(poll_interval_seconds)
             except Exception as e:
-                logger.error(f"Error polling task {task_id} on attempt {attempt + 1}: {e}")
-                if attempt == max_attempts - 1:
+                lowered = str(e).lower()
+                if lowered.startswith("task failed:"):
+                    logger.error("KIE poll failed permanently | task_id=%s attempt=%s error=%s", task_id, attempt, e)
                     raise
-                logger.info("Retrying in 10 seconds...")
-                await asyncio.sleep(10)
+                logger.error("KIE poll attempt error | task_id=%s attempt=%s error=%s", task_id, attempt, e)
+                if max_attempts is not None and attempt >= max_attempts:
+                    raise
+                logger.info("Retrying in %s seconds...", poll_interval_seconds)
+                await asyncio.sleep(poll_interval_seconds)
 
         raise Exception(
-            f"Task timeout after {max_attempts} attempts ({max_attempts * 10} seconds)"
+            f"Task timeout after {max_attempts} attempts ({max_attempts * poll_interval_seconds} seconds)"
         )
 
     async def download_image(self, url: str) -> bytes:
@@ -195,6 +376,7 @@ class KIEService:
                     url,
                     timeout=aiohttp.ClientTimeout(total=300),
                 ) as response:
+                    logger.info("KIE download_image response status=%s content-type=%s", response.status, response.headers.get("content-type"))
                     response.raise_for_status()
                     content = await response.read()
                     logger.info(f"Successfully downloaded {len(content)} bytes")
@@ -236,7 +418,7 @@ class KIEService:
                                 "image_size": "3:4",
                             }
                             task_id = await asyncio.to_thread(
-                                self.create_task, model, input_data
+                                self.create_task_with_fallback, model, input_data
                             )
                             result = await self.poll_task(task_id)
                             if "resultUrls" in result and result["resultUrls"]:
@@ -274,7 +456,7 @@ class KIEService:
                             "image_size": "3:4",
                         }
                         task_id = await asyncio.to_thread(
-                            self.create_task, model, input_data
+                            self.create_task_with_fallback, model, input_data
                         )
                         result = await self.poll_task(task_id)
                         if "resultUrls" in result and result["resultUrls"]:
@@ -319,7 +501,7 @@ class KIEService:
                     "output_format": "png",
                     "image_size": "3:4",
                 }
-                task_id = await asyncio.to_thread(self.create_task, model, input_data)
+                task_id = await asyncio.to_thread(self.create_task_with_fallback, model, input_data)
                 result = await self.poll_task(task_id)
                 if "resultUrls" in result and result["resultUrls"]:
                     image_bytes = await self.download_image(result["resultUrls"][0])
@@ -345,7 +527,8 @@ class KIEService:
         item_image_url: str, 
         model_image_url: str,
         ghost_prompt_override: Optional[str] = None,
-        combine_prompt_override: Optional[str] = None
+        combine_prompt_override: Optional[str] = None,
+        max_attempts: int | None = None,
     ) -> dict:
         model = "google/nano-banana-edit"
         
@@ -367,9 +550,9 @@ class KIEService:
                 "image_size": "3:4",
             }
             task_id_ghost = await asyncio.to_thread(
-                self.create_task, model, input_data_ghost
+                self.create_task_with_fallback, model, input_data_ghost
             )
-            ghost_result = await self.poll_task(task_id_ghost)
+            ghost_result = await self.poll_task(task_id_ghost, max_attempts=max_attempts)
             if "resultUrls" not in ghost_result or not ghost_result["resultUrls"]:
                 raise ValueError("No ghost image in result")
             ghost_url = ghost_result["resultUrls"][0]
@@ -382,9 +565,9 @@ class KIEService:
                 "image_size": "3:4",
             }
             task_id_combine = await asyncio.to_thread(
-                self.create_task, model, input_data_combine
+                self.create_task_with_fallback, model, input_data_combine
             )
-            combine_result = await self.poll_task(task_id_combine)
+            combine_result = await self.poll_task(task_id_combine, max_attempts=max_attempts)
             if "resultUrls" in combine_result and combine_result["resultUrls"]:
                 return {"image": await self.download_image(combine_result["resultUrls"][0])}
             raise ValueError("No final image in result")
@@ -396,7 +579,8 @@ class KIEService:
         item_image_url: str, 
         model_prompt: str,
         ghost_prompt_override: Optional[str] = None,
-        new_model_prompt_override: Optional[str] = None
+        new_model_prompt_override: Optional[str] = None,
+        max_attempts: int | None = None,
     ) -> dict:
         model = "google/nano-banana-edit"
 
@@ -416,9 +600,9 @@ class KIEService:
                 "image_size": "3:4",
             }
             task_id_ghost = await asyncio.to_thread(
-                self.create_task, model, input_data_ghost
+                self.create_task_with_fallback, model, input_data_ghost
             )
-            ghost_result = await self.poll_task(task_id_ghost)
+            ghost_result = await self.poll_task(task_id_ghost, max_attempts=max_attempts)
             if "resultUrls" not in ghost_result or not ghost_result["resultUrls"]:
                 raise ValueError("No ghost image in result")
             ghost_url = ghost_result["resultUrls"][0]
@@ -439,9 +623,9 @@ class KIEService:
                 "image_size": "3:4",
             }
             task_id_combine = await asyncio.to_thread(
-                self.create_task, model, input_data_combine
+                self.create_task_with_fallback, model, input_data_combine
             )
-            combine_result = await self.poll_task(task_id_combine)
+            combine_result = await self.poll_task(task_id_combine, max_attempts=max_attempts)
             if "resultUrls" in combine_result and combine_result["resultUrls"]:
                 return {"image": await self.download_image(combine_result["resultUrls"][0])}
             raise ValueError("No final image in result")
@@ -450,7 +634,12 @@ class KIEService:
 
     # ===== VIDEO / SIMPLE EDITS =====
 
-    async def enhance_photo(self, photo_url: str, level: str = "medium") -> dict:
+    async def enhance_photo(
+        self, 
+        photo_url: str, 
+        level: str = "medium",
+        max_attempts: int | None = None,
+    ) -> dict:
         model = "google/nano-banana-edit"
         
         prompts = {
@@ -475,11 +664,15 @@ class KIEService:
             "prompt": prompt,
             "image_urls": [photo_url],
             "output_format": "png",
-            "image_size": "original",
         }
-        
-        task_id = await asyncio.to_thread(self.create_task, model, input_data)
-        result = await self.poll_task(task_id)
+
+        task_id = await asyncio.to_thread(
+            self._try_create_task_with_size_fallback,
+            model,
+            input_data,
+            image_sizes=["3:4", "1:1", "2:3", "768:1024", "1024:768", "1024:1024"],
+        )
+        result = await self.poll_task(task_id, max_attempts=max_attempts)
         
         if "resultUrls" in result and result["resultUrls"]:
             return {"image": await self.download_image(result["resultUrls"][0])}
@@ -493,6 +686,7 @@ class KIEService:
         model: str,
         duration: int,
         resolution: str,
+        max_attempts: int | None = None,
     ) -> dict:
         logger.info(f"Starting video generation with model: {model}")
         logger.info(f"Image URL: {image_url}")
@@ -517,10 +711,10 @@ class KIEService:
             logger.info("Using Hailuo model format")
 
         logger.info(f"Creating task with input: {input_data}")
-        task_id = await asyncio.to_thread(self.create_task, model, input_data)
+        task_id = await asyncio.to_thread(self.create_task_with_fallback, model, input_data)
         logger.info(f"Task created with ID: {task_id}")
         logger.info("Starting to poll task status...")
-        result = await self.poll_task(task_id)
+        result = await self.poll_task(task_id, max_attempts=max_attempts)
         logger.info(f"Video generation complete! Result: {result}")
 
         if "resultUrls" in result and result["resultUrls"]:
@@ -535,7 +729,12 @@ class KIEService:
 
     # ===== SIMPLE SCENE / POSE / CUSTOM EDITS =====
 
-    async def change_scene(self, image_url: str, prompt: str) -> dict:
+    async def change_scene(
+        self,
+        image_url: str,
+        prompt: str,
+        max_attempts: int | None = None,
+    ) -> dict:
         model = "google/nano-banana-edit"
         full_prompt = (
             "Scene transformation using the reference image: Change the background and scene to "
@@ -548,13 +747,18 @@ class KIEService:
             "output_format": "png",
             "image_size": "3:4",
         }
-        task_id = await asyncio.to_thread(self.create_task, model, input_data)
-        result = await self.poll_task(task_id)
+        task_id = await asyncio.to_thread(self.create_task_with_fallback, model, input_data)
+        result = await self.poll_task(task_id, max_attempts=max_attempts)
         if "resultUrls" in result and result["resultUrls"]:
             return {"image": await self.download_image(result["resultUrls"][0])}
         raise ValueError("No image in result")
 
-    async def change_pose(self, image_url: str, prompt: str) -> dict:
+    async def change_pose(
+        self,
+        image_url: str,
+        prompt: str,
+        max_attempts: int | None = None,
+    ) -> dict:
         model = "google/nano-banana-edit"
         full_prompt = (
             "Pose transformation using the reference image: Change the pose to "
@@ -567,13 +771,18 @@ class KIEService:
             "output_format": "png",
             "image_size": "3:4",
         }
-        task_id = await asyncio.to_thread(self.create_task, model, input_data)
-        result = await self.poll_task(task_id)
+        task_id = await asyncio.to_thread(self.create_task_with_fallback, model, input_data)
+        result = await self.poll_task(task_id, max_attempts=max_attempts)
         if "resultUrls" in result and result["resultUrls"]:
             return {"image": await self.download_image(result["resultUrls"][0])}
         raise ValueError("No image in result")
 
-    async def custom_generation(self, image_url: str, prompt: str) -> dict:
+    async def custom_generation(
+        self,
+        image_url: str,
+        prompt: str,
+        max_attempts: int | None = None,
+    ) -> dict:
         model = "google/nano-banana-edit"
         full_prompt = (
             "Custom image edit based on the reference image: "
@@ -585,8 +794,8 @@ class KIEService:
             "output_format": "png",
             "image_size": "3:4",
         }
-        task_id = await asyncio.to_thread(self.create_task, model, input_data)
-        result = await self.poll_task(task_id)
+        task_id = await asyncio.to_thread(self.create_task_with_fallback, model, input_data)
+        result = await self.poll_task(task_id, max_attempts=max_attempts)
         if "resultUrls" in result and result["resultUrls"]:
             return {"image": await self.download_image(result["resultUrls"][0])}
         raise ValueError("No image in result")
@@ -615,7 +824,7 @@ class KIEService:
             "output_format": "png",
             "image_size": "3:4",
         }
-        task_id = await asyncio.to_thread(self.create_task, model, input_data)
+        task_id = await asyncio.to_thread(self.create_task_with_fallback, model, input_data)
         result = await self.poll_task(task_id)
         if "resultUrls" in result and result["resultUrls"]:
             return {"image": await self.download_image(result["resultUrls"][0])}
@@ -670,7 +879,7 @@ class KIEService:
                 "image_size": "3:4",
             }
         
-        task_id = await asyncio.to_thread(self.create_task, model, input_data)
+        task_id = await asyncio.to_thread(self.create_task_with_fallback, model, input_data)
         result = await self.poll_task(task_id)
         if "resultUrls" in result and result["resultUrls"]:
             return {"image": await self.download_image(result["resultUrls"][0])}

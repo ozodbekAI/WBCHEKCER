@@ -20,6 +20,15 @@ def map_photo_error(raw_error: Any, *, context: str | None = None) -> Dict[str, 
     if not raw_text:
         return payload
 
+    if lowered.startswith("task failed:"):
+        nested_raw = raw_text.split(":", 1)[1].strip()
+        nested_clean = nested_raw
+        if "(code:" in lowered:
+            nested_clean = nested_raw.rsplit("(", 1)[0].strip()
+        nested = map_photo_error(nested_clean, context=context)
+        if nested.get("code") != "photo_operation_failed":
+            return nested
+
     if "unauthorized" in lowered:
         return {
             **payload,
@@ -64,6 +73,46 @@ def map_photo_error(raw_error: Any, *, context: str | None = None) -> Dict[str, 
             "http_status": 400,
         }
 
+    if "image_size is not within the range of allowed options" in lowered:
+        return {
+            **payload,
+            "code": "photo_invalid_image_size",
+            "message": "Размер изображения не поддерживается для этой задачи KIE. Используйте 1:1 или 3:4 и повторите.",
+            "retryable": True,
+            "category": "input",
+            "http_status": 400,
+        }
+
+    if "kie api key is not configured" in lowered or "not configured" in lowered and "kie" in lowered:
+        return {
+            **payload,
+            "code": "photo_service_not_configured",
+            "message": "Сервис KIE не настроен. Проверьте KIE_API_KEY в .env и перезапустите сервер.",
+            "retryable": False,
+            "category": "configuration",
+            "http_status": 503,
+        }
+
+    if "failed to create task" in lowered and "image_size" in lowered:
+        return {
+            **payload,
+            "code": "photo_invalid_image_size",
+            "message": "Не удалось создать задачу из-за размера изображения. Используйте 1:1 или 3:4.",
+            "retryable": True,
+            "category": "input",
+            "http_status": 400,
+        }
+
+    if "failed to create task" in lowered:
+        return {
+            **payload,
+            "code": "photo_task_create_failed",
+            "message": "Не удалось отправить задачу в KIE. Проверьте параметры изображения и попробуйте позже.",
+            "retryable": True,
+            "category": "upstream",
+            "http_status": 502,
+        }
+
     if "duplicate photo urls are not allowed" in lowered or "resolved photo list contains duplicates" in lowered:
         return {
             **payload,
@@ -79,11 +128,12 @@ def map_photo_error(raw_error: Any, *, context: str | None = None) -> Dict[str, 
         or "пустой результат" in lowered
         or "empty result" in lowered
         or "gemini вернул пустой результат" in lowered
+        or "could not generate an image" in lowered
     ):
         return {
             **payload,
             "code": "photo_generation_empty_result",
-            "message": "Генерация не вернула изображение. Измените запрос и попробуйте снова.",
+            "message": "Генерация не завершилась с этим промптом. Сформулируйте задачу проще или измените её и повторите.",
             "retryable": True,
             "category": "generation",
             "http_status": 502,

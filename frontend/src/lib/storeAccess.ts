@@ -1,19 +1,13 @@
-import type { Store, StoreWbFeatureAccess } from '../types';
+import type { Store, StoreWbFeatureAccess, StoreWbTokenAccess } from '../types';
 
-export type StoreFeatureKey =
-  | 'cards'
-  | 'cards_write'
-  | 'photo_studio'
-  | 'ab_tests'
-  | 'ad_analysis'
-  | 'documents';
+export type StoreFeatureKey = 'cards' | 'photo_studio' | 'ab_tests' | 'ad_analysis';
 
 export function getStoreFeatureAccess(
   store: Store | null | undefined,
   featureKey: StoreFeatureKey,
 ): StoreWbFeatureAccess | null {
-  if (!store) return null;
-  return store.wb_token_access?.features?.[featureKey] || null;
+  if (!store?.wb_token_access?.features) return null;
+  return store.wb_token_access.features[featureKey] || null;
 }
 
 export function isStoreFeatureAllowed(
@@ -21,8 +15,8 @@ export function isStoreFeatureAllowed(
   featureKey: StoreFeatureKey,
 ): boolean {
   const access = getStoreFeatureAccess(store, featureKey);
-  if (!access) return true;
-  return !!access.allowed;
+  if (!access) return true; // if no access info, allow by default
+  return access.allowed;
 }
 
 export function getStoreFeatureMessage(
@@ -30,13 +24,15 @@ export function getStoreFeatureMessage(
   featureKey: StoreFeatureKey,
 ): string {
   const access = getStoreFeatureAccess(store, featureKey);
-  if (access?.message) return access.message;
-  return 'У вашего текущего WB-ключа нет доступа к этому разделу. Обновите ключ или подключите отдельный ключ для этого раздела.';
+  if (!access) return '';
+  return access.message || `Функция "${access.label}" недоступна`;
 }
 
 export function getDeniedStoreFeatures(
-  access: Store['wb_token_access'] | null | undefined,
-): StoreWbFeatureAccess[] {
-  const features = access?.features || {};
-  return Object.values(features).filter((feature) => !feature.allowed);
+  tokenAccess: StoreWbTokenAccess | null | undefined,
+): Array<{ key: string; label: string; message: string; recommended_slot_labels: string[] }> {
+  if (!tokenAccess?.features) return [];
+  return Object.entries(tokenAccess.features)
+    .filter(([, v]) => !v.allowed)
+    .map(([k, v]) => ({ key: k, label: v.label, message: v.message, recommended_slot_labels: v.recommended_slot_labels || [] }));
 }

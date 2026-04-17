@@ -1,16 +1,9 @@
+import ProxiedImg from '../components/ProxiedImg';
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useStore } from '../contexts/StoreContext';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import api, { API_ORIGIN } from '../api/client';
-import type {
-  PhotoChatAsset,
-  PhotoChatClearMode,
-  PhotoChatHistoryResponse,
-  PhotoChatSsePayload,
-  PhotoChatThreadContext,
-  PhotoChatUploadResponse,
-} from '../features/photo-studio/contract';
-import { createPhotoChatSseDecoder } from '../features/photo-studio/contract';
+import { useIsMobile } from '../hooks/use-mobile';
 import {
   ChevronLeft,
   Send,
@@ -55,6 +48,7 @@ import {
   GripVertical,
   Camera,
   Save,
+  ShoppingBag,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -66,21 +60,59 @@ interface PhotoMedia {
   type: 'image' | 'video';
   prompt?: string;
   localFile?: File;
-  source?: string;
-  caption?: string;
+}
+
+interface ThreadContextState {
+  last_generated_asset_id: number | null;
+  working_asset_ids: number[];
+  pending_question: string | null;
+  last_action: Record<string, any> | null;
+  locale: string | null;
+}
+
+interface ThreadMeta {
+  id: number;
+  preview: string;
+  createdAt: string;
+  messageCount: number;
+}
+
+const THREADS_STORAGE_KEY = 'photo_studio_threads';
+
+function loadStoredThreads(): ThreadMeta[] {
+  try {
+    const raw = localStorage.getItem(THREADS_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+function saveStoredThreads(threads: ThreadMeta[]) {
+  try {
+    localStorage.setItem(THREADS_STORAGE_KEY, JSON.stringify(threads.slice(0, 50)));
+  } catch { /* ignore */ }
+}
+
+function upsertThread(threads: ThreadMeta[], meta: ThreadMeta): ThreadMeta[] {
+  const idx = threads.findIndex((t) => t.id === meta.id);
+  if (idx >= 0) {
+    const next = [...threads];
+    next[idx] = { ...next[idx], ...meta };
+    return next;
+  }
+  return [meta, ...threads];
 }
 
 interface ChatMessage {
   id: string;
   dbId?: number;
   role: 'user' | 'assistant';
-  type: 'text' | 'image' | 'question' | 'action-progress' | 'action-complete' | 'action-error';
+  type: 'welcome' | 'text' | 'image' | 'action-progress' | 'action-complete' | 'action-error';
   content: string;
   timestamp: Date;
   photos?: PhotoMedia[];
   isLoading?: boolean;
-  requestId?: string;
   threadId?: number;
+  requestId?: string;
 }
 
 interface ProductItem {
@@ -106,73 +138,6 @@ type QuickActionId = 'change-background' | 'change-pose' | 'put-on-model' | 'enh
 
 type GeneratorTab = 'own-model' | 'new-model' | 'custom-prompt' | 'scenes' | 'poses' | 'video';
 
-type AppLocale = 'ru' | 'uz' | 'en';
-
-interface StreamRequestDraft {
-  text: string;
-  photos: PhotoMedia[];
-  quickAction?: Record<string, any>;
-}
-
-interface PreparedStreamRequest extends StreamRequestDraft {
-  payload: {
-    message: string;
-    asset_ids?: number[];
-    quick_action?: Record<string, any>;
-    thread_id?: number;
-    request_id: string;
-    locale: string;
-  };
-}
-
-interface UiText {
-  studioTitle: string;
-  newChat: string;
-  clearMessages: string;
-  select: string;
-  cancel: string;
-  chooseAll: string;
-  deleteSelected: string;
-  deleteAll: string;
-  activeThread: string;
-  activeThreadShort: string;
-  activeImages: string;
-  noActiveImages: string;
-  activeHint: string;
-  pendingQuestion: string;
-  localeLabel: string;
-  relatedMedia: string;
-  persistentLibraryHint: string;
-  emptyMedia: string;
-  emptyMediaSub: string;
-  retry: string;
-  dismiss: string;
-  sendPlaceholder: string;
-  sendPlaceholderWithAttachments: string;
-  sendPlaceholderWithActiveContext: string;
-  loadingHistory: string;
-  emptyConversationTitle: string;
-  emptyConversationBody: string;
-  generationStarted: string;
-  imagesStarted: string;
-  imageStarted: string;
-  generationComplete: string;
-  genericError: string;
-  retryBannerTitle: string;
-  retryBannerBody: string;
-  limitReachedTitle: string;
-  limitReachedBody: string;
-  questionBadge: string;
-  activeBadge: string;
-  lastGeneratedBadge: string;
-  clearSuccess: string;
-  newChatSuccess: string;
-  restoreHistoryError: string;
-  unsupportedAssetError: string;
-  libraryTabImages: string;
-  libraryTabVideos: string;
-}
-
 const GEN_TABS: { id: GeneratorTab; label: string; icon: React.ElementType }[] = [
   { id: 'own-model', label: 'Своя фотомодель', icon: User },
   { id: 'new-model', label: 'Новая фотомодель', icon: Shirt },
@@ -190,6 +155,14 @@ interface QuickMenuAction {
 }
 
 const MEDIA_BASE = API_ORIGIN;
+
+const WELCOME_MSG: ChatMessage = {
+  id: 'welcome',
+  role: 'assistant',
+  type: 'welcome',
+  content: 'Привет! 👋 Я помогу обработать ваши фото. Выберите товар слева или загрузите своё фото.',
+  timestamp: new Date(),
+};
 
 const QUICK_PRESETS = [
   { icon: Palette, label: 'Изменить фон', prompt: 'Измени фон на белый студийный' },
@@ -289,242 +262,18 @@ function fileNameFromUrl(url: string) {
   return parts[parts.length - 1] || 'image.jpg';
 }
 
-function normalizeUiLocale(raw?: string | null): AppLocale {
-  const value = String(raw || '').trim().toLowerCase();
-  if (value.startsWith('uz')) return 'uz';
-  if (value.startsWith('en')) return 'en';
-  return 'ru';
+function prependUniquePhoto(list: PhotoMedia[], photo: PhotoMedia) {
+  const exists = list.some((item) => (photo.assetId ? item.assetId === photo.assetId : false) || item.url === photo.url);
+  return exists ? list : [photo, ...list];
 }
 
-function detectBrowserLocale(): string {
-  if (typeof navigator === 'undefined') return 'ru';
-  return navigator.languages?.[0] || navigator.language || 'ru';
-}
-
-function getUiText(locale: AppLocale): UiText {
-  if (locale === 'uz') {
-    return {
-      studioTitle: 'AI Foto studiya',
-      newChat: 'Yangi chat',
-      clearMessages: 'Xabarlarni tozalash',
-      select: 'Tanlash',
-      cancel: 'Bekor qilish',
-      chooseAll: 'Barchasini tanlash',
-      deleteSelected: 'Tanlanganlarni o‘chirish',
-      deleteAll: 'Barchasini o‘chirish',
-      activeThread: 'Faol chat',
-      activeThreadShort: 'Chat',
-      activeImages: 'Faol ishchi rasmlar',
-      noActiveImages: 'Bu chat uchun faol rasm tanlanmagan',
-      activeHint: 'Yangi tahrirlar ushbu faol rasm(lar)ga qo‘llanadi.',
-      pendingQuestion: 'Aniqlashtirish savoli',
-      localeLabel: 'Til',
-      relatedMedia: 'Media kutubxonasi',
-      persistentLibraryHint: 'Bu doimiy kutubxona. Chatni tozalash media fayllarni o‘chirmaydi.',
-      emptyMedia: 'Media hali yo‘q',
-      emptyMediaSub: 'Rasm yuklang yoki generatsiyani ishga tushiring',
-      retry: 'Qayta urinish',
-      dismiss: 'Yopish',
-      sendPlaceholder: 'Nima qilmoqchi ekaningizni yozing...',
-      sendPlaceholderWithAttachments: 'Rasm bilan nima qilish kerak?',
-      sendPlaceholderWithActiveContext: 'Faol rasmga qanday o‘zgartirish kiritamiz?',
-      loadingHistory: 'Chat yuklanmoqda...',
-      emptyConversationTitle: 'Yangi suhbat',
-      emptyConversationBody: 'Media biriktiring yoki topshiriq yozing. Kontekst chat ichida saqlanadi.',
-      generationStarted: 'Generatsiya boshlandi...',
-      imagesStarted: 'Bir nechta rasm yaratilmoqda...',
-      imageStarted: 'Rasm yaratilmoqda...',
-      generationComplete: 'Tayyor',
-      genericError: 'Ulanishda xato yuz berdi. Qaytadan urinib ko‘ring.',
-      retryBannerTitle: 'So‘rov yakunlanmadi',
-      retryBannerBody: 'Xuddi shu topshiriqni yana yuborishingiz mumkin.',
-      limitReachedTitle: 'Chat limiti tugadi',
-      limitReachedBody: 'Yana yuborish uchun xabarlarni tozalang yoki yangi chat boshlang.',
-      questionBadge: 'Aniqlashtirish',
-      activeBadge: 'Faol',
-      lastGeneratedBadge: 'Oxirgi natija',
-      clearSuccess: 'Chat xabarlari tozalandi',
-      newChatSuccess: 'Yangi chat boshlandi',
-      restoreHistoryError: 'Foto studiya tarixini yuklab bo‘lmadi',
-      unsupportedAssetError: 'Rasmni chatga tayyorlab bo‘lmadi',
-      libraryTabImages: 'Rasmlar',
-      libraryTabVideos: 'Videolar',
-    };
-  }
-
-  if (locale === 'en') {
-    return {
-      studioTitle: 'AI Photo Studio',
-      newChat: 'New chat',
-      clearMessages: 'Clear messages',
-      select: 'Select',
-      cancel: 'Cancel',
-      chooseAll: 'Select all',
-      deleteSelected: 'Delete selected',
-      deleteAll: 'Delete all',
-      activeThread: 'Active thread',
-      activeThreadShort: 'Thread',
-      activeImages: 'Active working images',
-      noActiveImages: 'No active image is selected for this thread',
-      activeHint: 'Follow-up edits will target these active images.',
-      pendingQuestion: 'Clarification needed',
-      localeLabel: 'Locale',
-      relatedMedia: 'Media library',
-      persistentLibraryHint: 'This library is persistent. Clearing chat does not delete media assets.',
-      emptyMedia: 'No media yet',
-      emptyMediaSub: 'Upload an image or start a generation',
-      retry: 'Retry',
-      dismiss: 'Dismiss',
-      sendPlaceholder: 'Describe what you want to do...',
-      sendPlaceholderWithAttachments: 'What should I do with these images?',
-      sendPlaceholderWithActiveContext: 'What should I change in the active image?',
-      loadingHistory: 'Loading chat...',
-      emptyConversationTitle: 'Start a new conversation',
-      emptyConversationBody: 'Attach media or type a request. Thread context will carry follow-up edits.',
-      generationStarted: 'Starting generation...',
-      imagesStarted: 'Generating images...',
-      imageStarted: 'Generating image...',
-      generationComplete: 'Done',
-      genericError: 'Connection error. Please try again.',
-      retryBannerTitle: 'The request did not finish',
-      retryBannerBody: 'You can retry the same task.',
-      limitReachedTitle: 'Chat limit reached',
-      limitReachedBody: 'Clear messages or start a new chat to continue.',
-      questionBadge: 'Clarification',
-      activeBadge: 'Active',
-      lastGeneratedBadge: 'Latest result',
-      clearSuccess: 'Chat messages cleared',
-      newChatSuccess: 'Started a new chat',
-      restoreHistoryError: 'Could not restore Photo Studio history',
-      unsupportedAssetError: 'Could not prepare an image for chat',
-      libraryTabImages: 'Images',
-      libraryTabVideos: 'Videos',
-    };
-  }
-
-  return {
-    studioTitle: 'AI Фотостудия',
-    newChat: 'Новый чат',
-    clearMessages: 'Очистить сообщения',
-    select: 'Выбрать',
-    cancel: 'Отмена',
-    chooseAll: 'Выбрать все',
-    deleteSelected: 'Удалить выбранные',
-    deleteAll: 'Удалить все',
-    activeThread: 'Активный чат',
-    activeThreadShort: 'Чат',
-    activeImages: 'Активные рабочие изображения',
-    noActiveImages: 'Для этого чата пока нет активного изображения',
-    activeHint: 'Последующие правки будут применяться к активному изображению выше.',
-    pendingQuestion: 'Уточнение от ассистента',
-    localeLabel: 'Язык',
-    relatedMedia: 'Медиатека',
-    persistentLibraryHint: 'Это постоянная библиотека. Очистка чата не удаляет медиафайлы.',
-    emptyMedia: 'Пока нет медиа',
-    emptyMediaSub: 'Загрузите фото или запустите генерацию',
-    retry: 'Повторить',
-    dismiss: 'Закрыть',
-    sendPlaceholder: 'Напишите, что хотите сделать...',
-    sendPlaceholderWithAttachments: 'Что сделать с фото?',
-    sendPlaceholderWithActiveContext: 'Что изменить в активном изображении?',
-    loadingHistory: 'Загружаю чат...',
-    emptyConversationTitle: 'Новый диалог',
-    emptyConversationBody: 'Прикрепите медиа или напишите задачу. Контекст будет храниться внутри чата.',
-    generationStarted: 'Запускаю генерацию...',
-    imagesStarted: 'Генерирую изображения...',
-    imageStarted: 'Генерирую изображение...',
-    generationComplete: 'Готово',
-    genericError: 'Ошибка соединения. Попробуйте ещё раз.',
-    retryBannerTitle: 'Запрос не завершился',
-    retryBannerBody: 'Можно отправить ту же задачу повторно.',
-    limitReachedTitle: 'Достигнут лимит чата',
-    limitReachedBody: 'Очистите сообщения или начните новый чат, чтобы продолжить.',
-    questionBadge: 'Уточнение',
-    activeBadge: 'Активно',
-    lastGeneratedBadge: 'Последний результат',
-    clearSuccess: 'Сообщения чата очищены',
-    newChatSuccess: 'Новый чат создан',
-    restoreHistoryError: 'Не удалось восстановить историю фотостудии',
-    unsupportedAssetError: 'Не удалось подготовить изображение для чата',
-    libraryTabImages: 'Фото',
-    libraryTabVideos: 'Видео',
-  };
-}
-
-function normalizeThreadContext(context?: Partial<PhotoChatThreadContext> | null): PhotoChatThreadContext {
-  const workingIds = Array.isArray(context?.working_asset_ids)
-    ? context?.working_asset_ids.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0)
-    : [];
-
-  return {
-    last_generated_asset_id: context?.last_generated_asset_id ? Number(context.last_generated_asset_id) : null,
-    working_asset_ids: workingIds,
-    pending_question: context?.pending_question ? String(context.pending_question) : null,
-    last_action: context?.last_action ?? null,
-    locale: context?.locale ? String(context.locale) : null,
-  };
-}
-
-function assetToPhotoMedia(asset: PhotoChatAsset): PhotoMedia | null {
-  const assetId = Number(asset.asset_id || 0);
-  const url = toAbsoluteMediaUrl(asset.file_url || '');
-  if (!assetId || !url) return null;
-  return {
-    id: `asset-${assetId}`,
-    assetId,
-    url,
-    fileName: asset.file_name || fileNameFromUrl(url),
-    type: /\.(mp4|mov|webm)$/i.test(asset.file_url || asset.file_name || '') || asset.kind === 'video' ? 'video' : 'image',
-    prompt: asset.prompt || asset.caption || '',
-    source: asset.source,
-    caption: asset.caption || '',
-  };
-}
-
-function buildAssetMap(assets: PhotoChatAsset[]): Map<number, PhotoMedia> {
-  const map = new Map<number, PhotoMedia>();
-  for (const asset of assets) {
-    const media = assetToPhotoMedia(asset);
-    if (media?.assetId) {
-      map.set(media.assetId, media);
-    }
-  }
-  return map;
-}
-
-function historyMessageToChatMessage(record: PhotoChatHistoryResponse['messages'][number], assetMap: Map<number, PhotoMedia>): ChatMessage {
-  const role: 'user' | 'assistant' = record.role === 'model' || record.role === 'assistant' ? 'assistant' : 'user';
-  const metaAssetIds = Array.isArray(record.meta?.asset_ids)
-    ? (record.meta?.asset_ids as unknown[]).map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0)
-    : [];
-  const photos = metaAssetIds.map((assetId) => assetMap.get(assetId)).filter(Boolean) as PhotoMedia[];
-  const msgType: ChatMessage['type'] = record.msg_type === 'image'
-    ? 'image'
-    : role === 'assistant' && record.meta && typeof record.meta === 'object' && (record.meta as Record<string, unknown>).question
-      ? 'question'
-      : 'text';
-
-  return {
-    id: `db-${record.id}`,
-    dbId: Number(record.id),
-    role,
-    type: msgType,
-    content: record.content || '',
-    timestamp: record.created_at ? new Date(record.created_at) : new Date(),
-    photos: photos.length > 0 ? photos : undefined,
-    requestId: record.request_id || undefined,
-    threadId: record.thread_id || undefined,
-  };
-}
+type MobileTab = 'chat' | 'generator' | 'history' | 'products';
 
 export default function PhotoStudioPage() {
   const { activeStore, loadStores } = useStore();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const browserLocale = useMemo(() => detectBrowserLocale(), []);
-  const [threadContext, setThreadContext] = useState<PhotoChatThreadContext>(() => normalizeThreadContext());
-  const locale = normalizeUiLocale(threadContext.locale || browserLocale);
-  const t = useMemo(() => getUiText(locale), [locale]);
+  const isMobile = useIsMobile();
   const cardNmId = searchParams.get('nmId');
   const cardIdParam = searchParams.get('cardId');
   const returnTab = searchParams.get('returnTab');
@@ -537,11 +286,23 @@ export default function PhotoStudioPage() {
       ? (requestedGenTab as GeneratorTab)
       : 'own-model';
 
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([WELCOME_MSG]);
   const [inputText, setInputText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const [isHistoryLoading, setIsHistoryLoading] = useState(true);
+  const [isBotTyping, setIsBotTyping] = useState(false);
+  const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
+  const [contextState, setContextState] = useState<ThreadContextState>({
+    last_generated_asset_id: null,
+    working_asset_ids: [],
+    pending_question: null,
+    last_action: null,
+    locale: null,
+  });
   const [mode, setMode] = useState<'chat' | 'generator'>(initialMode);
+  const [mobileTab, setMobileTab] = useState<MobileTab>('chat');
+  const [threadList, setThreadList] = useState<ThreadMeta[]>(() => loadStoredThreads());
+  const [threadDropdownOpen, setThreadDropdownOpen] = useState(false);
+  const threadDropdownRef = useRef<HTMLDivElement>(null);
   const [quickOpen, setQuickOpen] = useState(false);
   const [quickActive, setQuickActive] = useState<QuickActionId>('change-background');
   const [quickMenu, setQuickMenu] = useState<QuickMenuAction[]>(QUICK_MENU);
@@ -552,14 +313,7 @@ export default function PhotoStudioPage() {
   const [galleryUploading, setGalleryUploading] = useState(false);
   const [instructionsOpen, setInstructionsOpen] = useState(false);
   const [attachedPhotos, setAttachedPhotos] = useState<PhotoMedia[]>([]);
-  const [libraryMedia, setLibraryMedia] = useState<PhotoMedia[]>([]);
-  const [threadId, setThreadId] = useState<number | null>(null);
-  const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
-  const [sessionKey, setSessionKey] = useState<string | null>(null);
-  const [messageCount, setMessageCount] = useState(0);
-  const [messageLimit, setMessageLimit] = useState<number | null>(null);
-  const [isThreadLocked, setIsThreadLocked] = useState(false);
-  const [streamError, setStreamError] = useState<{ title: string; message: string; retryable: boolean } | null>(null);
+  const [generatedPhotos, setGeneratedPhotos] = useState<PhotoMedia[]>([]);
 
   const [products, setProducts] = useState<ProductItem[]>([]);
   const [productsLoading, setProductsLoading] = useState(false);
@@ -582,11 +336,21 @@ export default function PhotoStudioPage() {
   const [cardPhotosSaving, setCardPhotosSaving] = useState(false);
   const [cardUploadInputRef2] = useState(() => ({ current: null as HTMLInputElement | null }));
   const [sidebarDragOver, setSidebarDragOver] = useState(false);
+  const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
+  const [lastApplyResult, setLastApplyResult] = useState<{
+    matched: boolean;
+    missing_urls?: string[];
+    unexpected_urls?: string[];
+    stabilized?: boolean;
+    requested_order?: string[];
+    actual_order?: string[];
+  } | null>(null);
 
   // Gallery add from history
   const [galleryAddPhoto, setGalleryAddPhoto] = useState<PhotoMedia | null>(null);
   const [galleryAddType, setGalleryAddType] = useState<'scene' | 'model'>('scene');
   const [galleryAdding, setGalleryAdding] = useState(false);
+  const [galleryAddRect, setGalleryAddRect] = useState<DOMRect | null>(null);
 
   // Preview with prompt
   const [previewPhoto, setPreviewPhoto] = useState<PhotoMedia | null>(null);
@@ -610,6 +374,8 @@ export default function PhotoStudioPage() {
   const [genSelectedScene, setGenSelectedScene] = useState<{ id: string; label: string; quickAction: Record<string, any> } | null>(null);
   const [genSelectedPose, setGenSelectedPose] = useState<{ id: string; label: string; quickAction: Record<string, any> } | null>(null);
   const [genRunning, setGenRunning] = useState(false);
+  const [genShowProductPicker, setGenShowProductPicker] = useState(false);
+  const [genLatestResult, setGenLatestResult] = useState<PhotoMedia | null>(null);
   const [genSourcePhoto, setGenSourcePhoto] = useState<PhotoMedia | null>(null);
   const [catalogVideos, setCatalogVideos] = useState<Array<{ id: string; label: string; prompt: string; quickAction: Record<string, any> }>>([]);
 
@@ -623,7 +389,6 @@ export default function PhotoStudioPage() {
   const quickDropdownRef = useRef<HTMLDivElement>(null);
   const dragDepth = useRef(0);
   const [isDrag, setIsDrag] = useState(false);
-  const lastStreamDraftRef = useRef<PreparedStreamRequest | null>(null);
 
   useEffect(() => {
     if (!activeStore) {
@@ -664,6 +429,19 @@ export default function PhotoStudioPage() {
     document.addEventListener('mousedown', onDocClick);
     return () => document.removeEventListener('mousedown', onDocClick);
   }, [quickOpen]);
+
+  // Thread dropdown click-outside
+  useEffect(() => {
+    if (!threadDropdownOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      const node = e.target as Node | null;
+      if (threadDropdownRef.current && node && !threadDropdownRef.current.contains(node)) {
+        setThreadDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [threadDropdownOpen]);
 
   const loadProducts = async () => {
     if (!activeStore) {
@@ -706,14 +484,14 @@ export default function PhotoStudioPage() {
         id: `scene-${item?.id}`,
         label: String(item?.label || item?.name || `Сцена ${item?.id || ''}`),
         prompt: String(item?.prompt || ''),
-        quickAction: { type: 'change-background', scene_item_id: Number(item?.id || 0) },
+        quickAction: { type: 'change-background', scene_item_id: Number(item?.id || 0), scene_prompt: String(item?.prompt || '') },
       })).filter((item: any) => item.quickAction.scene_item_id > 0);
 
       const poses = (Array.isArray(data?.poses) ? data.poses : []).map((item: any) => ({
         id: `pose-${item?.id}`,
         label: String(item?.label || item?.name || `Поза ${item?.id || ''}`),
         prompt: String(item?.prompt || ''),
-        quickAction: { type: 'change-pose', pose_prompt_id: Number(item?.id || 0) },
+        quickAction: { type: 'change-pose', pose_prompt_id: Number(item?.id || 0), pose_prompt: String(item?.prompt || '') },
       })).filter((item: any) => item.quickAction.pose_prompt_id > 0);
 
       const models = (Array.isArray(data?.models) ? data.models : []).map((item: any) => ({
@@ -824,53 +602,111 @@ export default function PhotoStudioPage() {
     void loadGalleryAssets(galleryType);
   }, [samplesOpen, galleryType]);
 
-  const upsertLibraryMedia = useCallback((media: PhotoMedia) => {
-    setLibraryMedia((prev) => {
-      const next = prev.filter((item) => {
-        if (media.assetId && item.assetId) return item.assetId !== media.assetId;
-        return item.id !== media.id;
-      });
-      return [media, ...next];
-    });
-  }, []);
-
-  const hydrateHistory = useCallback((data: PhotoChatHistoryResponse, options?: { preserveLibraryIfEmpty?: boolean }) => {
-    const assets = Array.isArray(data.assets) ? data.assets : [];
-    const library = assets.map(assetToPhotoMedia).filter(Boolean) as PhotoMedia[];
-    const assetMap = buildAssetMap(assets);
-    const nextMessages = (Array.isArray(data.messages) ? data.messages : []).map((message) => historyMessageToChatMessage(message, assetMap));
-
-    setMessages(nextMessages);
-    setThreadId(Number(data.thread_id || 0) || null);
-    setActiveThreadId(Number(data.active_thread_id || 0) || null);
-    setSessionKey(data.session_key || null);
-    setThreadContext(normalizeThreadContext(data.context_state));
-    setMessageCount(Number(data.message_count || 0));
-    setMessageLimit(data.limit ?? null);
-    setIsThreadLocked(Boolean(data.locked));
-    setStreamError(null);
-
-    if (library.length > 0 || !options?.preserveLibraryIfEmpty) {
-      setLibraryMedia(library);
-    }
-  }, []);
-
-  const loadChatHistory = useCallback(async (requestedThreadId?: number) => {
-    setIsHistoryLoading(true);
-    try {
-      const data = await api.getPhotoChatHistory(requestedThreadId);
-      hydrateHistory(data);
-    } catch (e) {
-      console.warn('Failed to load chat history', e);
-      toast.error(t.restoreHistoryError);
-    } finally {
-      setIsHistoryLoading(false);
-    }
-  }, [hydrateHistory, t.restoreHistoryError]);
-
   useEffect(() => {
-    void loadChatHistory();
-  }, [loadChatHistory]);
+    (async () => {
+      try {
+        const data = await api.getPhotoChatHistory();
+
+        // Thread info
+        if (data.active_thread_id) setActiveThreadId(data.active_thread_id);
+        else if (data.thread_id) setActiveThreadId(data.thread_id);
+        if (data.context_state) setContextState(data.context_state);
+
+        const assets: any[] = data.assets || [];
+        const rawMsgs: any[] = data.messages || [];
+
+
+        const assetMap = new Map<number, PhotoMedia>();
+        for (const a of assets) {
+          const aid = Number(a.asset_id);
+          if (!aid) continue;
+          const url = toAbsoluteMediaUrl(a.file_url || a.fileUrl || '');
+          if (!url) continue;
+          assetMap.set(aid, {
+            id: `asset-${aid}`,
+            assetId: aid,
+            url,
+            fileName: a.file_name,
+            type: /\.(mp4|mov|webm)/i.test(url) ? 'video' : 'image',
+            prompt: a.prompt || a.caption || '',
+          });
+        }
+        
+
+        const mapped: ChatMessage[] = rawMsgs.map((m: any) => {
+          const dbId = Number(m.id);
+          const role: 'user' | 'assistant' = (m.role === 'model' || m.role === 'assistant') ? 'assistant' : 'user';
+          const aids: number[] = (m.meta?.asset_ids || []).map(Number).filter(Boolean);
+          const photos = aids.map((id) => assetMap.get(id)).filter(Boolean) as PhotoMedia[];
+
+
+          // For image-type messages, try to build photo from content URL if no asset_ids
+          if (m.msg_type === 'image' && photos.length === 0 && m.content) {
+            const imgUrl = toAbsoluteMediaUrl(m.content);
+            if (imgUrl) {
+              photos.push({
+                id: `msg-img-${dbId}`,
+                url: imgUrl,
+                type: /\.(mp4|mov|webm)/i.test(imgUrl) ? 'video' : 'image',
+              });
+            }
+          }
+
+          return {
+            id: `db-${dbId}`,
+            dbId,
+            role,
+            type: m.msg_type === 'image' ? 'image' : 'text',
+            content: m.msg_type === 'image' ? '' : (m.content || ''),
+            timestamp: m.created_at ? new Date(m.created_at) : new Date(),
+            photos: photos.length ? photos : undefined,
+            threadId: m.thread_id,
+            requestId: m.request_id,
+          };
+        });
+
+        // Build generatedPhotos from ALL session assets (session-scoped persistent media)
+        const genPhotos = assets
+          .map((a: any) => ({
+            id: `asset-${a.asset_id}`,
+            assetId: a.asset_id,
+            url: toAbsoluteMediaUrl(a.file_url),
+            fileName: a.file_name,
+            type: (/\.(mp4|mov|webm)/i.test(a.file_url || '') ? 'video' : 'image') as 'image' | 'video',
+            prompt: a.prompt || a.caption || '',
+          }))
+          .filter((p: PhotoMedia) => !!p.url)
+          .reverse();
+
+        setGeneratedPhotos(genPhotos);
+
+        // Track thread in local thread list
+        const threadId = data.active_thread_id || data.thread_id;
+        if (threadId) {
+          const firstUserMsg = rawMsgs.find((m: any) => m.role === 'user');
+          const preview = firstUserMsg?.content?.slice(0, 60) || 'Новый чат';
+          const created = rawMsgs[0]?.created_at || new Date().toISOString();
+          setThreadList((prev) => {
+            const next = upsertThread(prev, {
+              id: threadId,
+              preview,
+              createdAt: created,
+              messageCount: data.message_count || rawMsgs.length,
+            });
+            saveStoredThreads(next);
+            return next;
+          });
+        }
+
+        if (mapped.length > 0) {
+          setMessages([WELCOME_MSG, ...mapped]);
+        }
+      } catch (e) {
+        console.warn('Failed to load chat history', e);
+        toast.error('Не удалось восстановить историю фотостудии');
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -919,309 +755,339 @@ export default function PhotoStudioPage() {
     });
   };
 
-  const uploadFile = async (file: File): Promise<PhotoChatUploadResponse> => {
+  const uploadFile = async (file: File): Promise<{ assetId?: number; url?: string }> => {
     const data = await api.uploadPhotoChatAsset(file);
-    const media: PhotoMedia = {
-      id: `asset-${data.asset_id}`,
-      assetId: data.asset_id,
-      url: toAbsoluteMediaUrl(data.file_url),
-      fileName: data.file_name,
-      type: /\.(mp4|mov|webm)$/i.test(data.file_url || data.file_name || '') ? 'video' : 'image',
-      caption: data.caption || '',
-    };
-    upsertLibraryMedia(media);
-    return data;
+    return { assetId: data.asset_id || data.id, url: toAbsoluteMediaUrl(data.file_url || data.url) };
   };
 
-  const importUrlAsAsset = async (url: string): Promise<PhotoChatUploadResponse> => {
+  const importUrlAsAsset = async (url: string): Promise<{ assetId?: number; url?: string }> => {
     const data = await api.importPhotoChatAsset(url);
-    const media: PhotoMedia = {
-      id: `asset-${data.asset_id}`,
-      assetId: data.asset_id,
-      url: toAbsoluteMediaUrl(data.file_url),
-      fileName: data.file_name,
-      type: /\.(mp4|mov|webm)$/i.test(data.file_url || data.file_name || '') ? 'video' : 'image',
-      caption: data.caption || '',
-      source: 'import',
-    };
-    upsertLibraryMedia(media);
-    return data;
+    return { assetId: data.asset_id || data.id, url: toAbsoluteMediaUrl(data.file_url || data.url) };
   };
 
-  const resolveAssetIds = useCallback(async (photos: PhotoMedia[]): Promise<number[]> => {
-    const assetIds: number[] = [];
-
-    for (const photo of photos) {
-      if (photo.assetId) {
-        assetIds.push(photo.assetId);
-        continue;
-      }
-
-      if (photo.localFile) {
-        const uploaded = await uploadFile(photo.localFile);
-        assetIds.push(uploaded.asset_id);
-        continue;
-      }
-
-      if (photo.url) {
-        const imported = await importUrlAsAsset(photo.url);
-        assetIds.push(imported.asset_id);
-      }
-    }
-
-    return Array.from(new Set(assetIds.filter((assetId) => Number.isFinite(assetId) && assetId > 0)));
-  }, [upsertLibraryMedia]);
-
-  const applyStreamPayload = useCallback((
-    payload: PhotoChatSsePayload,
-    state: {
-      userMessageId: string;
-      botMessageId: string;
-      botAdded: boolean;
-      botContent: string;
-      botPhotos: PhotoMedia[];
-    },
-  ) => {
-    const syncThread = (nextThreadId: number) => {
-      if (Number.isFinite(nextThreadId) && nextThreadId > 0) {
-        setThreadId(nextThreadId);
-        setActiveThreadId(nextThreadId);
-      }
-    };
-
-    const upsertBot = (type: ChatMessage['type'], loading = false) => {
-      if (!state.botAdded) {
-        state.botAdded = true;
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: state.botMessageId,
-            role: 'assistant',
-            type,
-            content: state.botContent,
-            timestamp: new Date(),
-            photos: state.botPhotos.length > 0 ? [...state.botPhotos] : undefined,
-            isLoading: loading,
-            requestId: payload.request_id,
-            threadId: payload.thread_id,
-          },
-        ]);
-        return;
-      }
-
-      setMessages((prev) => prev.map((message) => (
-        message.id === state.botMessageId
-          ? {
-            ...message,
-            type,
-            content: state.botContent,
-            photos: state.botPhotos.length > 0 ? [...state.botPhotos] : undefined,
-            isLoading: loading,
-            requestId: payload.request_id,
-            threadId: payload.thread_id,
-          }
-          : message
-      )));
-    };
-
-    syncThread(payload.thread_id);
-
-    switch (payload.type) {
-      case 'ack':
-        if (payload.user_message_id) {
-          setMessages((prev) => prev.map((message) => (
-            message.id === state.userMessageId
-              ? { ...message, dbId: Number(payload.user_message_id) }
-              : message
-          )));
-        }
-        setMessageCount((prev) => prev + 1);
-        break;
-      case 'chat':
-        state.botContent = payload.content || payload.message || '';
-        setThreadContext((prev) => ({ ...prev, pending_question: null }));
-        upsertBot('text');
-        break;
-      case 'question':
-        state.botContent = payload.content || payload.message || '';
-        setThreadContext((prev) => ({ ...prev, pending_question: state.botContent || null }));
-        upsertBot('question');
-        break;
-      case 'generation_start':
-        state.botContent = payload.prompt || t.generationStarted;
-        upsertBot('action-progress', true);
-        break;
-      case 'images_start':
-        state.botContent = payload.total && payload.total > 1 ? `${t.imagesStarted} ${payload.total}` : t.imagesStarted;
-        upsertBot('action-progress', true);
-        break;
-      case 'image_started':
-        state.botContent = payload.index && payload.total
-          ? `${t.imageStarted} ${payload.index}/${payload.total}`
-          : t.imageStarted;
-        upsertBot('action-progress', true);
-        break;
-      case 'generation_complete': {
-        const url = toAbsoluteMediaUrl(payload.image_url || '');
-        if (url) {
-          const media: PhotoMedia = {
-            id: payload.asset_id ? `asset-${payload.asset_id}` : uid(),
-            assetId: payload.asset_id || undefined,
-            url,
-            fileName: payload.file_name || fileNameFromUrl(url),
-            type: 'image',
-            prompt: payload.prompt || '',
-            source: 'generated',
-          };
-          state.botPhotos = [
-            ...state.botPhotos.filter((photo) => {
-              if (media.assetId && photo.assetId) return photo.assetId !== media.assetId;
-              return photo.url !== media.url;
-            }),
-            media,
-          ];
-          upsertLibraryMedia(media);
-        }
-        state.botContent = payload.prompt || t.generationComplete;
-        {
-          const total = Number(payload.total || 1);
-          const index = Number(payload.index || total);
-          upsertBot('action-complete', total > 1 && index < total);
-        }
-        break;
-      }
-      case 'context_state':
-        setThreadContext(normalizeThreadContext(payload.context_state));
-        break;
-      case 'limit_reached': {
-        const message = payload.message || payload.content || t.limitReachedBody;
-        setIsThreadLocked(true);
-        setStreamError({ title: t.limitReachedTitle, message, retryable: false });
-        state.botContent = message;
-        upsertBot('action-error');
-        break;
-      }
-      case 'error': {
-        const message = payload.message || payload.error?.message || payload.content || t.genericError;
-        setStreamError({
-          title: t.retryBannerTitle,
-          message,
-          retryable: payload.retryable !== false,
-        });
-        state.botContent = message;
-        upsertBot('action-error');
-        break;
-      }
-    }
-  }, [t, upsertLibraryMedia]);
-
-  const runPreparedStream = useCallback(async (prepared: PreparedStreamRequest, userMessageId: string) => {
-    const res = await api.streamPhotoChat(prepared.payload);
-    const reader = res.body?.getReader();
-    if (!reader) {
-      throw new Error(t.genericError);
-    }
-
-    const decoder = createPhotoChatSseDecoder();
-    const textDecoder = new TextDecoder();
-    const state = {
-      userMessageId,
-      botMessageId: uid(),
-      botAdded: false,
-      botContent: '',
-      botPhotos: [] as PhotoMedia[],
-    };
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = textDecoder.decode(value, { stream: true });
-      for (const payload of decoder.push(chunk)) {
-        applyStreamPayload(payload, state);
-      }
-    }
-
-    for (const payload of decoder.flush()) {
-      applyStreamPayload(payload, state);
-    }
-
-    if (state.botAdded) {
-      setMessages((prev) => prev.map((message) => (
-        message.id === state.botMessageId
-          ? { ...message, isLoading: false }
-          : message
-      )));
-    }
-  }, [applyStreamPayload, t.genericError]);
-
-  const prepareStreamRequest = useCallback(async (draft: StreamRequestDraft): Promise<PreparedStreamRequest> => {
-    const normalizedText = draft.text.trim();
-    const assetIds = await resolveAssetIds(draft.photos);
-    const requestId = crypto.randomUUID?.() || `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    return {
-      ...draft,
-      payload: {
-        message: normalizedText || '',
-        ...(assetIds.length > 0 ? { asset_ids: assetIds } : {}),
-        ...(draft.quickAction ? { quick_action: draft.quickAction } : {}),
-        ...(threadId ? { thread_id: threadId } : {}),
-        request_id: requestId,
-        locale: threadContext.locale || browserLocale,
-      },
-    };
-  }, [browserLocale, resolveAssetIds, threadContext.locale, threadId]);
-
-  const sendMessage = async ({ text, photos, quickAction }: StreamRequestDraft) => {
+  const sendMessage = async ({
+    text,
+    photos,
+    quickAction,
+  }: {
+    text: string;
+    photos: PhotoMedia[];
+    quickAction?: Record<string, any>;
+  }) => {
     const normalizedText = (text || '').trim();
-    if ((!normalizedText && photos.length === 0 && !quickAction) || isStreaming || isThreadLocked) {
-      return;
-    }
+    if (!normalizedText && photos.length === 0 && !quickAction) return;
+    if (isStreaming) return;
 
     setIsStreaming(true);
-    setStreamError(null);
+    setIsBotTyping(true);
+    setInputText('');
+    setAttachedPhotos([]);
+
+    const userMsg: ChatMessage = {
+      id: uid(),
+      role: 'user',
+      type: photos.length > 0 && !normalizedText ? 'image' : 'text',
+      content: normalizedText,
+      timestamp: new Date(),
+      photos: photos.length > 0 ? photos : undefined,
+    };
+    setMessages((prev) => [...prev, userMsg]);
+
+    const assetIds: number[] = [];
+    const fallbackPhotoUrls: string[] = [];
+    const addFallbackUrl = (raw?: string) => {
+      const abs = toAbsoluteMediaUrl(raw || '');
+      if (!abs || abs.startsWith('blob:')) return;
+      if (!fallbackPhotoUrls.includes(abs)) fallbackPhotoUrls.push(abs);
+    };
+
+    for (const p of photos) {
+      if (p.localFile) {
+        try {
+          const result = await uploadFile(p.localFile);
+          if (result.assetId) {
+            assetIds.push(result.assetId);
+          } else {
+            addFallbackUrl(result.url);
+          }
+        } catch (e) {
+          console.warn('Upload failed:', e);
+        }
+        continue;
+      }
+
+      if (p.assetId) {
+        assetIds.push(p.assetId);
+        continue;
+      }
+
+      if (!p.url) continue;
+
+      try {
+        const imported = await importUrlAsAsset(p.url);
+        if (imported.assetId) {
+          assetIds.push(imported.assetId);
+        } else {
+          addFallbackUrl(imported.url || p.url);
+        }
+      } catch (e) {
+        console.warn('Import failed:', e);
+        addFallbackUrl(p.url);
+      }
+    }
+
+    const uniqueAssetIds = Array.from(new Set(assetIds));
 
     try {
-      const prepared = await prepareStreamRequest({ text: normalizedText, photos, quickAction });
-      lastStreamDraftRef.current = prepared;
+      const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const requestMessage = normalizedText || (quickAction ? 'Быстрая команда' : '');
+      const body: any = { message: requestMessage, request_id: requestId };
+      if (activeThreadId) body.thread_id = activeThreadId;
+      if (uniqueAssetIds.length > 0) body.asset_ids = uniqueAssetIds;
+      if (fallbackPhotoUrls.length > 0) body.photo_urls = fallbackPhotoUrls;
+      if (quickAction) body.quick_action = quickAction;
 
-      const userMsgId = uid();
-      setInputText('');
-      setAttachedPhotos([]);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: userMsgId,
-          role: 'user',
-          type: photos.length > 0 && !normalizedText ? 'image' : 'text',
-          content: normalizedText,
-          timestamp: new Date(),
-          photos: photos.length > 0 ? photos : undefined,
-          requestId: prepared.payload.request_id,
-          threadId: threadId || undefined,
-        },
-      ]);
+      const res = await api.streamPhotoChat(body);
+      console.log('[PhotoStudio] Stream response status:', res.status, res.statusText);
+      console.log('[PhotoStudio] Response headers:', Object.fromEntries(res.headers.entries()));
+      if (!res.ok) {
+        const errBody = await res.text();
+        console.error('[PhotoStudio] Non-OK response body:', errBody);
+        throw new Error(`HTTP ${res.status}: ${errBody.slice(0, 300)}`);
+      }
 
-      await runPreparedStream(prepared, userMsgId);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : t.unsupportedAssetError;
-      setStreamError({
-        title: t.retryBannerTitle,
-        message,
-        retryable: true,
-      });
+      const reader = res.body?.getReader();
+      const dec = new TextDecoder();
+      let botContent = '';
+      let botPhotos: PhotoMedia[] = [];
+      let botMsgId = uid();
+      let botAdded = false;
+
+      const addOrUpdateBot = (type: ChatMessage['type'] = 'text', loading = false) => {
+        setIsBotTyping(false);
+        if (!botAdded) {
+          botAdded = true;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: botMsgId,
+              role: 'assistant',
+              type,
+              content: botContent,
+              timestamp: new Date(),
+              photos: botPhotos.length > 0 ? [...botPhotos] : undefined,
+              isLoading: loading,
+            },
+          ]);
+        } else {
+          setMessages((prev) => prev.map((m) =>
+            m.id === botMsgId
+              ? { ...m, type, content: botContent, photos: botPhotos.length > 0 ? [...botPhotos] : undefined, isLoading: loading }
+              : m,
+          ));
+        }
+      };
+
+      let receivedComplete = false;
+      let lastEventTime = Date.now();
+
+      if (reader) {
+        let buf = '';
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            lastEventTime = Date.now();
+            buf += dec.decode(value, { stream: true });
+            const lines = buf.split('\n');
+            buf = lines.pop() || '';
+
+            for (const ln of lines) {
+              if (!ln.startsWith('data: ')) continue;
+              try {
+                const d = JSON.parse(ln.slice(6));
+
+                if (d.type === 'ack') {
+                  if (d.thread_id) {
+                    setActiveThreadId(d.thread_id);
+                    setThreadList((prev) => {
+                      const next = upsertThread(prev, {
+                        id: d.thread_id,
+                        preview: (normalizedText || 'Фото').slice(0, 60),
+                        createdAt: new Date().toISOString(),
+                        messageCount: (prev.find((t) => t.id === d.thread_id)?.messageCount || 0) + 1,
+                      });
+                      saveStoredThreads(next);
+                      return next;
+                    });
+                  }
+                  if (d.user_message_id) {
+                    setMessages((prev) => prev.map((m) =>
+                      m.id === userMsg.id ? { ...m, dbId: d.user_message_id, threadId: d.thread_id, requestId: d.request_id } : m,
+                    ));
+                  }
+                }
+                else if (d.type === 'chat' || d.type === 'question' || d.type === 'response') {
+                  botContent = d.content || d.message || '';
+                  addOrUpdateBot('text');
+                }
+                else if (d.type === 'text' || d.type === 'chunk') {
+                  botContent += d.content || d.text || '';
+                  addOrUpdateBot('text');
+                }
+                else if (d.type === 'error' || d.type === 'limit_reached') {
+                  botContent = d.message || d.content || 'Произошла ошибка';
+                  addOrUpdateBot('action-error');
+                  receivedComplete = true;
+                }
+                else if (d.type === 'images_start') {
+                  botContent = '';
+                  addOrUpdateBot('action-progress', true);
+                }
+                else if (d.type === 'image_started') {
+                  botContent = '';
+                  addOrUpdateBot('action-progress', true);
+                }
+                else if (d.type === 'generation_start') {
+                  botContent = '';
+                  addOrUpdateBot('action-progress', true);
+                }
+                else if (d.type === 'generation_complete') {
+                  const mediaUrl = toAbsoluteMediaUrl(d.image_url || d.url);
+                  const isVideo = /\.(mp4|mov|webm)/i.test(mediaUrl) || /\.(mp4|mov|webm)/i.test(d.file_name || '');
+                  const newPhoto: PhotoMedia = {
+                    id: `gen-${d.asset_id || Date.now()}`,
+                    assetId: d.asset_id,
+                    url: mediaUrl,
+                    fileName: d.file_name,
+                    type: isVideo ? 'video' : 'image',
+                    prompt: d.prompt,
+                  };
+                  botPhotos.push(newPhoto);
+                  setGeneratedPhotos((prev) => [newPhoto, ...prev]);
+                  const total = Number(d.total || 1);
+                  const index = Number(d.index || total);
+                  const hasMore = index < total;
+                  botContent = hasMore
+                    ? `Генерация изображения ${index} из ${total}...`
+                    : 'Готово!';
+                  addOrUpdateBot('action-complete', hasMore);
+                  if (!hasMore) receivedComplete = true;
+                }
+                else if (d.type === 'media' || d.type === 'image') {
+                  const u = toAbsoluteMediaUrl(d.url || d.image_url);
+                  if (!u) continue;
+                  botPhotos.push({
+                    id: uid(),
+                    assetId: Number(d.asset_id || d.assetId || 0) || undefined,
+                    url: u,
+                    type: 'image',
+                    fileName: d.filename,
+                  });
+                  addOrUpdateBot('text');
+                }
+                else if (d.type === 'context_state' && d.context_state) {
+                  setContextState(d.context_state);
+                }
+                else if (d.type === 'keepalive' || d.type === 'ping') {
+                  // keepalive from server, ignore
+                }
+              } catch {
+                // ignore broken chunk
+              }
+            }
+          }
+        } catch (streamErr: any) {
+          console.warn('[PhotoStudio] Stream interrupted:', streamErr?.message);
+          // Stream broke mid-flight — poll history to check if result arrived
+          if (!receivedComplete && requestId) {
+            console.log('[PhotoStudio] Polling history for request_id:', requestId);
+            botContent = 'Соединение прервалось, проверяю результат...';
+            addOrUpdateBot('action-progress', true);
+
+            // Poll up to 12 times (every 10s = ~2 min) for result
+            for (let attempt = 0; attempt < 12; attempt++) {
+              await new Promise((r) => setTimeout(r, 10000));
+              try {
+                const history = await api.getPhotoChatHistory();
+                if (history?.messages) {
+                  const resultMsgs = history.messages.filter(
+                    (m: any) => m.request_id === requestId && m.role === 'model'
+                  );
+                  if (resultMsgs.length > 0) {
+                    // Found results — update UI
+                    for (const rm of resultMsgs) {
+                      if (rm.msg_type === 'image' && rm.meta?.asset_ids) {
+                        for (const aId of rm.meta.asset_ids) {
+                          const asset = history.assets?.find((a: any) => a.asset_id === aId);
+                          if (asset) {
+                            const mediaUrl = toAbsoluteMediaUrl(asset.file_url);
+                            const isVideo = /\.(mp4|mov|webm)/i.test(mediaUrl);
+                            const newPhoto: PhotoMedia = {
+                              id: `gen-${aId}`,
+                              assetId: aId,
+                              url: mediaUrl,
+                              fileName: asset.file_name,
+                              type: isVideo ? 'video' : 'image',
+                              prompt: asset.prompt,
+                            };
+                            botPhotos.push(newPhoto);
+                            setGeneratedPhotos((prev) => [newPhoto, ...prev]);
+                          }
+                        }
+                      }
+                      if (rm.msg_type === 'text' && rm.content) {
+                        botContent = rm.content;
+                      }
+                    }
+                    botContent = botContent || 'Готово!';
+                    addOrUpdateBot('action-complete', false);
+                    receivedComplete = true;
+                    break;
+                  }
+                }
+                botContent = `Ожидание результата... (${attempt + 1}/12)`;
+                addOrUpdateBot('action-progress', true);
+              } catch (pollErr) {
+                console.warn('[PhotoStudio] Poll attempt failed:', pollErr);
+              }
+            }
+
+            if (!receivedComplete) {
+              botContent = 'Генерация ещё выполняется на сервере. Обновите страницу через пару минут, чтобы увидеть результат.';
+              addOrUpdateBot('action-error');
+            }
+            // Don't re-throw — we handled it
+            return;
+          }
+          // If no requestId or already complete, ignore the stream break
+          if (receivedComplete) return;
+          throw streamErr; // re-throw to outer catch
+        }
+      }
+
+      if (!botAdded) {
+        botContent = 'Готово.';
+        addOrUpdateBot('text');
+      }
+    } catch (e: any) {
+      console.error('[PhotoStudio] Stream error:', e);
+      console.error('[PhotoStudio] Error name:', e?.name, '| message:', e?.message);
+      console.error('[PhotoStudio] Stack:', e?.stack);
+      const errDetail = e?.message || String(e);
       setMessages((prev) => [
         ...prev,
         {
           id: uid(),
           role: 'assistant',
           type: 'action-error',
-          content: message,
+          content: `Ошибка соединения: ${errDetail}`,
           timestamp: new Date(),
         },
       ]);
-      toast.error(message || t.unsupportedAssetError);
     } finally {
       setIsStreaming(false);
+      setIsBotTyping(false);
     }
   };
 
@@ -1368,8 +1234,8 @@ export default function PhotoStudioPage() {
   }, [products, productsQuery]);
 
   const canAttachMore = attachedPhotos.length < 3;
-  const libraryPhotos = useMemo(() => libraryMedia.filter((p) => p.type === 'image'), [libraryMedia]);
-  const libraryVideos = useMemo(() => libraryMedia.filter((p) => p.type === 'video'), [libraryMedia]);
+  const historyPhotos = useMemo(() => generatedPhotos.filter((p) => p.type === 'image'), [generatedPhotos]);
+  const historyVideos = useMemo(() => generatedPhotos.filter((p) => p.type === 'video'), [generatedPhotos]);
   const gallerySystemAssets = useMemo(
     () => galleryAssets.filter((a) => a.ownerType === 'system'),
     [galleryAssets],
@@ -1382,35 +1248,6 @@ export default function PhotoStudioPage() {
     () => quickMenu.find((x) => x.id === quickActive) || quickMenu[0] || QUICK_MENU[0],
     [quickActive, quickMenu],
   );
-  const libraryAssetMap = useMemo(() => {
-    const map = new Map<number, PhotoMedia>();
-    for (const media of libraryMedia) {
-      if (media.assetId) {
-        map.set(media.assetId, media);
-      }
-    }
-    return map;
-  }, [libraryMedia]);
-  const activeWorkingAssetIds = useMemo(() => {
-    const ids = [...threadContext.working_asset_ids];
-    if (threadContext.last_generated_asset_id && !ids.includes(threadContext.last_generated_asset_id)) {
-      ids.unshift(threadContext.last_generated_asset_id);
-    }
-    return Array.from(new Set(ids.filter((value) => Number.isFinite(value) && value > 0)));
-  }, [threadContext.last_generated_asset_id, threadContext.working_asset_ids]);
-  const activeWorkingMedia = useMemo(
-    () => activeWorkingAssetIds.map((assetId) => libraryAssetMap.get(assetId)).filter(Boolean) as PhotoMedia[],
-    [activeWorkingAssetIds, libraryAssetMap],
-  );
-  const messageUsageLabel = useMemo(() => {
-    if (messageLimit === null || messageLimit <= 0) return null;
-    return `${messageCount}/${messageLimit}`;
-  }, [messageCount, messageLimit]);
-  const chatPlaceholder = attachedPhotos.length > 0
-    ? t.sendPlaceholderWithAttachments
-    : activeWorkingMedia.length > 0
-      ? t.sendPlaceholderWithActiveContext
-      : t.sendPlaceholder;
 
   const handleQuickPick = async (
     action: QuickMenuAction,
@@ -1454,55 +1291,166 @@ export default function PhotoStudioPage() {
     }
   };
 
-  const clearChat = async (clearMode: PhotoChatClearMode = 'messages') => {
+  const clearChat = async () => {
     try {
-      const data = await api.clearPhotoChat({
-        threadId: threadId || undefined,
-        clearMode,
+      await api.clearPhotoChat(activeThreadId || undefined, 'all');
+      setMessages([WELCOME_MSG]);
+      setContextState({
+        last_generated_asset_id: null,
+        working_asset_ids: [],
+        pending_question: null,
+        last_action: null,
+        locale: contextState.locale,
       });
-      setThreadId(data.thread_id);
-      setActiveThreadId(data.active_thread_id);
-      setThreadContext(normalizeThreadContext(data.context_state));
-      setMessageCount(data.message_count || 0);
-      setMessageLimit(data.limit ?? null);
-      setIsThreadLocked(Boolean(data.locked));
-      setStreamError(null);
-      if (clearMode !== 'context') {
-        setMessages([]);
-        setSelectedMsgIds(new Set());
-        setChatSelectMode(false);
-      }
-      toast.success(t.clearSuccess);
+      toast.success('История чата очищена');
     } catch (e) {
       console.error('Clear chat error', e);
-      toast.error(t.genericError);
+      toast.error('Не удалось очистить историю чата');
     }
   };
 
-  const handleNewChat = async () => {
-    if (isStreaming) return;
+  const startNewThread = async () => {
     try {
-      const data = await api.createPhotoChatThread();
-      hydrateHistory(data, { preserveLibraryIfEmpty: true });
-      setAttachedPhotos([]);
-      setInputText('');
-      setSelectedMsgIds(new Set());
-      setChatSelectMode(false);
-      toast.success(t.newChatSuccess);
+      const data = await api.createNewPhotoThread();
+      const newThreadId = data.active_thread_id || data.thread_id;
+      setActiveThreadId(newThreadId);
+      if (data.context_state) setContextState(data.context_state);
+      setMessages([WELCOME_MSG]);
+
+      // Sync session-wide media library from response assets
+      const assets: any[] = data.assets || [];
+      const genPhotos = assets
+        .map((a: any) => ({
+          id: `asset-${a.asset_id}`,
+          assetId: a.asset_id,
+          url: toAbsoluteMediaUrl(a.file_url || ''),
+          fileName: a.file_name,
+          type: (/\.(mp4|mov|webm)/i.test(a.file_url || '') ? 'video' : 'image') as 'image' | 'video',
+          prompt: a.prompt || a.caption || '',
+        }))
+        .filter((p: PhotoMedia) => !!p.url)
+        .reverse();
+      setGeneratedPhotos(genPhotos);
+
+      // Track new thread
+      if (newThreadId) {
+        setThreadList((prev) => {
+          const next = upsertThread(prev, {
+            id: newThreadId,
+            preview: 'Новый чат',
+            createdAt: new Date().toISOString(),
+            messageCount: 0,
+          });
+          saveStoredThreads(next);
+          return next;
+        });
+      }
+
+      toast.success('Новый чат создан');
     } catch (e) {
-      console.error('New chat error', e);
-      toast.error(t.genericError);
+      console.error('New thread error', e);
+      toast.error('Не удалось создать новый чат');
     }
   };
 
-  const retryLastRequest = async () => {
-    const lastDraft = lastStreamDraftRef.current;
-    if (!lastDraft || isStreaming || isThreadLocked) return;
-    await sendMessage({
-      text: lastDraft.text,
-      photos: lastDraft.photos,
-      quickAction: lastDraft.quickAction,
-    });
+  const deleteThread = async (threadId: number) => {
+    try {
+      await api.clearPhotoChat(threadId, 'all');
+      setThreadList((prev) => {
+        const next = prev.filter((t) => t.id !== threadId);
+        saveStoredThreads(next);
+        return next;
+      });
+      if (threadId === activeThreadId) {
+        setMessages([WELCOME_MSG]);
+        setActiveThreadId(null);
+      }
+      toast.success('Чат удалён');
+    } catch (e) {
+      console.error('Delete thread error', e);
+      toast.error('Не удалось удалить чат');
+    }
+  };
+
+  const switchThread = async (threadId: number) => {
+    if (threadId === activeThreadId) {
+      setThreadDropdownOpen(false);
+      return;
+    }
+    try {
+      const data = await api.getPhotoChatHistory(threadId);
+      const resolvedThreadId = data.thread_id || threadId;
+      setActiveThreadId(resolvedThreadId);
+      if (data.context_state) setContextState(data.context_state);
+
+      const assets: any[] = data.assets || [];
+      const rawMsgs: any[] = data.messages || [];
+
+      const assetMap = new Map<number, PhotoMedia>();
+      for (const a of assets) {
+        const aid = Number(a.asset_id);
+        if (!aid) continue;
+        const url = toAbsoluteMediaUrl(a.file_url || a.fileUrl || '');
+        if (!url) continue;
+        assetMap.set(aid, {
+          id: `asset-${aid}`,
+          assetId: aid,
+          url,
+          fileName: a.file_name,
+          type: /\.(mp4|mov|webm)/i.test(url) ? 'video' : 'image',
+          prompt: a.prompt || a.caption || '',
+        });
+      }
+
+      const mapped: ChatMessage[] = rawMsgs.map((m: any) => {
+        const dbId = Number(m.id);
+        const role: 'user' | 'assistant' = (m.role === 'model' || m.role === 'assistant') ? 'assistant' : 'user';
+        const aids: number[] = (m.meta?.asset_ids || []).map(Number).filter(Boolean);
+        const photos = aids.map((id) => assetMap.get(id)).filter(Boolean) as PhotoMedia[];
+
+        if (m.msg_type === 'image' && photos.length === 0 && m.content) {
+          const imgUrl = toAbsoluteMediaUrl(m.content);
+          if (imgUrl) {
+            photos.push({
+              id: `msg-img-${dbId}`,
+              url: imgUrl,
+              type: /\.(mp4|mov|webm)/i.test(imgUrl) ? 'video' : 'image',
+            });
+          }
+        }
+
+        return {
+          id: `db-${dbId}`,
+          dbId,
+          role,
+          type: m.msg_type === 'image' ? 'image' : 'text',
+          content: m.msg_type === 'image' ? '' : (m.content || ''),
+          timestamp: m.created_at ? new Date(m.created_at) : new Date(),
+          photos: photos.length ? photos : undefined,
+          threadId: m.thread_id,
+          requestId: m.request_id,
+        };
+      });
+
+      const genPhotos = assets
+        .map((a: any) => ({
+          id: `asset-${a.asset_id}`,
+          assetId: a.asset_id,
+          url: toAbsoluteMediaUrl(a.file_url),
+          fileName: a.file_name,
+          type: (/\.(mp4|mov|webm)/i.test(a.file_url || '') ? 'video' : 'image') as 'image' | 'video',
+          prompt: a.prompt || a.caption || '',
+        }))
+        .filter((p: PhotoMedia) => !!p.url)
+        .reverse();
+      setGeneratedPhotos(genPhotos);
+
+      setMessages(mapped.length > 0 ? [WELCOME_MSG, ...mapped] : [WELCOME_MSG]);
+      setThreadDropdownOpen(false);
+    } catch (e) {
+      console.error('Switch thread error', e);
+      toast.error('Не удалось загрузить чат');
+    }
   };
 
   const deleteSelectedMessages = async (ids: Set<string>) => {
@@ -1514,16 +1462,20 @@ export default function PhotoStudioPage() {
       .filter((id): id is number => id !== null);
     if (dbIds.length > 0) {
       try {
-        await api.deletePhotoChatMessages(dbIds, threadId || undefined);
+        await api.deletePhotoChatMessages(dbIds, activeThreadId || undefined);
       } catch (e) {
         console.error('Delete messages error', e);
-        toast.error(t.genericError);
+        toast.error('Не удалось удалить выбранные сообщения');
       }
     }
     setMessages((prev) => prev.filter((m) => !ids.has(m.id)));
     setSelectedMsgIds(new Set());
     setChatSelectMode(false);
-    setMessageCount((prev) => Math.max(0, prev - dbIds.length));
+  };
+
+  // Delete photo from history
+  const deleteHistoryPhoto = (photoId: string) => {
+    setGeneratedPhotos((prev) => prev.filter((p) => p.id !== photoId));
   };
 
   // Add generated photo to gallery (scenes or models)
@@ -1606,6 +1558,7 @@ export default function PhotoStudioPage() {
   const handleSaveCardPhotoChanges = async () => {
     if (!activeStore || !selectedProduct || cardPhotosSaving) return;
     setCardPhotosSaving(true);
+    setLastApplyResult(null);
     try {
       const localCardId = await resolveLocalCardId(selectedProduct.nm_id);
       if (!localCardId) throw new Error('Карточка не найдена в локальной базе');
@@ -1618,11 +1571,40 @@ export default function PhotoStudioPage() {
       setSelectedProductPhotos(nextPhotos);
       setCardPhotosOriginal(nextPhotos);
       setCardPhotosDirty(false);
+      setSaveConfirmOpen(false);
       await loadProducts();
-      toast.success('Фото карточки сохранены');
-    } catch (err) {
+
+      // Parse verification summary if available
+      const verification = updated?.media_apply_result?.verification || updated?.verification;
+      if (verification && typeof verification === 'object') {
+        setLastApplyResult({
+          matched: Boolean(verification.matched),
+          missing_urls: verification.missing_urls || [],
+          unexpected_urls: verification.unexpected_urls || [],
+          stabilized: verification.stabilized,
+          requested_order: verification.requested_order || [],
+          actual_order: verification.actual_order || [],
+        });
+        if (verification.matched) {
+          toast.success('Фото карточки сохранены — порядок подтверждён WB');
+        } else {
+          toast.warning('Фото сохранены, но итоговый порядок в WB отличается от запрошенного');
+        }
+      } else {
+        toast.success('Фото карточки сохранены');
+      }
+    } catch (err: any) {
       console.error('Save card photos error:', err);
-      toast.error(err instanceof Error ? err.message : 'Не удалось сохранить изменения');
+      // Product-level error rendering
+      const detail = err?.detail;
+      if (detail && typeof detail === 'object' && detail.code) {
+        toast.error(detail.message || 'Не удалось сохранить изменения');
+        if (detail.retryable) {
+          toast.info('Можно попробовать ещё раз');
+        }
+      } else {
+        toast.error(err instanceof Error ? err.message : 'Не удалось сохранить изменения');
+      }
     } finally {
       setCardPhotosSaving(false);
     }
@@ -1757,6 +1739,124 @@ export default function PhotoStudioPage() {
     e.target.value = '';
   };
 
+  // ── Product picker state ──
+  const [pickerTarget, setPickerTarget] = useState<'source' | 'garment' | 'model' | null>(null);
+  const [pickerProduct, setPickerProduct] = useState<ProductItem | null>(null);
+  const [pickerProductPhotos, setPickerProductPhotos] = useState<string[]>([]);
+  const [pickerProductLoading, setPickerProductLoading] = useState(false);
+
+  const openProductPicker = (target: 'source' | 'garment' | 'model') => {
+    setPickerTarget(target);
+    setPickerProduct(null);
+    setPickerProductPhotos([]);
+    setGenShowProductPicker(true);
+  };
+
+  const handlePickerSelectProduct = async (card: ProductItem) => {
+    setPickerProduct(card);
+    setPickerProductLoading(true);
+    const wbPhotos = (card.photos || []).map((u) => toAbsoluteMediaUrl(u)).filter(Boolean);
+    if (wbPhotos.length > 0) {
+      setPickerProductPhotos(wbPhotos);
+      setPickerProductLoading(false);
+      return;
+    }
+    if (!activeStore) { setPickerProductPhotos([]); setPickerProductLoading(false); return; }
+    try {
+      const fallbackCards = await api.getCards(activeStore.id, 1, 1, { search: String(card.nm_id) });
+      const match = (fallbackCards?.items || []).find((it: any) => Number(it?.nm_id) === Number(card.nm_id));
+      if (!match?.id) { setPickerProductPhotos([]); return; }
+      const detail = await api.getCard(activeStore.id, match.id);
+      const photos = Array.isArray(detail?.photos) ? detail.photos : [];
+      setPickerProductPhotos(photos.map((u: string) => toAbsoluteMediaUrl(u)).filter(Boolean));
+    } catch { setPickerProductPhotos([]); } finally { setPickerProductLoading(false); }
+  };
+
+  const handlePickerSelectPhoto = (url: string) => {
+    const photo: PhotoMedia = { id: `picker-${Date.now()}`, url, type: 'image' };
+    if (pickerTarget === 'garment') setGenGarmentPhoto(photo);
+    else if (pickerTarget === 'model') setGenModelPhoto(photo);
+    else setGenSourcePhoto(photo);
+    setGenShowProductPicker(false);
+    setPickerTarget(null);
+  };
+
+  const handleZoneClick = (target: 'source' | 'garment' | 'model' = 'source', fileRef?: React.RefObject<HTMLInputElement>) => {
+    if (products.length > 0) {
+      openProductPicker(target);
+    } else {
+      (fileRef || genSourceInputRef).current?.click();
+    }
+  };
+
+  const renderProductPicker = () => {
+    if (!genShowProductPicker) return null;
+    const fileRef = pickerTarget === 'garment' ? genFileInputRef1 : pickerTarget === 'model' ? genFileInputRef2 : genSourceInputRef;
+    return (
+      <div className="ps-gen-product-picker-overlay" onClick={() => setGenShowProductPicker(false)}>
+        <div className="ps-gen-product-picker" onClick={e => e.stopPropagation()}>
+          {!pickerProduct ? (
+            <>
+              <div className="ps-gen-product-picker-head">
+                <span>Выберите источник</span>
+                <button onClick={() => setGenShowProductPicker(false)}><X size={16} /></button>
+              </div>
+              <button className="ps-gen-product-picker-upload" onClick={() => { setGenShowProductPicker(false); fileRef.current?.click(); }}>
+                <Upload size={18} />
+                <span>Загрузить файл</span>
+              </button>
+              <div className="ps-gen-product-picker-label"><ShoppingBag size={14} /> Товары</div>
+              <div className="ps-gen-product-picker-products">
+                {filteredProducts.length === 0 && !productsLoading && (
+                  <div className="ps-gen-product-picker-empty">Нет товаров</div>
+                )}
+                {productsLoading && <div className="ps-gen-product-picker-empty"><Loader2 size={20} className="ps-spin" /></div>}
+                {filteredProducts.map((card) => (
+                  <button key={card.id} className="ps-gen-product-picker-card" onClick={() => handlePickerSelectProduct(card)}>
+                    {card.photos?.[0] ? (
+                      <ProxiedImg src={toAbsoluteMediaUrl(card.photos[0])} alt="" crossOrigin="anonymous" className="ps-gen-product-picker-card-img" />
+                    ) : (
+                      <div className="ps-gen-product-picker-card-img ps-gen-product-picker-card-placeholder"><ImageIcon size={18} /></div>
+                    )}
+                    <div className="ps-gen-product-picker-card-info">
+                      <span className="ps-gen-product-picker-card-title">{card.title || card.vendor_code || `#${card.nm_id}`}</span>
+                      <span className="ps-gen-product-picker-card-sub">{card.vendor_code || ''} · {card.nm_id}</span>
+                    </div>
+                    <ChevronDown size={16} style={{ transform: 'rotate(-90deg)', flexShrink: 0, color: '#9ca3af' }} />
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="ps-gen-product-picker-head">
+                <button onClick={() => { setPickerProduct(null); setPickerProductPhotos([]); }} style={{ background: 'none', border: 'none' }}>
+                  <ArrowLeft size={18} />
+                </button>
+                <span style={{ flex: 1 }}>{pickerProduct.title || pickerProduct.vendor_code || `#${pickerProduct.nm_id}`}</span>
+                <button onClick={() => setGenShowProductPicker(false)}><X size={16} /></button>
+              </div>
+              {pickerProductLoading ? (
+                <div className="ps-gen-product-picker-empty"><Loader2 size={24} className="ps-spin" /></div>
+              ) : pickerProductPhotos.length === 0 ? (
+                <div className="ps-gen-product-picker-empty">Нет фото у товара</div>
+              ) : (
+                <div className="ps-gen-product-picker-grid">
+                  {pickerProductPhotos.map((url, i) => (
+                    <button key={i} className="ps-gen-product-picker-thumb" onClick={() => handlePickerSelectPhoto(url)}>
+                      <ProxiedImg src={url} alt="" crossOrigin="anonymous" />
+                      <span>{i + 1}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   const handleGenRun = async () => {
     if (genRunning || isStreaming) return;
 
@@ -1836,7 +1936,6 @@ export default function PhotoStudioPage() {
     }
 
     setGenRunning(true);
-    setMode('chat');
     try {
       await sendMessage({ text, photos, quickAction });
     } finally {
@@ -1850,6 +1949,749 @@ export default function PhotoStudioPage() {
     else setGenSourcePhoto(photo);
   };
 
+  // ===================== MOBILE LAYOUT =====================
+  if (isMobile) {
+    return (
+      <div className="ps-mobile-root">
+        {/* Mobile top bar */}
+        <div className="ps-mobile-topbar">
+          <Sparkles size={18} />
+          <span className="ps-mobile-topbar-title">AI Фотостудия</span>
+          <button className="ps-mobile-topbar-btn" onClick={() => setInstructionsOpen(true)}>
+            <HelpCircle size={18} />
+          </button>
+        </div>
+
+        {/* Mobile tab content */}
+        <div className="ps-mobile-content">
+          {/* ---- CHAT TAB ---- */}
+          {mobileTab === 'chat' && (
+            <div className="ps-mobile-tab-pane">
+              <div className="ps-mobile-chat-top">
+                <div className="ps-mobile-thread-row">
+                  <div ref={threadDropdownRef} style={{ position: 'relative', flex: 1 }}>
+                    <button className="ps-mobile-thread-btn" onClick={() => setThreadDropdownOpen(v => !v)}>
+                      <Folder size={14} />
+                      <span>{threadList.find(t => t.id === activeThreadId)?.preview || 'Новый чат'}</span>
+                      <ChevronDown size={14} />
+                    </button>
+                    {threadDropdownOpen && (
+                      <div className="ps-mobile-thread-dropdown">
+                        <button className="ps-mobile-thread-item ps-mobile-thread-item--new" onClick={() => { setThreadDropdownOpen(false); void startNewThread(); }}>
+                          <Plus size={14} /> Новый чат
+                        </button>
+                        {threadList.map(t => (
+                          <div key={t.id} className={`ps-mobile-thread-item ${t.id === activeThreadId ? 'active' : ''}`}>
+                            <button className="ps-mobile-thread-item-main" onClick={() => { void switchThread(t.id); setThreadDropdownOpen(false); }}>
+                              <span className="ps-mobile-thread-preview">{t.preview || 'Чат'}</span>
+                              <span className="ps-mobile-thread-meta">{t.messageCount} сообщ.</span>
+                            </button>
+                            <button className="ps-mobile-thread-delete" onClick={() => void deleteThread(t.id)}>
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <button className="ps-mobile-new-chat-btn" onClick={() => void startNewThread()}>
+                    <Plus size={16} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="ps-messages ps-mobile-messages" onDragOver={(e) => e.preventDefault()} onDrop={handleDrop}>
+                {messages.map(msg => (
+                  <MessageBubble
+                    key={msg.id}
+                    msg={msg}
+                    onPhotoClick={(photo) => setPreviewPhoto(photo)}
+                    onPhotoDragStart={handleChatPhotoDragStart}
+                    selectMode={chatSelectMode}
+                    isSelected={selectedMsgIds.has(msg.id)}
+                    onToggleSelect={(id) => setSelectedMsgIds(prev => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; })}
+                  />
+                ))}
+                {isBotTyping && (
+                  <div className="ps-typing"><div className="ps-msg-avatar"><Bot size={16} /></div><div className="ps-typing-dots"><span /><span /><span /></div></div>
+                )}
+                <div ref={bottomRef} />
+              </div>
+
+              {/* Quick actions row */}
+              <div className="ps-mobile-quick-row">
+                {quickMenu.map((qm) => (
+                  <div key={qm.id} className="ps-mobile-quick-dropdown-wrap">
+                    <button
+                      className={`ps-mobile-quick-chip ${quickOpen && quickActive === qm.id ? 'active' : ''}`}
+                      onClick={() => {
+                        if (quickOpen && quickActive === qm.id) {
+                          setQuickOpen(false);
+                        } else {
+                          setQuickActive(qm.id);
+                          setQuickOpen(true);
+                        }
+                      }}
+                    >
+                      <qm.icon size={13} />
+                      {qm.label}
+                      <ChevronDown size={12} />
+                    </button>
+                  </div>
+                ))}
+                <button className="ps-mobile-quick-chip" onClick={() => setSamplesOpen(true)}>
+                  <GalleryHorizontal size={13} /> Образцы
+                </button>
+              </div>
+
+              {/* Bottom-sheet for selected quick action */}
+              {quickOpen && (
+                <div className="ps-mobile-quick-sheet-overlay" onClick={() => setQuickOpen(false)}>
+                  <div className="ps-mobile-quick-sheet" onClick={e => e.stopPropagation()}>
+                    <div className="ps-mobile-quick-sheet-handle" />
+                    <div className="ps-mobile-quick-sheet-head">
+                      {(() => { const Icon = activeQuickMenu.icon; return <Icon size={18} />; })()}
+                      <span>{activeQuickMenu.label}</span>
+                      <button className="ps-mobile-quick-sheet-close" onClick={() => setQuickOpen(false)}><X size={18} /></button>
+                    </div>
+                    <div className="ps-mobile-quick-sheet-options">
+                      {activeQuickMenu.options.map((opt) => (
+                        <button
+                          key={`${activeQuickMenu.id}-${opt.id || opt.label}`}
+                          className="ps-mobile-quick-sheet-option"
+                          onClick={() => { void handleQuickPick(activeQuickMenu, opt); setQuickOpen(false); }}
+                        >
+                          <span className="ps-mobile-quick-sheet-option-label">{opt.label}</span>
+                          <Send size={14} />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Attached photos */}
+              {attachedPhotos.length > 0 && (
+                <div className="ps-mobile-attached">
+                  {attachedPhotos.map(p => (
+                    <div key={p.id} className="ps-mobile-attached-thumb">
+                      <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
+                      <button className="ps-mobile-attached-remove" onClick={() => removeAttached(p.id)}><X size={10} /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Input bar */}
+              <form className="ps-mobile-input-bar" onSubmit={(e) => { e.preventDefault(); void handleSend(); }}>
+                <button type="button" className="ps-mobile-input-icon" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || !canAttachMore}>
+                  <Paperclip size={18} />
+                </button>
+                <input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={handleFileSelect} />
+                <input
+                  type="text"
+                  value={inputText}
+                  onChange={(e) => setInputText(e.target.value)}
+                  onKeyDown={onKeyDown}
+                  placeholder={attachedPhotos.length ? 'Что сделать с фото?' : 'Напишите запрос...'}
+                  disabled={isStreaming}
+                  className="ps-mobile-text-input"
+                />
+                <button
+                  type="submit"
+                  className={`ps-mobile-send-btn ${(inputText.trim() || attachedPhotos.length) && !isStreaming ? 'active' : ''}`}
+                  disabled={(!inputText.trim() && !attachedPhotos.length) || isStreaming}
+                >
+                  <Send size={18} />
+                </button>
+              </form>
+            </div>
+          )}
+
+          {/* ---- GENERATOR TAB ---- */}
+          {mobileTab === 'generator' && (
+            <div className="ps-mobile-tab-pane ps-mobile-tab-pane--scroll">
+              <div className="ps-mgen-dropdown-wrap">
+                <span className="ps-mgen-picker-label">Режим генерации:</span>
+                <div className="ps-mgen-select-wrap ps-mgen-select-wrap--top">
+                  <select
+                    className="ps-mgen-select ps-mgen-select--top"
+                    value={genTab}
+                    onChange={(e) => setGenTab(e.target.value as GeneratorTab)}
+                  >
+                    {GEN_TABS.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.label}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronDown size={16} className="ps-mgen-select-icon" />
+                </div>
+              </div>
+
+              <div className="ps-mgen-content">
+                {/* ===== Своя фотомодель ===== */}
+                {genTab === 'own-model' && (
+                  <div className="ps-mgen-card">
+                    <div className="ps-mgen-card-head">
+                      <User size={18} />
+                      <div>
+                        <div className="ps-mgen-card-title">Своя фотомодель</div>
+                        <div className="ps-mgen-card-desc">Загрузите фото изделия и вашей фотомодели — AI совместит</div>
+                      </div>
+                    </div>
+                    <div className="ps-mgen-zones">
+                      <div className="ps-mgen-zone" onClick={() => handleZoneClick('garment', genFileInputRef1)}>
+                        {genGarmentPhoto ? (
+                          <div className="ps-mgen-zone-preview">
+                            <ProxiedImg src={genGarmentPhoto.url} alt="" crossOrigin="anonymous" />
+                            <button className="ps-mgen-zone-remove" onClick={(e) => { e.stopPropagation(); setGenGarmentPhoto(null); }}><X size={12} /></button>
+                          </div>
+                        ) : (
+                          <div className="ps-mgen-zone-empty">
+                            <Upload size={22} />
+                            <span>Изделие</span>
+                          </div>
+                        )}
+                        <input ref={genFileInputRef1} type="file" accept="image/*" hidden onChange={handleGenFileSelect(setGenGarmentPhoto)} />
+                      </div>
+                      <div className="ps-mgen-zone" onClick={() => handleZoneClick('model', genFileInputRef2)}>
+                        {genModelPhoto ? (
+                          <div className="ps-mgen-zone-preview">
+                            <ProxiedImg src={genModelPhoto.url} alt="" crossOrigin="anonymous" />
+                            <button className="ps-mgen-zone-remove" onClick={(e) => { e.stopPropagation(); setGenModelPhoto(null); }}><X size={12} /></button>
+                          </div>
+                        ) : (
+                          <div className="ps-mgen-zone-empty">
+                            <User size={22} />
+                            <span>Фотомодель</span>
+                          </div>
+                        )}
+                        <input ref={genFileInputRef2} type="file" accept="image/*" hidden onChange={handleGenFileSelect(setGenModelPhoto)} />
+                      </div>
+                    </div>
+                    {availablePhotos.length > 0 && (
+                      <div className="ps-mgen-available">
+                        <span className="ps-mgen-available-label">Фото товара:</span>
+                        <div className="ps-mgen-available-row">
+                          {availablePhotos.map((p, i) => (
+                            <button key={p.id} className="ps-mgen-available-thumb" onClick={() => { if (!genGarmentPhoto) setGenGarmentPhoto(p); else if (!genModelPhoto) setGenModelPhoto(p); }}>
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
+                              <span>{i + 1}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* ===== Новая фотомодель ===== */}
+                {genTab === 'new-model' && (
+                  <div className="ps-mgen-card">
+                    <div className="ps-mgen-card-head">
+                      <Shirt size={18} />
+                      <div>
+                        <div className="ps-mgen-card-title">Новая фотомодель (AI)</div>
+                        <div className="ps-mgen-card-desc">AI создаст модель для вашего изделия</div>
+                      </div>
+                    </div>
+                    <div className="ps-mgen-zones ps-mgen-zones--single">
+                      <div className="ps-mgen-zone" onClick={() => handleZoneClick('garment', genFileInputRef1)}>
+                        {genGarmentPhoto ? (
+                          <div className="ps-mgen-zone-preview">
+                            <ProxiedImg src={genGarmentPhoto.url} alt="" crossOrigin="anonymous" />
+                            <button className="ps-mgen-zone-remove" onClick={(e) => { e.stopPropagation(); setGenGarmentPhoto(null); }}><X size={12} /></button>
+                          </div>
+                        ) : (
+                          <div className="ps-mgen-zone-empty">
+                            <Upload size={22} />
+                            <span>Изделие</span>
+                          </div>
+                        )}
+                        <input ref={genFileInputRef1} type="file" accept="image/*" hidden onChange={handleGenFileSelect(setGenGarmentPhoto)} />
+                      </div>
+                    </div>
+                    {availablePhotos.length > 0 && (
+                      <div className="ps-mgen-available">
+                        <span className="ps-mgen-available-label">Фото товара:</span>
+                        <div className="ps-mgen-available-row">
+                          {availablePhotos.map((p, i) => (
+                            <button key={p.id} className="ps-mgen-available-thumb" onClick={() => setGenGarmentPhoto(p)}>
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
+                              <span>{i + 1}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {catalogModels.length > 0 && (
+                      <div className="ps-mgen-picker">
+                        <span className="ps-mgen-picker-label">Тип модели:</span>
+                        <div className="ps-mgen-select-wrap">
+                          <select
+                            className="ps-mgen-select"
+                            value={catalogModels.some((o) => o.prompt === genNewModelPrompt) ? genNewModelPrompt : ''}
+                            onChange={(e) => setGenNewModelPrompt(e.target.value)}
+                          >
+                            <option value="">Выберите тип</option>
+                            {catalogModels.map((opt) => (
+                              <option key={opt.id || opt.label} value={opt.prompt}>
+                                {opt.label}
+                              </option>
+                            ))}
+                          </select>
+                          <ChevronDown size={16} className="ps-mgen-select-icon" />
+                        </div>
+                      </div>
+                    )}
+                    <input type="text" className="ps-mgen-text-input" value={genNewModelPrompt} onChange={e => setGenNewModelPrompt(e.target.value)} placeholder="Или опишите модель вручную..." />
+                  </div>
+                )}
+
+                {/* ===== Свой промпт ===== */}
+                {genTab === 'custom-prompt' && (
+                  <div className="ps-mgen-card">
+                    <div className="ps-mgen-card-head">
+                      <Type size={18} />
+                      <div>
+                        <div className="ps-mgen-card-title">Свой промпт</div>
+                        <div className="ps-mgen-card-desc">Напишите запрос — AI обработает фото</div>
+                      </div>
+                    </div>
+                    <div className="ps-mgen-zones ps-mgen-zones--single">
+                      <div className="ps-mgen-zone" onClick={() => handleZoneClick()}>
+                        {genSourcePhoto ? (
+                          <div className="ps-mgen-zone-preview">
+                            <ProxiedImg src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
+                            <button className="ps-mgen-zone-remove" onClick={(e) => { e.stopPropagation(); setGenSourcePhoto(null); }}><X size={12} /></button>
+                          </div>
+                        ) : (
+                          <div className="ps-mgen-zone-empty">
+                            <ImageIcon size={22} />
+                            <span>Исходное фото</span>
+                          </div>
+                        )}
+                        <input ref={genSourceInputRef} type="file" accept="image/*" hidden onChange={handleGenFileSelect(setGenSourcePhoto)} />
+                      </div>
+                    </div>
+                    {availablePhotos.length > 0 && (
+                      <div className="ps-mgen-available">
+                        <span className="ps-mgen-available-label">Фото товара:</span>
+                        <div className="ps-mgen-available-row">
+                          {availablePhotos.map((p, i) => (
+                            <button key={p.id} className="ps-mgen-available-thumb" onClick={() => setGenSourcePhoto(p)}>
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
+                              <span>{i + 1}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <textarea className="ps-mgen-textarea" value={genCustomPrompt} onChange={e => setGenCustomPrompt(e.target.value)} placeholder="Опишите, что нужно сделать с фото..." rows={4} />
+                  </div>
+                )}
+
+                {/* ===== Сцены ===== */}
+                {genTab === 'scenes' && (
+                  <div className="ps-mgen-card">
+                    <div className="ps-mgen-card-head">
+                      <Mountain size={18} />
+                      <div>
+                        <div className="ps-mgen-card-title">Смена сцены / фона</div>
+                        <div className="ps-mgen-card-desc">Выберите фото и сцену</div>
+                      </div>
+                    </div>
+                    <div className="ps-mgen-zones ps-mgen-zones--single">
+                      <div className="ps-mgen-zone" onClick={() => handleZoneClick()}>
+                        {genSourcePhoto ? (
+                          <div className="ps-mgen-zone-preview">
+                            <ProxiedImg src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
+                            <button className="ps-mgen-zone-remove" onClick={(e) => { e.stopPropagation(); setGenSourcePhoto(null); }}><X size={12} /></button>
+                          </div>
+                        ) : (
+                          <div className="ps-mgen-zone-empty">
+                            <ImageIcon size={22} />
+                            <span>Исходное фото</span>
+                          </div>
+                        )}
+                        <input ref={genSourceInputRef} type="file" accept="image/*" hidden onChange={handleGenFileSelect(setGenSourcePhoto)} />
+                      </div>
+                    </div>
+                    {availablePhotos.length > 0 && (
+                      <div className="ps-mgen-available">
+                        <span className="ps-mgen-available-label">Фото товара:</span>
+                        <div className="ps-mgen-available-row">
+                          {availablePhotos.map((p, i) => (
+                            <button key={p.id} className="ps-mgen-available-thumb" onClick={() => setGenSourcePhoto(p)}>
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
+                              <span>{i + 1}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <div className="ps-mgen-picker">
+                      <span className="ps-mgen-picker-label">Сцена:</span>
+                      <div className="ps-mgen-select-wrap">
+                        <select
+                          className="ps-mgen-select"
+                          value={genSelectedScene ? String(genSelectedScene.id) : ''}
+                          onChange={(e) => {
+                            const selected = catalogScenes.find((opt) => String(opt.id || opt.label) === e.target.value);
+                            setGenSelectedScene(selected ? { id: selected.id || selected.label, label: selected.label, quickAction: selected.quickAction! } : null);
+                          }}
+                        >
+                          <option value="">Выберите сцену</option>
+                          {catalogScenes.map((opt) => (
+                            <option key={opt.id || opt.label} value={String(opt.id || opt.label)}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                        <ChevronDown size={16} className="ps-mgen-select-icon" />
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* ===== Позы ===== */}
+                {genTab === 'poses' && (
+                  <div className="ps-mgen-card">
+                    <div className="ps-mgen-card-head">
+                      <Move size={18} />
+                      <div>
+                        <div className="ps-mgen-card-title">Смена позы</div>
+                        <div className="ps-mgen-card-desc">AI изменит положение модели</div>
+                      </div>
+                    </div>
+                    <div className="ps-mgen-zones ps-mgen-zones--single">
+                      <div className="ps-mgen-zone" onClick={() => handleZoneClick()}>
+                        {genSourcePhoto ? (
+                          <div className="ps-mgen-zone-preview">
+                            <ProxiedImg src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
+                            <button className="ps-mgen-zone-remove" onClick={(e) => { e.stopPropagation(); setGenSourcePhoto(null); }}><X size={12} /></button>
+                          </div>
+                        ) : (
+                          <div className="ps-mgen-zone-empty">
+                            <ImageIcon size={22} />
+                            <span>Фото с моделью</span>
+                          </div>
+                        )}
+                        <input ref={genSourceInputRef} type="file" accept="image/*" hidden onChange={handleGenFileSelect(setGenSourcePhoto)} />
+                      </div>
+                    </div>
+                    {availablePhotos.length > 0 && (
+                      <div className="ps-mgen-available">
+                        <span className="ps-mgen-available-label">Фото товара:</span>
+                        <div className="ps-mgen-available-row">
+                          {availablePhotos.map((p, i) => (
+                            <button key={p.id} className="ps-mgen-available-thumb" onClick={() => setGenSourcePhoto(p)}>
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
+                              <span>{i + 1}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <div className="ps-mgen-picker">
+                      <span className="ps-mgen-picker-label">Поза:</span>
+                      <div className="ps-mgen-select-wrap">
+                        <select
+                          className="ps-mgen-select"
+                          value={genSelectedPose ? String(genSelectedPose.id) : ''}
+                          onChange={(e) => {
+                            const selected = catalogPoses.find((opt) => String(opt.id || opt.label) === e.target.value);
+                            setGenSelectedPose(selected ? { id: selected.id || selected.label, label: selected.label, quickAction: selected.quickAction! } : null);
+                          }}
+                        >
+                          <option value="">Выберите позу</option>
+                          {catalogPoses.map((opt) => (
+                            <option key={opt.id || opt.label} value={String(opt.id || opt.label)}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                        <ChevronDown size={16} className="ps-mgen-select-icon" />
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* ===== Видео ===== */}
+                {genTab === 'video' && (
+                  <div className="ps-mgen-card">
+                    <div className="ps-mgen-card-head">
+                      <Video size={18} />
+                      <div>
+                        <div className="ps-mgen-card-title">Генерация видео</div>
+                        <div className="ps-mgen-card-desc">AI создаст короткое видео из фото</div>
+                      </div>
+                    </div>
+                    <div className="ps-mgen-zones ps-mgen-zones--single">
+                      <div className="ps-mgen-zone" onClick={() => handleZoneClick()}>
+                        {genSourcePhoto ? (
+                          <div className="ps-mgen-zone-preview">
+                            <ProxiedImg src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
+                            <button className="ps-mgen-zone-remove" onClick={(e) => { e.stopPropagation(); setGenSourcePhoto(null); }}><X size={12} /></button>
+                          </div>
+                        ) : (
+                          <div className="ps-mgen-zone-empty">
+                            <Video size={22} />
+                            <span>Исходное фото</span>
+                          </div>
+                        )}
+                        <input ref={genSourceInputRef} type="file" accept="image/*" hidden onChange={handleGenFileSelect(setGenSourcePhoto)} />
+                      </div>
+                    </div>
+                    {availablePhotos.length > 0 && (
+                      <div className="ps-mgen-available">
+                        <span className="ps-mgen-available-label">Фото товара:</span>
+                        <div className="ps-mgen-available-row">
+                          {availablePhotos.map((p, i) => (
+                            <button key={p.id} className="ps-mgen-available-thumb" onClick={() => setGenSourcePhoto(p)}>
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
+                              <span>{i + 1}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {catalogVideos.length > 0 && (
+                      <div className="ps-mgen-picker">
+                        <span className="ps-mgen-picker-label">Тип движения:</span>
+                        <div className="ps-mgen-select-wrap">
+                          <select
+                            className="ps-mgen-select"
+                            value={catalogVideos.some((v) => v.prompt === genVideoPrompt) ? genVideoPrompt : ''}
+                            onChange={(e) => setGenVideoPrompt(e.target.value)}
+                          >
+                            <option value="">Выберите тип</option>
+                            {catalogVideos.map((v) => (
+                              <option key={v.id} value={v.prompt}>
+                                {v.label}
+                              </option>
+                            ))}
+                          </select>
+                          <ChevronDown size={16} className="ps-mgen-select-icon" />
+                        </div>
+                      </div>
+                    )}
+                    <input type="text" className="ps-mgen-text-input" value={genVideoPrompt} onChange={e => setGenVideoPrompt(e.target.value)} placeholder="Или опишите движение вручную..." />
+                  </div>
+                )}
+              </div>
+
+
+              {renderProductPicker()}
+              {/* Run button - sticky bottom */}
+              {genRunning ? (
+                <div className="ps-mgen-generating-overlay">
+                  <div className="ps-gen-anim">
+                    <div className="ps-gen-anim-shimmer">
+                      <div className="ps-gen-anim-icon"><Sparkles size={24} /></div>
+                      <div className="ps-gen-anim-bars">
+                        <div className="ps-gen-anim-bar" style={{ animationDelay: '0s' }} />
+                        <div className="ps-gen-anim-bar" style={{ animationDelay: '0.15s' }} />
+                        <div className="ps-gen-anim-bar" style={{ animationDelay: '0.3s' }} />
+                      </div>
+                    </div>
+                    <span className="ps-mgen-generating-text">Генерация...</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="ps-mgen-run-wrap">
+                  <button className="ps-mgen-run-btn" onClick={handleGenRun} disabled={isStreaming}>
+                    <Play size={18} /> Запустить генерацию
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ---- HISTORY TAB ---- */}
+          {mobileTab === 'history' && (
+            <div className="ps-mobile-tab-pane ps-mobile-tab-pane--scroll">
+              <div className="ps-mobile-history-head">
+                <button className={`ps-mobile-hist-tab ${historyTab === 'image' ? 'active' : ''}`} onClick={() => setHistoryTab('image')}>
+                  <Camera size={14} /> Фото ({historyPhotos.length})
+                </button>
+                <button className={`ps-mobile-hist-tab ${historyTab === 'video' ? 'active' : ''}`} onClick={() => setHistoryTab('video')}>
+                  <Video size={14} /> Видео ({historyVideos.length})
+                </button>
+              </div>
+              {(historyTab === 'image' ? historyPhotos : historyVideos).length === 0 ? (
+                <div className="ps-mobile-empty">
+                  <ImageIcon size={32} />
+                  <span>Нет {historyTab === 'image' ? 'фото' : 'видео'}</span>
+                  <span className="ps-mobile-empty-sub">Сгенерируйте в чате или генераторе</span>
+                </div>
+              ) : (
+                <div className="ps-mobile-history-grid">
+                  {(historyTab === 'image' ? historyPhotos : historyVideos).map(p => (
+                    <div key={p.id} className="ps-mobile-history-item" onClick={() => setPreviewPhoto(p)}>
+                      {p.type === 'video' ? (
+                        <video src={p.url} crossOrigin="anonymous" />
+                      ) : (
+                        <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
+                      )}
+                      <div className="ps-mobile-history-actions">
+                        <button onClick={(e) => { e.stopPropagation(); handleDownload(p); }}><Download size={14} /></button>
+                        <button onClick={(e) => { e.stopPropagation(); attachByUrl(p.url, p.assetId); setMobileTab('chat'); }}><Paperclip size={14} /></button>
+                        <button onClick={(e) => { e.stopPropagation(); deleteHistoryPhoto(p.id); }}><Trash2 size={14} /></button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ---- PRODUCTS TAB ---- */}
+          {mobileTab === 'products' && (
+            <div className="ps-mobile-tab-pane ps-mobile-tab-pane--scroll">
+              {selectedProduct ? (
+                <div className="ps-mobile-product-detail">
+                  <button className="ps-mobile-product-back" onClick={() => { setSelectedProduct(null); setSelectedProductPhotos([]); }}>
+                    <ChevronLeft size={16} /> Назад к товарам
+                  </button>
+                  <div className="ps-mobile-product-title">{selectedProduct.title || `#${selectedProduct.nm_id}`}</div>
+                  <div className="ps-mobile-product-photos">
+                    {selectedProductPhotos.map((url, i) => (
+                      <div key={i} className="ps-mobile-product-photo" onClick={() => { attachByUrl(url); setMobileTab('chat'); }}>
+                        <ProxiedImg src={url} alt="" crossOrigin="anonymous" />
+                        <span className="ps-mobile-product-photo-num">{i + 1}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="ps-mobile-product-hint">Нажмите на фото, чтобы прикрепить в чат</p>
+                </div>
+              ) : (
+                <>
+                  <div className="ps-mobile-search-wrap">
+                    <Search size={16} />
+                    <input
+                      type="text"
+                      value={productsQuery}
+                      onChange={e => setProductsQuery(e.target.value)}
+                      placeholder="Поиск товаров..."
+                      className="ps-mobile-search-input"
+                    />
+                  </div>
+                  {productsLoading ? (
+                    <div className="ps-mobile-empty"><Loader2 size={24} className="ps-spin" /> Загрузка...</div>
+                  ) : filteredProducts.length === 0 ? (
+                    <div className="ps-mobile-empty"><ImageIcon size={32} /><span>Нет товаров</span></div>
+                  ) : (
+                    <div className="ps-mobile-products-list">
+                      {filteredProducts.map(card => (
+                        <button key={card.id} className="ps-mobile-product-card" onClick={() => void handleOpenProduct(card)}>
+                          <div className="ps-mobile-product-thumb">
+                            {card.main_photo_url ? <ProxiedImg src={card.main_photo_url} alt="" crossOrigin="anonymous" /> : <ImageIcon size={20} />}
+                          </div>
+                          <div className="ps-mobile-product-info">
+                            <span className="ps-mobile-product-name">{card.title || `Товар #${card.nm_id}`}</span>
+                            <span className="ps-mobile-product-id">#{card.nm_id}</span>
+                          </div>
+                          <ChevronDown size={16} style={{ transform: 'rotate(-90deg)' }} />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Bottom navigation */}
+        <nav className="ps-mobile-bottom-nav">
+          <button className={`ps-mobile-nav-item ${mobileTab === 'chat' ? 'active' : ''}`} onClick={() => setMobileTab('chat')}>
+            <Send size={20} />
+            <span>Чат</span>
+            {isStreaming && <span className="ps-mobile-nav-dot" />}
+          </button>
+          <button className={`ps-mobile-nav-item ${mobileTab === 'generator' ? 'active' : ''}`} onClick={() => setMobileTab('generator')}>
+            <Wand2 size={20} />
+            <span>Генератор</span>
+          </button>
+          <button className={`ps-mobile-nav-item ${mobileTab === 'history' ? 'active' : ''}`} onClick={() => setMobileTab('history')}>
+            <ImageIcon size={20} />
+            <span>История</span>
+            {generatedPhotos.length > 0 && <span className="ps-mobile-nav-badge">{generatedPhotos.length}</span>}
+          </button>
+          <button className={`ps-mobile-nav-item ${mobileTab === 'products' ? 'active' : ''}`} onClick={() => setMobileTab('products')}>
+            <Folder size={20} />
+            <span>Товары</span>
+          </button>
+        </nav>
+
+        {/* Modals (shared) */}
+        {samplesOpen && (
+          <div className="ps-modal-overlay ps-modal-overlay--floating" onClick={() => setSamplesOpen(false)}>
+            <div className="ps-modal-card ps-modal-card--gallery" onClick={e => e.stopPropagation()}>
+              <div className="ps-modal-head">
+                <h3>Образцы</h3>
+                <button onClick={() => setSamplesOpen(false)}><X size={16} /></button>
+              </div>
+              <div className="ps-gallery-section">
+                <div className="ps-gallery-type-tabs">
+                  <button className={galleryType === 'scene' ? 'active' : ''} onClick={() => setGalleryType('scene')}>Локации</button>
+                  <button className={galleryType === 'model' ? 'active' : ''} onClick={() => setGalleryType('model')}>Модели</button>
+                </div>
+                {galleryLoading ? (
+                  <div className="ps-modal-empty"><Loader2 size={16} className="ps-spin" /> Загрузка...</div>
+                ) : (
+                  <div className="ps-gallery-grid">
+                    {gallerySystemAssets.length === 0 ? Array.from({ length: 8 }).map((_, idx) => (
+                      <div key={idx} className="ps-gallery-tile ps-gallery-tile--placeholder"><Star size={18} /></div>
+                    )) : gallerySystemAssets.slice(0, 12).map(asset => (
+                      <button key={`sys-${asset.id}`} className="ps-gallery-tile" onClick={() => handleGallerySelect(asset)}>
+                        <ProxiedImg src={asset.url} alt={asset.name} crossOrigin="anonymous" />
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {instructionsOpen && (
+          <div className="ps-modal-overlay" onClick={() => setInstructionsOpen(false)}>
+            <div className="ps-modal-card ps-modal-card--narrow" onClick={e => e.stopPropagation()}>
+              <div className="ps-modal-head"><h3>Инструкции</h3><button onClick={() => setInstructionsOpen(false)}><X size={16} /></button></div>
+              <div className="ps-instructions">
+                <p>1. Выберите товар в «Товары» и прикрепите фото.</p>
+                <p>2. Используйте быстрые команды или напишите запрос.</p>
+                <p>3. Результаты в «История».</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {previewPhoto && (
+          <div className="ps-preview-overlay" onClick={() => setPreviewPhoto(null)}>
+            <button className="ps-preview-close"><X size={24} /></button>
+            <div className="ps-preview-content" onClick={e => e.stopPropagation()}>
+              {previewPhoto.type === 'video' ? (
+                <video src={previewPhoto.url} controls autoPlay crossOrigin="anonymous" className="ps-preview-img" />
+              ) : (
+                <ProxiedImg src={previewPhoto.url} alt="" crossOrigin="anonymous" className="ps-preview-img" />
+              )}
+              {previewPhoto.prompt && <div className="ps-preview-prompt">{previewPhoto.prompt}</div>}
+              <div className="ps-preview-actions">
+                <button onClick={() => handleDownload(previewPhoto)}><Download size={16} /> Скачать</button>
+                <button onClick={() => { attachByUrl(previewPhoto.url, previewPhoto.assetId); setPreviewPhoto(null); setMobileTab('chat'); }} disabled={!canAttachMore}><Paperclip size={16} /> В чат</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ===================== DESKTOP LAYOUT =====================
   return (
     <div className="ps-root ps-root--v2">
       <div className="ps-nav-header">
@@ -1964,13 +2806,21 @@ export default function PhotoStudioPage() {
                           onDragLeave={() => { setCardDragOver(null); setSlotDragOver(null); }}
                           onDrop={(e) => handleCardPhotoDrop(e, i)}
                           onDragEnd={() => { setCardDragFrom(null); setCardDragOver(null); }}
+                          onClick={() => {
+                            if (canAttachMore) {
+                              attachByUrl(u);
+                              toast.success('Фото прикреплено к чату');
+                            } else {
+                              toast.info('Максимум 3 фото');
+                            }
+                          }}
+                          title="Клик — прикрепить к чату"
+                          style={{ cursor: 'pointer' }}
                         >
-                          <img
+                          <ProxiedImg
                             src={u}
                             alt=""
                             crossOrigin="anonymous"
-                            onDoubleClick={() => { if (canAttachMore) attachByUrl(u); }}
-                            title="Двойной клик — прикрепить к чату"
                           />
                           {i === 0 && <span className="ps-product-cover-badge">ОБЛОЖКА</span>}
                           <span className="ps-product-order-badge">{i + 1}</span>
@@ -1984,7 +2834,7 @@ export default function PhotoStudioPage() {
                             </button>
                             <button
                               className="ps-product-photo-action"
-                              onClick={(e) => { e.stopPropagation(); setGalleryAddPhoto({ id: uid(), url: u, type: 'image' }); }}
+                              onClick={(e) => { e.stopPropagation(); setGalleryAddRect((e.currentTarget as HTMLElement).getBoundingClientRect()); setGalleryAddPhoto({ id: uid(), url: u, type: 'image' }); }}
                               title="В галерею образцов"
                             >
                               <Plus size={12} />
@@ -2020,21 +2870,74 @@ export default function PhotoStudioPage() {
                       />
                     </div>
                     <div className="ps-card-photo-hint">
-                      💡 Двойной клик — прикрепить к чату (макс. 3)
+                      💡 Клик — прикрепить к чату (макс. 3)
                     </div>
                     {cardPhotosDirty && (
-                      <button
-                        className="ps-card-save-btn"
-                        onClick={handleSaveCardPhotoChanges}
-                        disabled={cardPhotosSaving}
-                      >
-                        {cardPhotosSaving ? (
-                          <><Loader2 size={14} className="ps-spin" /> Сохраняю...</>
-                        ) : (
-                          <><Save size={14} /> Сохранить изменения</>
+                      <>
+                        <button
+                          className="ps-card-save-btn"
+                          onClick={() => setSaveConfirmOpen(true)}
+                          disabled={cardPhotosSaving}
+                        >
+                          {cardPhotosSaving ? (
+                            <><Loader2 size={14} className="ps-spin" /> Сохраняю...</>
+                          ) : (
+                            <><Save size={14} /> Сохранить в WB</>
+                          )}
+                        </button>
+                        {saveConfirmOpen && (
+                          <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-900">
+                            <p className="font-semibold">Применить изменения к карточке WB?</p>
+                            <p className="mt-1 text-amber-700">Текущие фото карточки будут заменены на новый порядок. Это действие повлияет на живую карточку в WB.</p>
+                            <div className="mt-2 flex gap-2">
+                              <button
+                                className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
+                                onClick={handleSaveCardPhotoChanges}
+                                disabled={cardPhotosSaving}
+                              >
+                                Подтвердить
+                              </button>
+                              <button
+                                className="rounded-lg border border-amber-300 px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100"
+                                onClick={() => setSaveConfirmOpen(false)}
+                              >
+                                Отмена
+                              </button>
+                            </div>
+                          </div>
                         )}
-                      </button>
+                      </>
                     )}
+                    {/* Last apply result */}
+                    {lastApplyResult && (
+                      <div className={`mt-2 rounded-xl border px-3 py-2 text-xs ${
+                        lastApplyResult.matched
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                          : 'border-amber-200 bg-amber-50 text-amber-800'
+                      }`}>
+                        <p className="font-semibold">
+                          {lastApplyResult.matched ? '✓ Фото сохранены успешно' : '⚠ Порядок фото отличается'}
+                        </p>
+                        {!lastApplyResult.matched && (
+                          <div className="mt-1">
+                            <p className="text-amber-700">Итоговый порядок фото в WB отличается от запрошенного.</p>
+                            {(lastApplyResult.missing_urls?.length ?? 0) > 0 && (
+                              <p className="mt-0.5">Не применены: {lastApplyResult.missing_urls!.length} фото</p>
+                            )}
+                            {(lastApplyResult.unexpected_urls?.length ?? 0) > 0 && (
+                              <p className="mt-0.5">Неожиданные: {lastApplyResult.unexpected_urls!.length} фото</p>
+                            )}
+                          </div>
+                        )}
+                        {lastApplyResult.stabilized === false && (
+                          <p className="mt-1 text-amber-600 italic">WB ещё не стабилизировал порядок — проверьте позже.</p>
+                        )}
+                      </div>
+                    )}
+                    {/* Rollback placeholder */}
+                    <div className="mt-2 rounded-xl border border-dashed border-slate-200 bg-slate-50/50 px-3 py-2 text-[10px] text-slate-400">
+                      Откат к предыдущему состоянию будет доступен после подключения backend-эндпоинта.
+                    </div>
                   </>
                 )
               ) : productsLoading ? (
@@ -2050,7 +2953,7 @@ export default function PhotoStudioPage() {
                     <button key={card.id} className="ps-product-item" onClick={() => void handleOpenProduct(card)}>
                       <div className="ps-product-thumb">
                         {card.main_photo_url ? (
-                          <img src={card.main_photo_url} alt="" crossOrigin="anonymous" />
+                          <ProxiedImg src={card.main_photo_url} alt="" crossOrigin="anonymous" />
                         ) : (
                           <ImageIcon size={14} />
                         )}
@@ -2120,45 +3023,150 @@ export default function PhotoStudioPage() {
           <div className="ps-chat-header ps-chat-header--v2">
             <div className="ps-chat-header-left">
               <Sparkles size={18} className="ps-accent" />
-              <h2>{t.studioTitle}</h2>
+              <h2>AI Фотостудия</h2>
               {selectedProduct ? (
                 <span className="ps-chat-product-badge">
                   {selectedProduct.title || `#${selectedProduct.nm_id}`}
                 </span>
               ) : null}
-              {messageUsageLabel ? (
-                <span className={`ps-msg-count ${isThreadLocked ? 'ps-msg-count--limit' : ''}`}>
-                  {messageUsageLabel}
-                </span>
-              ) : null}
             </div>
             <div className="ps-chat-header-center">
               <div className="ps-mode-toggle">
-                <button className={`ps-mode-btn ${mode === 'chat' ? 'active' : ''}`} onClick={() => setMode('chat')}>
-                  {locale === 'ru' ? 'Чат' : 'Chat'}
-                </button>
-                <button className={`ps-mode-btn ${mode === 'generator' ? 'active' : ''}`} onClick={() => setMode('generator')}>
-                  {locale === 'uz' ? 'Generator' : locale === 'en' ? 'Generator' : 'Генератор'}
-                </button>
+                <button className={`ps-mode-btn ${mode === 'chat' ? 'active' : ''}`} onClick={() => setMode('chat')}>Чат</button>
+                <button className={`ps-mode-btn ${mode === 'generator' ? 'active' : ''}`} onClick={() => setMode('generator')}>Генератор</button>
               </div>
             </div>
-            <div className="ps-chat-header-right">
-              <button className="ps-choose-btn" onClick={() => void handleNewChat()} disabled={isStreaming}>
+            <div className="ps-chat-header-right" style={{ display: 'flex', gap: '6px', alignItems: 'center', position: 'relative' }}>
+              <div ref={threadDropdownRef} style={{ position: 'relative' }}>
+                <button
+                  className="ps-choose-btn"
+                  onClick={() => setThreadDropdownOpen((v) => !v)}
+                  title="Чаты"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                >
+                  <Folder size={14} />
+                  Чаты
+                  <ChevronDown size={12} style={{ transform: threadDropdownOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
+                </button>
+                {threadDropdownOpen && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: '100%',
+                      right: 0,
+                      marginTop: '4px',
+                      width: '280px',
+                      maxHeight: '320px',
+                      overflowY: 'auto',
+                      borderRadius: '10px',
+                      boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+                      zIndex: 100,
+                    }}
+                    className="bg-card border border-border"
+                  >
+                    <div style={{ padding: '8px', borderBottom: '1px solid var(--border)' }}>
+                      <button
+                        className="ps-choose-btn"
+                        onClick={() => { setThreadDropdownOpen(false); void startNewThread(); }}
+                        style={{ width: '100%', justifyContent: 'center', display: 'flex', alignItems: 'center', gap: '4px' }}
+                      >
+                        <Plus size={14} />
+                        Новый чат
+                      </button>
+                    </div>
+                    {threadList.length === 0 ? (
+                      <div style={{ padding: '16px', textAlign: 'center', fontSize: '13px' }} className="text-muted-foreground">
+                        Нет сохранённых чатов
+                      </div>
+                    ) : (
+                      threadList.map((t) => (
+                        <div
+                          key={t.id}
+                          style={{
+                            width: '100%',
+                            display: 'flex',
+                            alignItems: 'center',
+                            borderBottom: '1px solid var(--border)',
+                            background: t.id === activeThreadId ? 'var(--accent)' : 'transparent',
+                            transition: 'background 0.1s',
+                          }}
+                          className="hover:bg-accent"
+                        >
+                          <button
+                            onClick={() => void switchThread(t.id)}
+                            style={{
+                              flex: 1,
+                              display: 'flex',
+                              flexDirection: 'column',
+                              alignItems: 'flex-start',
+                              padding: '10px 8px 10px 12px',
+                              cursor: 'pointer',
+                              border: 'none',
+                              borderRadius: 0,
+                              background: 'transparent',
+                              minWidth: 0,
+                            }}
+                          >
+                            <span style={{
+                              fontSize: '13px',
+                              fontWeight: t.id === activeThreadId ? 600 : 400,
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap',
+                              width: '100%',
+                              textAlign: 'left',
+                            }} className="text-foreground">
+                              {t.preview || 'Новый чат'}
+                            </span>
+                            <span style={{ fontSize: '11px', marginTop: '2px' }} className="text-muted-foreground">
+                              {t.messageCount > 0 ? `${t.messageCount} сообщений` : 'Пустой чат'}
+                              {' · '}
+                              {new Date(t.createdAt).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })}
+                            </span>
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void deleteThread(t.id);
+                            }}
+                            title="Удалить чат"
+                            style={{
+                              background: 'none',
+                              border: 'none',
+                              cursor: 'pointer',
+                              padding: '6px 10px',
+                              color: 'var(--muted-foreground)',
+                              borderRadius: '6px',
+                              transition: 'color 0.15s, background 0.15s',
+                              flexShrink: 0,
+                            }}
+                            className="hover:text-destructive hover:bg-destructive/10"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+              <button
+                className="ps-choose-btn"
+                onClick={() => void startNewThread()}
+                title="Новый чат"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+              >
                 <Plus size={14} />
-                {t.newChat}
-              </button>
-              <button className="ps-choose-btn" onClick={() => void clearChat('messages')} disabled={isStreaming || (messages.length === 0 && !isThreadLocked)}>
-                <Trash2 size={14} />
-                {t.clearMessages}
+                Новый
               </button>
               {chatSelectMode ? (
                 <button className="ps-choose-btn ps-choose-btn--cancel" onClick={() => { setChatSelectMode(false); setSelectedMsgIds(new Set()); }}>
-                  {t.cancel}
+                  Отмена
                 </button>
               ) : (
-                <button className="ps-choose-btn" onClick={() => setChatSelectMode(true)} disabled={messages.length === 0}>
+                <button className="ps-choose-btn" onClick={() => setChatSelectMode(true)}>
                   <CheckCircle2 size={14} />
-                  {t.select}
+                  Выбрать
                 </button>
               )}
             </div>
@@ -2166,143 +3174,36 @@ export default function PhotoStudioPage() {
 
           {mode === 'chat' ? (
             <>
-              <div className="ps-thread-panel">
-                <div className="ps-thread-panel-head">
-                  <div>
-                    <div className="ps-thread-label">
-                      {t.activeThread}: {threadId ? `#${threadId}` : '...'}
-                    </div>
-                    {sessionKey ? (
-                      <div className="ps-thread-subtitle">
-                        session {sessionKey}
-                        {activeThreadId && activeThreadId !== threadId ? ` • active #${activeThreadId}` : ''}
-                      </div>
-                    ) : null}
-                  </div>
-                  <div className="ps-thread-meta">
-                    <span className="ps-thread-chip">
-                      {t.localeLabel}: {(threadContext.locale || browserLocale).split('-')[0]}
-                    </span>
-                    {threadContext.last_action ? (
-                      <span className="ps-thread-chip">
-                        {typeof threadContext.last_action === 'string'
-                          ? threadContext.last_action
-                          : String((threadContext.last_action as Record<string, unknown>)?.type || 'action')}
-                      </span>
-                    ) : null}
-                  </div>
-                </div>
-
-                <div className="ps-thread-active-row">
-                  <div className="ps-thread-active-copy">
-                    <span className="ps-thread-active-title">{t.activeImages}</span>
-                    <span className="ps-thread-active-hint">{t.activeHint}</span>
-                  </div>
-                  {activeWorkingMedia.length > 0 ? (
-                    <div className="ps-thread-active-grid">
-                      {activeWorkingMedia.map((photo) => (
-                        <button
-                          key={photo.id}
-                          className="ps-thread-active-card"
-                          onClick={() => setPreviewPhoto(photo)}
-                          title={photo.prompt || photo.fileName || ''}
-                        >
-                          <img src={photo.url} alt="" crossOrigin="anonymous" />
-                          <span className="ps-thread-active-badge">{t.activeBadge}</span>
-                          {threadContext.last_generated_asset_id && photo.assetId === threadContext.last_generated_asset_id ? (
-                            <span className="ps-thread-active-badge ps-thread-active-badge--accent">
-                              {t.lastGeneratedBadge}
-                            </span>
-                          ) : null}
-                        </button>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="ps-thread-empty">{t.noActiveImages}</div>
-                  )}
-                </div>
-
-                {threadContext.pending_question ? (
-                  <div className="ps-thread-question">
-                    <HelpCircle size={14} />
-                    <span>{t.pendingQuestion}: {threadContext.pending_question}</span>
-                  </div>
-                ) : null}
-              </div>
-
-              {streamError ? (
-                <div className={`ps-stream-banner ${isThreadLocked ? 'ps-stream-banner--limit' : ''}`}>
-                  <div className="ps-stream-banner-copy">
-                    <strong>{streamError.title}</strong>
-                    <span>{streamError.message}</span>
-                  </div>
-                  <div className="ps-stream-banner-actions">
-                    {streamError.retryable && !isThreadLocked ? (
-                      <button className="ps-stream-banner-btn" onClick={() => void retryLastRequest()} disabled={isStreaming}>
-                        {t.retry}
-                      </button>
-                    ) : null}
-                    {isThreadLocked ? (
-                      <>
-                        <button className="ps-stream-banner-btn" onClick={() => void clearChat('messages')} disabled={isStreaming}>
-                          {t.clearMessages}
-                        </button>
-                        <button className="ps-stream-banner-btn ps-stream-banner-btn--primary" onClick={() => void handleNewChat()} disabled={isStreaming}>
-                          {t.newChat}
-                        </button>
-                      </>
-                    ) : (
-                      <button className="ps-stream-banner-btn" onClick={() => setStreamError(null)}>
-                        {t.dismiss}
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ) : null}
-
               <div className="ps-messages">
                 {chatSelectMode && (
                   <div className="ps-select-bar">
                     <button className="ps-select-bar-btn" onClick={() => {
-                      const allIds = new Set(messages.map((m) => m.id));
+                      const allIds = new Set(messages.filter((m) => m.type !== 'welcome').map((m) => m.id));
                       setSelectedMsgIds(allIds);
-                    }}>{t.chooseAll}</button>
+                    }}>Выбрать все</button>
                     <button
                       className="ps-select-bar-btn ps-select-bar-btn--danger"
                       disabled={selectedMsgIds.size === 0}
                       onClick={() => void deleteSelectedMessages(selectedMsgIds)}
                     >
-                      {t.deleteSelected} ({selectedMsgIds.size})
+                      Удалить ({selectedMsgIds.size})
                     </button>
                     <button
                       className="ps-select-bar-btn ps-select-bar-btn--danger"
                       onClick={() => {
-                        const allIds = new Set(messages.map((m) => m.id));
+                        const allIds = new Set(messages.filter((m) => m.type !== 'welcome').map((m) => m.id));
                         void deleteSelectedMessages(allIds);
                       }}
-                    >{t.deleteAll}</button>
+                    >Удалить все</button>
                   </div>
                 )}
-                {isHistoryLoading ? (
-                  <div className="ps-chat-empty">
-                    <Loader2 size={20} className="ps-spin" />
-                    <strong>{t.loadingHistory}</strong>
-                  </div>
-                ) : null}
-                {!isHistoryLoading && messages.length === 0 ? (
-                  <div className="ps-chat-empty">
-                    <Sparkles size={20} />
-                    <strong>{t.emptyConversationTitle}</strong>
-                    <span>{t.emptyConversationBody}</span>
-                  </div>
-                ) : null}
                 {messages.map((msg) => (
                   <MessageBubble
                     key={msg.id}
                     msg={msg}
-                    locale={locale}
-                    questionBadgeLabel={t.questionBadge}
-                    onPhotoClick={(photo) => setPreviewPhoto(photo)}
+                    onPhotoClick={(photo) => {
+                      setPreviewPhoto(photo);
+                    }}
                     onPhotoDragStart={handleChatPhotoDragStart}
                     selectMode={chatSelectMode}
                     isSelected={selectedMsgIds.has(msg.id)}
@@ -2313,8 +3214,9 @@ export default function PhotoStudioPage() {
                     })}
                   />
                 ))}
-                {isStreaming && messages[messages.length - 1]?.role !== 'assistant' && !isHistoryLoading && (
+                {isBotTyping && (
                   <div className="ps-typing">
+                    <div className="ps-msg-avatar"><Bot size={16} /></div>
                     <div className="ps-typing-dots"><span /><span /><span /></div>
                   </div>
                 )}
@@ -2325,51 +3227,23 @@ export default function PhotoStudioPage() {
                 <div ref={quickDropdownRef} className={`ps-dropdown ${quickOpen ? 'open' : ''}`}>
                   <button className="ps-action-chip" onClick={() => setQuickOpen((v) => !v)}>
                     <Sparkles size={14} />
-                    {locale === 'uz' ? 'Tez buyruqlar' : locale === 'en' ? 'Quick actions' : 'Быстрые команды'}
+                    Быстрые команды
                     <ChevronDown size={14} />
                   </button>
                   {quickOpen ? (
-                    <div className="ps-dropdown-menu ps-dropdown-menu--matrix">
-                      <div className="ps-quick-col">
-                        <div className="ps-quick-col-title">
-                          {locale === 'uz' ? 'Amalni tanlang' : locale === 'en' ? 'Choose action' : 'Выберите действие'}
-                        </div>
-                        {quickMenu.map((item) => (
-                          <button
-                            key={item.id}
-                            className={`ps-quick-action-row ${quickActive === item.id ? 'active' : ''}`}
-                            onMouseEnter={() => setQuickActive(item.id)}
-                            onClick={() => setQuickActive(item.id)}
-                          >
-                            <item.icon size={14} />
-                            <span>{item.label}</span>
-                            <ChevronDown size={12} />
-                          </button>
-                        ))}
-                      </div>
-                      <div className="ps-quick-col">
-                        <div className="ps-quick-col-title">
-                          {locale === 'uz' ? 'Variantni tanlang' : locale === 'en' ? 'Choose option' : 'Выберите вариант'}
-                        </div>
-                        <div className="ps-quick-options">
-                          {activeQuickMenu.options.map((opt) => (
-                            <button
-                              key={`${activeQuickMenu.id}-${opt.id || opt.label}`}
-                              className="ps-quick-option-row"
-                              onClick={() => { void handleQuickPick(activeQuickMenu, opt); }}
-                            >
-                              {opt.label}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
+                    <QuickCommandsPanel
+                      quickMenu={quickMenu}
+                      quickActive={quickActive}
+                      setQuickActive={setQuickActive}
+                      activeQuickMenu={activeQuickMenu}
+                      onPick={handleQuickPick}
+                    />
                   ) : null}
                 </div>
 
                 <button className="ps-action-chip" onClick={() => setSamplesOpen(true)}>
                   <GalleryHorizontal size={14} />
-                  {locale === 'uz' ? 'Namunalar galereyasi' : locale === 'en' ? 'Sample gallery' : 'Галерея образцов'}
+                  Галерея образцов
                   {attachedPhotos.length > 0 ? (
                     <span className="ps-chip-badge">{attachedPhotos.length}</span>
                   ) : null}
@@ -2378,7 +3252,7 @@ export default function PhotoStudioPage() {
 
                 <button className="ps-action-chip" onClick={() => setInstructionsOpen(true)}>
                   <HelpCircle size={14} />
-                  {locale === 'uz' ? 'Ko‘rsatmalar' : locale === 'en' ? 'Instructions' : 'Инструкции'}
+                  Инструкции
                 </button>
               </div>
 
@@ -2387,22 +3261,20 @@ export default function PhotoStudioPage() {
                   {attachedPhotos.length === 1 ? (
                     <div className="ps-attached-single">
                       <div className="ps-attached-single-thumb">
-                        <img src={attachedPhotos[0].url} alt="" crossOrigin="anonymous" />
+                        <ProxiedImg src={attachedPhotos[0].url} alt="" crossOrigin="anonymous" />
                         <button className="ps-attached-remove-abs" onClick={() => removeAttached(attachedPhotos[0].id)}>
                           <X size={10} />
                         </button>
                       </div>
                       <div className="ps-attached-single-info">
-                        <span className="ps-attached-label-text">
-                          {locale === 'uz' ? 'Rasm biriktirildi' : locale === 'en' ? 'Image attached' : 'Фото прикреплено'}
-                        </span>
+                        <span className="ps-attached-label-text">Фото прикреплено</span>
                       </div>
                     </div>
                   ) : (
                     <div className="ps-attached-multi">
                       {attachedPhotos.map((p, i) => (
                         <div key={p.id} className="ps-attached-thumb ps-attached-thumb--ord">
-                          <img src={p.url} alt="" crossOrigin="anonymous" />
+                          <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
                           <span className="ps-attached-ord-badge">{i + 1}</span>
                           <button className="ps-attached-remove" onClick={() => removeAttached(p.id)}>
                             <X size={10} />
@@ -2416,7 +3288,7 @@ export default function PhotoStudioPage() {
               )}
 
               <form className="ps-input" onSubmit={(e) => { e.preventDefault(); void handleSend(); }}>
-                <button type="button" className="ps-icon-btn" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || isThreadLocked || !canAttachMore}>
+                <button type="button" className="ps-icon-btn" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || !canAttachMore}>
                   <Paperclip size={18} />
                 </button>
                 <input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={handleFileSelect} />
@@ -2426,15 +3298,15 @@ export default function PhotoStudioPage() {
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
                   onKeyDown={onKeyDown}
-                  placeholder={chatPlaceholder}
-                  disabled={isStreaming || isThreadLocked}
+                  placeholder={attachedPhotos.length ? 'Что сделать с фото?' : 'Напишите, что хотите сделать...'}
+                  disabled={isStreaming}
                   className="ps-text-input"
                 />
 
                 <button
                   type="submit"
                   className={`ps-send-btn ps-send-btn--pill ${(inputText.trim() || attachedPhotos.length) && !isStreaming ? 'ps-send-btn--active' : ''}`}
-                  disabled={(!inputText.trim() && !attachedPhotos.length) || isStreaming || isThreadLocked}
+                  disabled={(!inputText.trim() && !attachedPhotos.length) || isStreaming}
                 >
                   <Send size={18} />
                 </button>
@@ -2464,10 +3336,10 @@ export default function PhotoStudioPage() {
                     <div className="ps-gen-section-desc">Загрузите фото изделия и фотомодели — AI совместит их</div>
 
                     <div className="ps-gen-dropzones">
-                      <div className="ps-gen-dropzone" onClick={() => genFileInputRef1.current?.click()}>
+                      <div className="ps-gen-dropzone" onClick={() => handleZoneClick('garment', genFileInputRef1)}>
                         {genGarmentPhoto ? (
                           <div className="ps-gen-dropzone-preview">
-                            <img src={genGarmentPhoto.url} alt="" crossOrigin="anonymous" />
+                            <ProxiedImg src={genGarmentPhoto.url} alt="" crossOrigin="anonymous" />
                             <button className="ps-gen-dropzone-remove" onClick={(e) => { e.stopPropagation(); setGenGarmentPhoto(null); }}>
                               <X size={10} />
                             </button>
@@ -2482,10 +3354,10 @@ export default function PhotoStudioPage() {
                         <input ref={genFileInputRef1} type="file" accept="image/*" hidden onChange={handleGenFileSelect(setGenGarmentPhoto)} />
                       </div>
 
-                      <div className="ps-gen-dropzone" onClick={() => genFileInputRef2.current?.click()}>
+                      <div className="ps-gen-dropzone" onClick={() => handleZoneClick('model', genFileInputRef2)}>
                         {genModelPhoto ? (
                           <div className="ps-gen-dropzone-preview">
-                            <img src={genModelPhoto.url} alt="" crossOrigin="anonymous" />
+                            <ProxiedImg src={genModelPhoto.url} alt="" crossOrigin="anonymous" />
                             <button className="ps-gen-dropzone-remove" onClick={(e) => { e.stopPropagation(); setGenModelPhoto(null); }}>
                               <X size={10} />
                             </button>
@@ -2510,7 +3382,7 @@ export default function PhotoStudioPage() {
                               if (!genGarmentPhoto) setGenGarmentPhoto(p);
                               else if (!genModelPhoto) setGenModelPhoto(p);
                             }}>
-                              <img src={p.url} alt="" crossOrigin="anonymous" />
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
                               <span className="ps-gen-available-num">{i + 1}</span>
                             </button>
                           ))}
@@ -2531,10 +3403,10 @@ export default function PhotoStudioPage() {
                     <div className="ps-gen-section-desc">Загрузите фото изделия — AI создаст новую модель</div>
 
                     <div className="ps-gen-dropzones ps-gen-dropzones--single">
-                      <div className="ps-gen-dropzone" onClick={() => genFileInputRef1.current?.click()}>
+                      <div className="ps-gen-dropzone" onClick={() => handleZoneClick('garment', genFileInputRef1)}>
                         {genGarmentPhoto ? (
                           <div className="ps-gen-dropzone-preview">
-                            <img src={genGarmentPhoto.url} alt="" crossOrigin="anonymous" />
+                            <ProxiedImg src={genGarmentPhoto.url} alt="" crossOrigin="anonymous" />
                             <button className="ps-gen-dropzone-remove" onClick={(e) => { e.stopPropagation(); setGenGarmentPhoto(null); }}>
                               <X size={10} />
                             </button>
@@ -2556,7 +3428,7 @@ export default function PhotoStudioPage() {
                         <div className="ps-gen-available-grid">
                           {availablePhotos.map((p, i) => (
                             <button key={p.id} className="ps-gen-available-thumb" onClick={() => setGenGarmentPhoto(p)}>
-                              <img src={p.url} alt="" crossOrigin="anonymous" />
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
                               <span className="ps-gen-available-num">{i + 1}</span>
                             </button>
                           ))}
@@ -2598,10 +3470,10 @@ export default function PhotoStudioPage() {
                     <div className="ps-gen-section-desc">Напишите что угодно — AI обработает фото по вашему описанию</div>
 
                     <div className="ps-gen-dropzones ps-gen-dropzones--single">
-                      <div className="ps-gen-dropzone" onClick={() => genSourceInputRef.current?.click()}>
+                      <div className="ps-gen-dropzone" onClick={() => handleZoneClick()}>
                         {genSourcePhoto ? (
                           <div className="ps-gen-dropzone-preview">
-                            <img src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
+                            <ProxiedImg src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
                             <button className="ps-gen-dropzone-remove" onClick={(e) => { e.stopPropagation(); setGenSourcePhoto(null); }}>
                               <X size={10} />
                             </button>
@@ -2623,7 +3495,7 @@ export default function PhotoStudioPage() {
                         <div className="ps-gen-available-grid">
                           {availablePhotos.map((p, i) => (
                             <button key={p.id} className="ps-gen-available-thumb" onClick={() => setGenSourcePhoto(p)}>
-                              <img src={p.url} alt="" crossOrigin="anonymous" />
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
                               <span className="ps-gen-available-num">{i + 1}</span>
                             </button>
                           ))}
@@ -2648,10 +3520,10 @@ export default function PhotoStudioPage() {
                     <div className="ps-gen-section-desc">Выберите фото и сцену — AI заменит фон</div>
 
                     <div className="ps-gen-dropzones ps-gen-dropzones--single">
-                      <div className="ps-gen-dropzone" onClick={() => genSourceInputRef.current?.click()}>
+                      <div className="ps-gen-dropzone" onClick={() => handleZoneClick()}>
                         {genSourcePhoto ? (
                           <div className="ps-gen-dropzone-preview">
-                            <img src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
+                            <ProxiedImg src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
                             <button className="ps-gen-dropzone-remove" onClick={(e) => { e.stopPropagation(); setGenSourcePhoto(null); }}>
                               <X size={10} />
                             </button>
@@ -2673,7 +3545,7 @@ export default function PhotoStudioPage() {
                         <div className="ps-gen-available-grid">
                           {availablePhotos.map((p, i) => (
                             <button key={p.id} className="ps-gen-available-thumb" onClick={() => setGenSourcePhoto(p)}>
-                              <img src={p.url} alt="" crossOrigin="anonymous" />
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
                               <span className="ps-gen-available-num">{i + 1}</span>
                             </button>
                           ))}
@@ -2707,10 +3579,10 @@ export default function PhotoStudioPage() {
                     <div className="ps-gen-section-desc">Выберите фото и позу — AI изменит положение модели</div>
 
                     <div className="ps-gen-dropzones ps-gen-dropzones--single">
-                      <div className="ps-gen-dropzone" onClick={() => genSourceInputRef.current?.click()}>
+                      <div className="ps-gen-dropzone" onClick={() => handleZoneClick()}>
                         {genSourcePhoto ? (
                           <div className="ps-gen-dropzone-preview">
-                            <img src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
+                            <ProxiedImg src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
                             <button className="ps-gen-dropzone-remove" onClick={(e) => { e.stopPropagation(); setGenSourcePhoto(null); }}>
                               <X size={10} />
                             </button>
@@ -2732,7 +3604,7 @@ export default function PhotoStudioPage() {
                         <div className="ps-gen-available-grid">
                           {availablePhotos.map((p, i) => (
                             <button key={p.id} className="ps-gen-available-thumb" onClick={() => setGenSourcePhoto(p)}>
-                              <img src={p.url} alt="" crossOrigin="anonymous" />
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
                               <span className="ps-gen-available-num">{i + 1}</span>
                             </button>
                           ))}
@@ -2766,10 +3638,10 @@ export default function PhotoStudioPage() {
                     <div className="ps-gen-section-desc">Загрузите фото — AI создаст короткое видео с движением</div>
 
                     <div className="ps-gen-dropzones ps-gen-dropzones--single">
-                      <div className="ps-gen-dropzone" onClick={() => genSourceInputRef.current?.click()}>
+                      <div className="ps-gen-dropzone" onClick={() => handleZoneClick()}>
                         {genSourcePhoto ? (
                           <div className="ps-gen-dropzone-preview">
-                            <img src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
+                            <ProxiedImg src={genSourcePhoto.url} alt="" crossOrigin="anonymous" />
                             <button className="ps-gen-dropzone-remove" onClick={(e) => { e.stopPropagation(); setGenSourcePhoto(null); }}>
                               <X size={10} />
                             </button>
@@ -2791,7 +3663,7 @@ export default function PhotoStudioPage() {
                         <div className="ps-gen-available-grid">
                           {availablePhotos.map((p, i) => (
                             <button key={p.id} className="ps-gen-available-thumb" onClick={() => setGenSourcePhoto(p)}>
-                              <img src={p.url} alt="" crossOrigin="anonymous" />
+                              <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
                               <span className="ps-gen-available-num">{i + 1}</span>
                             </button>
                           ))}
@@ -2843,6 +3715,7 @@ export default function PhotoStudioPage() {
               </div>
             </div>
           )}
+          {renderProductPicker()}
 
           {isDrag && (
             <div className="ps-drag-overlay">
@@ -2858,7 +3731,7 @@ export default function PhotoStudioPage() {
             <div className="ps-side-head">
               <div className="ps-side-title-row">
                 <Sparkles size={16} />
-                <span>{t.relatedMedia}</span>
+                <span>История</span>
               </div>
               <div className="ps-history-head-actions">
                 <button className="ps-side-collapse" onClick={() => setRightExpanded(v => !v)} title={rightExpanded ? 'Сжать' : 'Развернуть'}>
@@ -2872,38 +3745,36 @@ export default function PhotoStudioPage() {
 
             <div className="ps-sidebar-body">
               <div className="ps-history-hint">
-                {t.persistentLibraryHint}
+                Перетащите фото в карточку товара или выберите для редактирования
               </div>
 
               <div className="ps-history-counters">
                 <span className={`ps-history-counter ${historyTab === 'image' ? 'ps-history-counter--active' : ''}`} onClick={() => setHistoryTab('image')}>
                   <Camera size={12} />
-                  {libraryPhotos.length}
+                  {historyPhotos.length}/100
                 </span>
                 <span className={`ps-history-counter ${historyTab === 'video' ? 'ps-history-counter--active' : ''}`} onClick={() => setHistoryTab('video')}>
                   <Video size={12} />
-                  {libraryVideos.length}
+                  {historyVideos.length}/50
                 </span>
               </div>
 
               <div className="ps-history-subtitle">
-                {historyTab === 'image'
-                  ? `${t.libraryTabImages.toUpperCase()} (${libraryPhotos.length})`
-                  : `${t.libraryTabVideos.toUpperCase()} (${libraryVideos.length})`}
+                {historyTab === 'image' ? `ФОТО (${historyPhotos.length})` : `ВИДЕО (${historyVideos.length})`}
               </div>
 
-              {(historyTab === 'image' ? libraryPhotos : libraryVideos).length === 0 ? (
+              {(historyTab === 'image' ? historyPhotos : historyVideos).length === 0 ? (
                 <div className="ps-sidebar-empty">
                   <ImageIcon size={24} />
-                  <span>{t.emptyMedia}</span>
-                  <span className="ps-empty-sub">{t.emptyMediaSub}</span>
+                  <span>Нет {historyTab === 'image' ? 'фото' : 'видео'}</span>
+                  <span className="ps-empty-sub">Прикрепите фото и отправьте команду</span>
                 </div>
               ) : (
                 <div className="ps-history-grid">
-                  {(historyTab === 'image' ? libraryPhotos : libraryVideos).map((p) => (
+                  {(historyTab === 'image' ? historyPhotos : historyVideos).map((p) => (
                     <div
                       key={p.id}
-                      className={`ps-history-item ${p.assetId && activeWorkingAssetIds.includes(p.assetId) ? 'ps-history-item--active' : ''}`}
+                      className="ps-history-item"
                       onMouseEnter={(e) => handleHistoryMouseEnter(e, p)}
                       onMouseLeave={handleHistoryMouseLeave}
                     >
@@ -2913,24 +3784,23 @@ export default function PhotoStudioPage() {
                           draggable
                           onDragStart={(e) => handleHistoryDragStart(e, p)}
                           onClick={() => setPreviewPhoto(p)}
-                          onDoubleClick={(e) => { e.preventDefault(); if (canAttachMore) attachByUrl(p.url, p.assetId); }}
-                          title="Клик — просмотр | Двойной клик — прикрепить к чату"
+                          title="Клик — просмотр | Перетащите в чат для прикрепления"
                         >
                           {p.type === 'video' ? (
                             <video src={p.url} crossOrigin="anonymous" />
                           ) : (
-                            <img src={p.url} alt="" crossOrigin="anonymous" />
+                            <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
                           )}
                         </button>
-                        {p.assetId && activeWorkingAssetIds.includes(p.assetId) ? (
-                          <div className="ps-history-active-pill">{t.activeBadge}</div>
-                        ) : null}
                         {/* Hover actions overlay */}
                         <div className={`ps-history-hover-actions ${hoveredHistoryId === p.id ? 'visible' : ''}`}>
                           <button onClick={() => handleDownload(p)} title="Скачать">
                             <Download size={13} />
                           </button>
-                          <button onClick={() => { setGalleryAddPhoto(p); setGalleryAddType('scene'); }} title="В галерею">
+                          <button onClick={() => deleteHistoryPhoto(p.id)} title="Удалить">
+                            <Trash2 size={13} />
+                          </button>
+                          <button onClick={(e) => { setGalleryAddRect((e.currentTarget as HTMLElement).getBoundingClientRect()); setGalleryAddPhoto(p); setGalleryAddType('scene'); }} title="В галерею">
                             <Plus size={13} />
                           </button>
                         </div>
@@ -2987,8 +3857,23 @@ export default function PhotoStudioPage() {
                       </div>
                     ))
                     : gallerySystemAssets.slice(0, 12).map((asset) => (
-                      <button key={`sys-${asset.id}`} className="ps-gallery-tile" onClick={() => handleGallerySelect(asset)}>
-                        <img src={asset.url} alt={asset.name} crossOrigin="anonymous" />
+                      <button
+                        key={`sys-${asset.id}`}
+                        className="ps-gallery-tile"
+                        onClick={() => handleGallerySelect(asset)}
+                        onMouseEnter={(e) => {
+                          const el = e.currentTarget as HTMLElement;
+                          if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+                          hoverTimerRef.current = setTimeout(() => {
+                            setHoverPreview({ photo: { id: String(asset.id), url: asset.url, type: 'image' }, rect: el.getBoundingClientRect() });
+                          }, 350);
+                        }}
+                        onMouseLeave={() => {
+                          if (hoverTimerRef.current) { clearTimeout(hoverTimerRef.current); hoverTimerRef.current = null; }
+                          setHoverPreview(null);
+                        }}
+                      >
+                        <ProxiedImg src={asset.url} alt={asset.name} crossOrigin="anonymous" />
                       </button>
                     ))}
                 </div>
@@ -3017,8 +3902,23 @@ export default function PhotoStudioPage() {
                 </button>
 
                 {galleryUserAssets.slice(0, 11).map((asset) => (
-                  <button key={`my-${asset.id}`} className="ps-gallery-tile" onClick={() => handleGallerySelect(asset)}>
-                    <img src={asset.url} alt={asset.name} crossOrigin="anonymous" />
+                  <button
+                    key={`my-${asset.id}`}
+                    className="ps-gallery-tile"
+                    onClick={() => handleGallerySelect(asset)}
+                    onMouseEnter={(e) => {
+                      const el = e.currentTarget as HTMLElement;
+                      if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+                      hoverTimerRef.current = setTimeout(() => {
+                        setHoverPreview({ photo: { id: String(asset.id), url: asset.url, type: 'image' }, rect: el.getBoundingClientRect() });
+                      }, 350);
+                    }}
+                    onMouseLeave={() => {
+                      if (hoverTimerRef.current) { clearTimeout(hoverTimerRef.current); hoverTimerRef.current = null; }
+                      setHoverPreview(null);
+                    }}
+                  >
+                    <ProxiedImg src={asset.url} alt={asset.name} crossOrigin="anonymous" />
                   </button>
                 ))}
 
@@ -3063,7 +3963,7 @@ export default function PhotoStudioPage() {
             {previewPhoto.type === 'video' ? (
               <video src={previewPhoto.url} controls autoPlay crossOrigin="anonymous" className="ps-preview-img" />
             ) : (
-              <img src={previewPhoto.url} alt="" crossOrigin="anonymous" className="ps-preview-img" />
+              <ProxiedImg src={previewPhoto.url} alt="" crossOrigin="anonymous" className="ps-preview-img" />
             )}
             {previewPhoto.prompt && (
               <div className="ps-preview-prompt">{previewPhoto.prompt}</div>
@@ -3085,46 +3985,47 @@ export default function PhotoStudioPage() {
         </div>
       )}
 
-      {/* Gallery add modal */}
+      {/* Gallery add popover */}
       {galleryAddPhoto && (
-        <div className="ps-modal-overlay" onClick={() => setGalleryAddPhoto(null)}>
-          <div className="ps-modal-card ps-modal-card--narrow" onClick={(e) => e.stopPropagation()}>
-            <div className="ps-modal-head">
-              <h3>Добавить в галерею</h3>
-              <button onClick={() => setGalleryAddPhoto(null)}><X size={16} /></button>
+        <div className="ps-modal-overlay ps-modal-overlay--transparent" onClick={() => setGalleryAddPhoto(null)}>
+          <div
+            className="ps-gallery-add-popover"
+            onClick={(e) => e.stopPropagation()}
+            style={galleryAddRect ? {
+              top: Math.min(galleryAddRect.top, window.innerHeight - 200),
+              left: Math.min(galleryAddRect.right + 8, window.innerWidth - 220),
+            } : { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }}
+          >
+            <div className="ps-gallery-add-popover-head">
+              <span>В галерею</span>
+              <button onClick={() => setGalleryAddPhoto(null)}><X size={12} /></button>
             </div>
-            <div className="ps-gallery-add-body">
-              <div className="ps-gallery-add-preview">
-                <img src={galleryAddPhoto.url} alt="" crossOrigin="anonymous" />
+            <div className="ps-gallery-add-popover-body">
+              <div className="ps-gallery-add-popover-thumb">
+                <ProxiedImg src={galleryAddPhoto.url} alt="" crossOrigin="anonymous" />
               </div>
-              <div className="ps-gallery-add-options">
-                <span className="ps-gallery-add-label">Добавить как:</span>
-                <div className="ps-gallery-add-btns">
-                  <button
-                    className={`ps-gallery-add-type-btn ${galleryAddType === 'scene' ? 'active' : ''}`}
-                    onClick={() => setGalleryAddType('scene')}
-                  >
-                    <Mountain size={14} /> Локация
-                  </button>
-                  <button
-                    className={`ps-gallery-add-type-btn ${galleryAddType === 'model' ? 'active' : ''}`}
-                    onClick={() => setGalleryAddType('model')}
-                  >
-                    <User size={14} /> Модель
-                  </button>
-                </div>
+              <div className="ps-gallery-add-popover-options">
                 <button
-                  className="ps-gallery-add-confirm"
-                  onClick={() => galleryAddPhoto && addPhotoToGallery(galleryAddPhoto, galleryAddType)}
-                  disabled={galleryAdding}
+                  className={`ps-gallery-add-popover-type ${galleryAddType === 'scene' ? 'active' : ''}`}
+                  onClick={() => setGalleryAddType('scene')}
                 >
-                  {galleryAdding ? (
-                    <><Loader2 size={14} className="ps-spin" /> Добавляю...</>
-                  ) : (
-                    <><Plus size={14} /> Добавить</>
-                  )}
+                  <Mountain size={12} /> Локация
+                </button>
+                <button
+                  className={`ps-gallery-add-popover-type ${galleryAddType === 'model' ? 'active' : ''}`}
+                  onClick={() => setGalleryAddType('model')}
+                >
+                  <User size={12} /> Модель
                 </button>
               </div>
+              <button
+                className="ps-gallery-add-popover-confirm"
+                onClick={() => galleryAddPhoto && addPhotoToGallery(galleryAddPhoto, galleryAddType)}
+                disabled={galleryAdding}
+              >
+                {galleryAdding ? <Loader2 size={12} className="ps-spin" /> : <Plus size={12} />}
+                {galleryAdding ? 'Добавляю...' : 'Добавить'}
+              </button>
             </div>
           </div>
         </div>
@@ -3141,7 +4042,7 @@ export default function PhotoStudioPage() {
           {hoverPreview.photo.type === 'video' ? (
             <video src={hoverPreview.photo.url} crossOrigin="anonymous" autoPlay muted loop className="ps-hover-enlarge-img" />
           ) : (
-            <img src={hoverPreview.photo.url} alt="" crossOrigin="anonymous" className="ps-hover-enlarge-img" />
+            <ProxiedImg src={hoverPreview.photo.url} alt="" crossOrigin="anonymous" className="ps-hover-enlarge-img" />
           )}
           {hoverPreview.photo.prompt && (
             <div className="ps-hover-enlarge-prompt">{hoverPreview.photo.prompt}</div>
@@ -3152,10 +4053,56 @@ export default function PhotoStudioPage() {
   );
 }
 
+const QuickCommandsPanel = React.memo(function QuickCommandsPanel({
+  quickMenu,
+  quickActive,
+  setQuickActive,
+  activeQuickMenu,
+  onPick,
+}: {
+  quickMenu: QuickMenuAction[];
+  quickActive: QuickActionId;
+  setQuickActive: (id: QuickActionId) => void;
+  activeQuickMenu: QuickMenuAction;
+  onPick: (action: QuickMenuAction, option: QuickMenuAction['options'][number]) => void;
+}) {
+  return (
+    <div className="ps-dropdown-menu ps-dropdown-menu--matrix">
+      <div className="ps-quick-col">
+        <div className="ps-quick-col-title">Выберите действие</div>
+        {quickMenu.map((item) => (
+          <button
+            key={item.id}
+            className={`ps-quick-action-row ${quickActive === item.id ? 'active' : ''}`}
+            onMouseEnter={() => setQuickActive(item.id)}
+            onClick={() => setQuickActive(item.id)}
+          >
+            <item.icon size={14} />
+            <span>{item.label}</span>
+            <ChevronDown size={12} />
+          </button>
+        ))}
+      </div>
+      <div className="ps-quick-col">
+        <div className="ps-quick-col-title">Выберите вариант</div>
+        <div className="ps-quick-options">
+          {activeQuickMenu.options.map((opt) => (
+            <button
+              key={`${activeQuickMenu.id}-${opt.id || opt.label}`}
+              className="ps-quick-option-row"
+              onClick={() => { void onPick(activeQuickMenu, opt); }}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+});
+
 function MessageBubble({
   msg,
-  locale,
-  questionBadgeLabel,
   onPhotoClick,
   onPhotoDragStart,
   selectMode = false,
@@ -3163,8 +4110,6 @@ function MessageBubble({
   onToggleSelect,
 }: {
   msg: ChatMessage;
-  locale: AppLocale;
-  questionBadgeLabel: string;
   onPhotoClick: (photo: PhotoMedia) => void;
   onPhotoDragStart: (e: React.DragEvent, photo: PhotoMedia) => void;
   selectMode?: boolean;
@@ -3172,12 +4117,12 @@ function MessageBubble({
   onToggleSelect?: (id: string) => void;
 }) {
   const isUser = msg.role === 'user';
-  const isQuestion = msg.type === 'question';
-  const isSelectable = selectMode;
+  const isWelcome = msg.type === 'welcome';
+  const isSelectable = selectMode && msg.type !== 'welcome';
 
   return (
     <div
-      className={`ps-msg ${isUser ? 'ps-msg--user' : 'ps-msg--bot'} ${isQuestion ? 'ps-msg--question' : ''} ${isSelectable ? 'ps-msg--selectable' : ''} ${isSelected ? 'ps-msg--selected' : ''}`}
+      className={`ps-msg ${isUser ? 'ps-msg--user' : 'ps-msg--bot'} ${isWelcome ? 'ps-msg--welcome' : ''} ${isSelectable ? 'ps-msg--selectable' : ''} ${isSelected ? 'ps-msg--selected' : ''}`}
       onClick={() => isSelectable && onToggleSelect?.(msg.id)}
     >
       <div className="ps-msg-avatar">
@@ -3189,17 +4134,29 @@ function MessageBubble({
         {!isSelectable && (isUser ? <User size={16} /> : <Bot size={16} />)}
       </div>
       <div className="ps-msg-body">
-        {isQuestion ? (
-          <div className="ps-msg-badge">{questionBadgeLabel}</div>
-        ) : null}
         {msg.content && (
           <div className="ps-msg-text">
             {msg.isLoading && <Loader2 size={14} className="ps-inline-loader ps-spin" />}
             {msg.content}
           </div>
         )}
+        {/* Generation animation placeholder */}
+        {msg.isLoading && msg.type === 'action-progress' && (
+          <div className="ps-gen-anim">
+            <div className="ps-gen-anim-shimmer">
+              <div className="ps-gen-anim-icon">
+                <Sparkles size={24} />
+              </div>
+              <div className="ps-gen-anim-bars">
+                <div className="ps-gen-anim-bar" style={{ animationDelay: '0s' }} />
+                <div className="ps-gen-anim-bar" style={{ animationDelay: '0.15s' }} />
+                <div className="ps-gen-anim-bar" style={{ animationDelay: '0.3s' }} />
+              </div>
+            </div>
+          </div>
+        )}
         {msg.photos && msg.photos.length > 0 && (
-          <div className="ps-msg-photos">
+          <div className={`ps-msg-photos ps-msg-photos--${Math.min(msg.photos.length, 4)}`}>
             {msg.photos.map((p) => (
               <div
                 key={p.id}
@@ -3211,7 +4168,7 @@ function MessageBubble({
                 {p.type === 'video' ? (
                   <video src={p.url} crossOrigin="anonymous" />
                 ) : (
-                  <img src={p.url} alt="" crossOrigin="anonymous" />
+                  <ProxiedImg src={p.url} alt="" crossOrigin="anonymous" />
                 )}
                 <div className="ps-msg-photo-drag-hint">
                   <GripVertical size={12} />
@@ -3221,7 +4178,7 @@ function MessageBubble({
           </div>
         )}
         <span className="ps-msg-time">
-          {msg.timestamp.toLocaleTimeString(locale === 'uz' ? 'uz-UZ' : locale === 'en' ? 'en-US' : 'ru-RU', { hour: '2-digit', minute: '2-digit' })}
+          {msg.timestamp.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}
         </span>
       </div>
     </div>

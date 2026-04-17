@@ -62,6 +62,7 @@ class PhotoChatStreamRequest(BaseModel):
     quick_action: Optional[PhotoChatQuickActionIn] = None
     thread_id: Optional[int] = None
     request_id: Optional[str] = None
+    locale: Optional[str] = None
     client_session_id: Optional[str] = None
 
     @field_validator("asset_ids", mode="before")
@@ -98,7 +99,7 @@ class PhotoChatStreamRequest(BaseModel):
             return ""
         return str(value).strip()
 
-    @field_validator("photo_url", "request_id", "client_session_id", mode="before")
+    @field_validator("photo_url", "request_id", "locale", "client_session_id", mode="before")
     @classmethod
     def _normalize_string_fields(cls, value: object) -> Optional[str]:
         if value is None:

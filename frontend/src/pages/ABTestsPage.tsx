@@ -55,13 +55,23 @@ interface ListItem {
   title: string;
   status: string;
   spend_rub?: number;
+  estimated_spend_rub?: number;
   views_per_photo?: number;
   photos_count?: number;
   current_photo_order?: number;
   last_error?: string;
   can_start?: boolean;
   can_stop?: boolean;
-  photos?: Array<{ order: number; file_url: string; wb_url?: string | null }>;
+  winner_decision?: string;
+  photos?: Array<{
+    order: number;
+    file_url: string;
+    wb_url?: string | null;
+    winner_score?: number;
+    winner_score_confidence?: number;
+    winner_score_conversion_source?: string;
+    winner_score_reason?: string;
+  }>;
 }
 
 interface WizardPhoto {
@@ -633,7 +643,7 @@ export const ABTestsPage: React.FC = () => {
       });
 
       if (started?.status === 'running' || started?.started) {
-        toast.success('A/B тест запущен');
+        toast.success('Фото-тест запущен');
       } else if (started?.status === 'waiting_balance') {
         toast.message('Тест поставлен в ожидание бюджета. Как только WB увидит пополнение, система попробует стартовать его сама.');
       } else if (started?.status === 'failed') {
@@ -703,13 +713,18 @@ export const ABTestsPage: React.FC = () => {
                   <div className="abt-callout abt-callout--info">
                     <Info size={18} />
                     <div>
-                      <h4>ВНИМАНИЕ. Запуск теста предполагает:</h4>
-                      <ol>
+                      <h4>Как работает фото-тест</h4>
+                      <p className="mt-1 text-sm text-slate-600">
+                        Это <strong>последовательный фото-тест</strong>, а не параллельный A/B-сплит.
+                        Варианты оцениваются поочерёдно: система ставит каждое фото главным и собирает показы.
+                        Результаты индикативные — на них может влиять время суток и сезонность.
+                      </p>
+                      <ol className="mt-2">
                         <li>Создание автоматической рекламной кампании</li>
                         <li>Пополнение кампании на сумму расчётных расходов</li>
                         <li>Установку одного из фото в качестве главного</li>
                         <li>Автоматическую смену главного фото в процессе теста</li>
-                        <li>Выбор победителя по CTR после завершения</li>
+                        <li>Выбор лучшего варианта по CTR и конверсии после завершения</li>
                       </ol>
                     </div>
                   </div>
@@ -1009,8 +1024,9 @@ export const ABTestsPage: React.FC = () => {
                   </div>
 
                   <div className="abt-spend-card">
-                    <div>Рассчитанный расход:</div>
+                    <div>Ориентировочный расход:</div>
                     <strong>≈ {formatRub(estimatedSpend)} ₽</strong>
+                    <div className="mt-1 text-xs text-slate-500">Фактический расход может отличаться в зависимости от аукциона и условий доставки.</div>
                   </div>
 
                   <div className="abt-callout abt-callout--warning">
@@ -1117,9 +1133,9 @@ export const ABTestsPage: React.FC = () => {
                     <div className="abt-summary-row"><span>Показов на фото:</span><strong>{formatRub(viewsPerPhoto)}</strong></div>
                     <div className="abt-summary-row"><span>Стоимость 1000 показов:</span><strong>{formatRub(cpm)} ₽</strong></div>
                     <div className="abt-summary-row"><span>Победитель станет главным:</span><strong>{autoApplyWinner ? 'Да' : 'Нет'}</strong></div>
-                    <div className="abt-summary-row abt-summary-total"><span>Расчётный бюджет:</span><strong>{formatRub(estimatedSpend)} ₽</strong></div>
+                    <div className="abt-summary-row abt-summary-total"><span>Ориентировочный бюджет:</span><strong>{formatRub(estimatedSpend)} ₽</strong></div>
                   </div>
-                  <p className="abt-bottom-note">Нажмите «Запустить тест», чтобы начать A/B тестирование</p>
+                  <p className="abt-bottom-note">Нажмите «Запустить тест», чтобы начать фото-тестирование</p>
                 </div>
               )}
             </div>
@@ -1148,12 +1164,15 @@ export const ABTestsPage: React.FC = () => {
 
         <section className="abt-hero">
           <div className="abt-hero-main">
-            <div className="abt-hero-title"><FlaskConical size={22} /> A/B тесты главного фото</div>
+            <div className="abt-hero-title"><FlaskConical size={22} /> Фото-тесты главного фото</div>
             <p>
               Узнайте, какое фото привлекает больше покупателей.
-              Система автоматически покажет разные фото и выберет победителя по CTR.
+              Система последовательно покажет каждый вариант и определит лучший по CTR и конверсии.
             </p>
-            <button className="btn btn-primary" onClick={openWizard}><Plus size={14} /> Запустить новый тест</button>
+            <div className="mt-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+              <strong>Последовательный фото-тест:</strong> варианты оцениваются поочерёдно, а не одновременно. Результаты индикативные — время суток и сезон могут влиять.
+            </div>
+            <button className="btn btn-primary mt-3" onClick={openWizard}><Plus size={14} /> Запустить новый тест</button>
           </div>
 
           <div className="abt-hero-stats">
@@ -1191,7 +1210,7 @@ export const ABTestsPage: React.FC = () => {
             <div className="abt-empty">
               <FlaskConical size={46} />
               <h3>Нет тестов</h3>
-              <p>Создайте первый A/B тест для проверки фото</p>
+              <p>Создайте первый фото-тест для проверки фото</p>
               <button className="btn btn-primary" onClick={openWizard}><Plus size={14} /> Создать тест</button>
             </div>
           ) : (
@@ -1259,7 +1278,7 @@ export const ABTestsPage: React.FC = () => {
 
                       <div className="abt-list-metrics">
                         <div className="abt-metric"><Eye size={12} /> {formatRub(Number(item.views_per_photo || 0))} / фото</div>
-                        <div className="abt-metric"><Banknote size={12} /> {item.spend_rub ? `${formatRub(item.spend_rub)} ₽` : '—'}</div>
+                        <div className="abt-metric"><Banknote size={12} /> {item.estimated_spend_rub ? `≈ ${formatRub(item.estimated_spend_rub)} ₽` : item.spend_rub ? `${formatRub(item.spend_rub)} ₽` : '—'}</div>
                         <div className="abt-metric"><Camera size={12} /> {item.photos_count || item.photos?.length || 0} фото</div>
                       </div>
                     </div>
@@ -1280,6 +1299,34 @@ export const ABTestsPage: React.FC = () => {
 
                   {expanded ? (
                     <div className="abt-item-details">
+                      {/* Winner decision result card */}
+                      {normalizeStatus(item.status) === 'finished' && (
+                        <div className={`rounded-xl border px-4 py-3 mb-3 ${
+                          item.winner_decision === 'winner_found' ? 'border-emerald-200 bg-emerald-50' :
+                          item.winner_decision === 'no_clear_winner' ? 'border-amber-200 bg-amber-50' :
+                          item.winner_decision === 'insufficient_data' ? 'border-sky-200 bg-sky-50' :
+                          item.winner_decision === 'test_interrupted' ? 'border-rose-200 bg-rose-50' :
+                          'border-slate-200 bg-slate-50'
+                        }`}>
+                          <div className="flex items-center gap-2 text-sm font-semibold">
+                            {item.winner_decision === 'winner_found' && <><Trophy size={14} className="text-emerald-600" /> Победитель найден</>}
+                            {item.winner_decision === 'no_clear_winner' && <><AlertCircle size={14} className="text-amber-600" /> Нет явного победителя</>}
+                            {item.winner_decision === 'insufficient_data' && <><Info size={14} className="text-sky-600" /> Недостаточно данных</>}
+                            {item.winner_decision === 'test_interrupted' && <><XCircle size={14} className="text-rose-600" /> Тест прерван</>}
+                            {!item.winner_decision && normalizeStatus(item.status) === 'finished' && <><CheckCircle2 size={14} /> Тест завершён</>}
+                          </div>
+                          <p className="mt-1 text-xs text-slate-600">
+                            {item.winner_decision === 'winner_found' && 'Лучший вариант определён на основе CTR и конверсии.'}
+                            {item.winner_decision === 'no_clear_winner' && 'Результаты слишком близки — разница между вариантами не существенна.'}
+                            {item.winner_decision === 'insufficient_data' && 'Собранных данных недостаточно для уверенного вывода.'}
+                            {item.winner_decision === 'test_interrupted' && 'Тест был остановлен до достижения необходимого количества показов.'}
+                          </p>
+                          {(item.estimated_spend_rub || item.spend_rub) && (
+                            <p className="mt-1 text-xs text-slate-500">Ориентировочный расход: ≈ {formatRub(item.estimated_spend_rub || item.spend_rub || 0)} ₽</p>
+                          )}
+                        </div>
+                      )}
+
                       {item.current_photo_order != null ? <p>Текущее фото: <strong>#{item.current_photo_order}</strong></p> : null}
                       {item.last_error ? <p className="abt-error">Ошибка: {item.last_error}</p> : null}
                       {normalizeStatus(item.status) === 'pending' && item.last_error ? (
@@ -1319,12 +1366,26 @@ export const ABTestsPage: React.FC = () => {
 
                       {item.photos && item.photos.length > 0 ? (
                         <div className="abt-item-photos">
-                          {item.photos.map((p, idx) => (
-                            <div key={idx} className="abt-item-photo">
-                              <img src={normalizeAssetUrl(p.wb_url || p.file_url)} alt={`Фото ${p.order}`} />
-                              <span>#{p.order}</span>
-                            </div>
-                          ))}
+                          {item.photos.map((p, idx) => {
+                            const hasScore = p.winner_score !== undefined && p.winner_score !== null;
+                            return (
+                              <div key={idx} className="abt-item-photo">
+                                <img src={normalizeAssetUrl(p.wb_url || p.file_url)} alt={`Фото ${p.order}`} />
+                                <span>#{p.order}</span>
+                                {hasScore && (
+                                  <div className="mt-1 text-[10px] leading-tight text-slate-600">
+                                    <div>Оценка: <strong>{(p.winner_score! * 100).toFixed(0)}%</strong></div>
+                                    {p.winner_score_confidence !== undefined && (
+                                      <div>Уверенность: {(p.winner_score_confidence! * 100).toFixed(0)}%</div>
+                                    )}
+                                    {p.winner_score_reason && (
+                                      <div className="italic">{p.winner_score_reason}</div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
                       ) : null}
                     </div>

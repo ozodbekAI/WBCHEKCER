@@ -528,7 +528,9 @@ export interface TeamWorklog {
 }
 
 // ==================== Ad Analysis / SKU Economics ====================
-export type AdAnalysisSourceMode =
+
+// --- Enums ---
+export type SourceMode =
   | 'automatic'
   | 'manual'
   | 'partial'
@@ -537,52 +539,94 @@ export type AdAnalysisSourceMode =
   | 'pending'
   | 'running'
   | 'missing';
+
+/** @deprecated Use SourceMode instead. Kept for backward compat in some UI maps. */
+export type AdAnalysisSourceMode = SourceMode | 'ok' | 'error' | 'empty';
+
+export type SourceLineageMode = 'automatic' | 'manual' | 'partial' | 'failed';
+/** @deprecated Use SourceLineageMode */
+export type AdAnalysisLineageMode = SourceLineageMode;
+
 export type AdAnalysisItemStatus = 'stop' | 'rescue' | 'control' | 'grow' | 'low_data';
 export type AdAnalysisDiagnosis = 'traffic' | 'card' | 'economics' | 'data';
 export type AdAnalysisPrecision = 'exact' | 'estimated' | 'manual' | 'mixed' | 'unallocated';
+export type AdAnalysisAlertLevel = 'info' | 'warning' | 'error' | 'success';
 export type AdAnalysisPriority = 'critical' | 'high' | 'medium' | 'low';
-export type AdAnalysisTrendSignal = 'worsening' | 'improving' | 'stable' | 'volatile' | 'new' | 'no_history';
+export type AdAnalysisTrendSignal =
+  | 'worsening'
+  | 'improving'
+  | 'stable'
+  | 'volatile'
+  | 'new'
+  | 'no_history';
+
+export type AdCostConfidence = 'high' | 'medium' | 'low';
+export type AdAnalysisDecisionLabel = 'ready' | 'preliminary' | 'blocked';
+export type MetricLineage = 'finance' | 'manual_finance' | 'funnel' | 'advert' | 'missing';
+
+export type BootstrapStatus =
+  | 'idle'
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'completed_partial'
+  | 'failed';
+
+export type BootstrapStage =
+  | 'queued'
+  | 'fetching_advert'
+  | 'fetching_finance'
+  | 'fetching_funnel'
+  | 'building_snapshot'
+  | 'completed_partial'
+  | 'completed'
+  | 'failed';
+
+/** @deprecated Use BootstrapStage */
+export type AdAnalysisBootstrapStage = BootstrapStage;
+
+// --- Core interfaces ---
 
 export interface AdAnalysisSourceStatus {
   id: string;
   label: string;
-  mode: AdAnalysisSourceMode;
-  detail: string | null;
+  mode: SourceMode;
+  detail?: string | null;
   records: number;
   automatic: boolean;
   synced_at?: string | null;
-  coverage_ratio?: number;
+  coverage_ratio: number;
   coverage_start?: string | null;
   coverage_end?: string | null;
   expected_start?: string | null;
   expected_end?: string | null;
-  blocked?: boolean;
+  blocked: boolean;
 }
 
 export interface AdAnalysisSourceLineage {
-  advert: 'automatic' | 'manual' | 'partial' | 'failed';
-  finance: 'automatic' | 'manual' | 'partial' | 'failed';
-  funnel: 'automatic' | 'manual' | 'partial' | 'failed';
+  advert: SourceLineageMode;
+  finance: SourceLineageMode;
+  funnel: SourceLineageMode;
 }
 
 export interface AdAnalysisAlert {
-  level: 'info' | 'warning' | 'error' | 'success';
+  level: AdAnalysisAlertLevel;
   title: string;
   description: string;
-  action: string | null;
+  action?: string | null;
 }
 
 export interface AdAnalysisBudgetMove {
-  from_nm_id: number | null;
+  from_nm_id?: number | null;
   from_title: string;
   from_amount: number;
-  to_nm_id: number | null;
+  to_nm_id?: number | null;
   to_title: string;
-  uplift_percent: number | null;
+  uplift_percent?: number | null;
 }
 
 export interface AdAnalysisCampaign {
-  advert_id: number | null;
+  advert_id?: number | null;
   title: string;
   ad_cost: number;
   ad_gmv: number;
@@ -615,7 +659,7 @@ export interface AdAnalysisMetrics {
   ad_cost_estimated: number;
   ad_cost_manual: number;
   ad_cost_source_mode: AdAnalysisPrecision;
-  ad_cost_confidence: 'high' | 'medium' | 'low';
+  ad_cost_confidence: AdCostConfidence;
   net_profit: number;
   profit_per_order: number;
   max_cpo: number;
@@ -655,14 +699,15 @@ export interface AdAnalysisTrend {
 
 export interface AdAnalysisItem {
   nm_id: number;
-  card_id: number | null;
-  title: string | null;
-  vendor_code: string | null;
-  photo_url: string | null;
-  wb_link: string | null;
-  workspace_link: string | null;
-  price: number | null;
-  card_score: number | null;
+  card_id?: number | null;
+  title?: string | null;
+  vendor_code?: string | null;
+  photo_url?: string | null;
+  wb_link?: string | null;
+  workspace_link?: string | null;
+  price?: number | null;
+  card_score?: number | null;
+
   status: AdAnalysisItemStatus;
   status_label: string;
   diagnosis: AdAnalysisDiagnosis;
@@ -675,26 +720,21 @@ export interface AdAnalysisItem {
   priority_label: string;
   precision: AdAnalysisPrecision;
   precision_label: string;
-  revenue_lineage: 'finance' | 'manual_finance' | 'funnel' | 'advert' | 'missing';
-  orders_lineage: 'finance' | 'manual_finance' | 'funnel' | 'advert' | 'missing';
+
+  revenue_lineage: MetricLineage;
+  orders_lineage: MetricLineage;
   decision_ready: boolean;
-  decision_label: 'ready' | 'preliminary' | 'blocked';
+  decision_label: AdAnalysisDecisionLabel;
+
   source_lineage: AdAnalysisSourceLineage;
   trend: AdAnalysisTrend;
   issue_summary: AdAnalysisIssueSummary;
   metrics: AdAnalysisMetrics;
+
   spend_sources: Record<string, number>;
   insights: string[];
   steps: string[];
   risk_flags: string[];
-}
-
-export interface AdAnalysisDataQuality {
-  decision_ready: boolean;
-  confidence: 'high' | 'medium' | 'low';
-  partial_sources: string[];
-  blocked_sources: string[];
-  notes: string[];
 }
 
 export interface AdAnalysisUploadNeeds {
@@ -709,36 +749,50 @@ export interface AdAnalysisUploadNeeds {
   can_upload_manual_finance: boolean;
 }
 
+export interface AdAnalysisDataQuality {
+  decision_ready: boolean;
+  confidence: AdCostConfidence;
+  partial_sources: string[];
+  blocked_sources: string[];
+  notes: string[];
+}
+
 export interface AdAnalysisOverview {
   store_id: number;
   generated_at: string;
   snapshot_ready: boolean;
   period_start: string;
   period_end: string;
-  available_period_start: string | null;
-  available_period_end: string | null;
-  previous_period_start: string | null;
-  previous_period_end: string | null;
+  available_period_start?: string | null;
+  available_period_end?: string | null;
+  previous_period_start?: string | null;
+  previous_period_end?: string | null;
   selected_preset: string;
+
   page: number;
   page_size: number;
   total_items: number;
   total_pages: number;
+
   total_skus: number;
   total_revenue: number;
   total_ad_spend: number;
   total_net_profit: number;
+
   exact_spend: number;
   estimated_spend: number;
   manual_spend: number;
   unallocated_spend: number;
+
   profitable_count: number;
   problematic_count: number;
   loss_count: number;
   worsening_count: number;
   improving_count: number;
+
   main_takeaway: string;
   status_counts: Record<string, number>;
+
   source_statuses: AdAnalysisSourceStatus[];
   source_lineage: AdAnalysisSourceLineage;
   data_quality: AdAnalysisDataQuality;
@@ -746,56 +800,101 @@ export interface AdAnalysisOverview {
   budget_moves: AdAnalysisBudgetMove[];
   campaigns: AdAnalysisCampaign[];
   upload_needs: AdAnalysisUploadNeeds;
+
   critical_preview: AdAnalysisItem[];
   growth_preview: AdAnalysisItem[];
   items: AdAnalysisItem[];
 }
 
 export interface AdAnalysisBootstrapStatus {
-  task_id: number | null;
+  task_id?: number | null;
   store_id: number;
-  status: 'idle' | 'pending' | 'running' | 'completed' | 'completed_partial' | 'failed';
+  status: BootstrapStatus;
   progress: number;
   step: string;
-  current_stage:
-    | 'queued'
-    | 'fetching_advert'
-    | 'fetching_finance'
-    | 'fetching_funnel'
-    | 'building_snapshot'
-    | 'completed_partial'
-    | 'completed'
-    | 'failed'
-    | null;
+  current_stage?: BootstrapStage | null;
   stage_progress: number;
   source_statuses: AdAnalysisSourceStatus[];
   is_partial: boolean;
-  failed_source: 'advert' | 'finance' | 'funnel' | 'snapshot' | 'unknown' | null;
+  failed_source?: 'advert' | 'finance' | 'funnel' | 'snapshot' | 'unknown' | null;
   ready: boolean;
-  error: string | null;
-  started_at: string | null;
-  completed_at: string | null;
-  period_start: string | null;
-  period_end: string | null;
+  error?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  period_start?: string | null;
+  period_end?: string | null;
 }
 
 export interface AdAnalysisUploadUnresolvedRow {
   row_number: number;
-  raw_nm_id: string | null;
-  raw_vendor_code: string | null;
-  raw_title: string | null;
+  raw_nm_id?: string | null;
+  raw_vendor_code?: string | null;
+  raw_title?: string | null;
 }
 
 export interface AdAnalysisUploadResult {
   imported: number;
   updated: number;
   file_name: string;
-  period_start: string | null;
-  period_end: string | null;
+  period_start?: string | null;
+  period_end?: string | null;
   notes: string[];
   detected_headers: string[];
   matched_fields: Record<string, string>;
   resolved_by_vendor_code: number;
   unresolved_count: number;
   unresolved_preview: AdAnalysisUploadUnresolvedRow[];
+}
+
+// ==================== Promotion / Photo Test (audit updates) ====================
+export type PromotionWinnerDecision =
+  | 'winner_found'
+  | 'no_clear_winner'
+  | 'insufficient_data'
+  | 'test_interrupted';
+
+export interface PromotionPhotoScore {
+  winner_score?: number;
+  winner_score_confidence?: number;
+  winner_score_conversion_source?: string;
+  winner_score_reason?: string;
+}
+
+export interface PromotionCompanyDecision {
+  winner_decision?: PromotionWinnerDecision;
+  estimated_spend_rub?: number;
+}
+
+// ==================== Photo Error (audit) ====================
+export interface PhotoErrorDetail {
+  code: string;
+  message: string;
+  retryable: boolean;
+  category: string;
+  http_status?: number;
+  context?: string;
+}
+
+// ==================== Media Verification (audit) ====================
+export interface MediaVerificationSummary {
+  requested_order: string[];
+  actual_order: string[];
+  matched: boolean;
+  missing_urls: string[];
+  unexpected_urls: string[];
+  stabilized?: boolean;
+}
+
+export interface MediaApplySnapshot {
+  operation_id: string;
+  source: string;
+  card_id: number;
+  nm_id: number;
+  created_at: string;
+  before_snapshot: string[];
+  requested_after_snapshot: string[];
+  actual_after_snapshot: string[];
+  matched: boolean;
+  stabilized: boolean;
+  verification: MediaVerificationSummary;
 }

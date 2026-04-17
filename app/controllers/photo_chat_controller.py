@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Awaitable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -148,6 +150,16 @@ def _user_id(user: Any) -> Optional[int]:
 def _sse(data: Dict[str, Any]) -> str:
     payload = json.dumps(data or {}, ensure_ascii=False)
     return f"event: message\ndata: {payload}\n\n"
+
+
+def _short_payload(value: Any, *, max_len: int = 500) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(value)
+    if len(text) <= max_len:
+        return text
+    return f"{text[:max_len]}...(+{len(text) - max_len} chars)"
 
 
 def _normalize_base_url(base_url: str | None = None) -> str | None:
@@ -717,6 +729,53 @@ class PhotoChatController:
         assets = [self._asset_to_planner_asset(media_map[asset_id], base_url=base_url) for asset_id in ordered_asset_ids]
         return hist, assets, context_state
 
+    async def _await_kie_with_progress(
+        self,
+        *,
+        state: StreamState,
+        action: str,
+        request_coro: Awaitable[dict],
+        result_holder: Dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        poll_interval = max(1, int(settings.KIE_POLL_INTERVAL_SECONDS or 10))
+        attempt = 0
+        task = asyncio.create_task(request_coro)
+        logger.info(
+            "quick_action awaiting KIE result | request=%s action=%s",
+            state.request_id,
+            action,
+        )
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {task},
+                    timeout=poll_interval,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if task in done:
+                    result_holder["result"] = await task
+                    return
+
+                attempt += 1
+                logger.info(
+                    "quick_action still waiting for KIE result | request=%s action=%s attempt=%s",
+                    state.request_id,
+                    action,
+                    attempt,
+                )
+                yield self._emit(
+                    state,
+                    "image_started",
+                    index=attempt,
+                    total=0,
+                    prompt="Обработка на стороне KIE продолжается",
+                )
+        finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
     async def _handle_quick_action(
         self,
         *,
@@ -730,7 +789,21 @@ class PhotoChatController:
         asset_ids: list[int],
         quick_action: Dict[str, Any],
     ) -> AsyncGenerator[str, None]:
-        action_type = (quick_action.get("type") or quick_action.get("action") or "").strip()
+        action_type = (quick_action.get("type") or quick_action.get("action") or "").strip().lower().replace("_", "-")
+        action_aliases = {
+            "create_video": "generate-video",
+            "create-video": "generate-video",
+            "change-background": "change-background",
+            "change-pose": "change-pose",
+            "put-on-model": "put-on-model",
+            "enhance": "enhance",
+            "normalize-own-model": "normalize-own-model",
+            "custom-generation": "custom-generation",
+            "generate-video": "generate-video",
+        }
+        action_type = action_aliases.get(action_type, action_type)
+        if action_type == "create-video":
+            action_type = "generate-video"
         response_locale = self._response_locale(
             user_message=message,
             thread_context=state.context_state,
@@ -820,6 +893,22 @@ class PhotoChatController:
             return
 
         src_url = get_file_url(src_media.relpath, base_url=state.base_url)
+        logger.info(
+            "quick_action resolved source | action=%s request=%s user=%s thread=%s asset=%s relpath=%s src_url=%s",
+            action_type,
+            state.request_id,
+            user_id,
+            state.thread_id,
+            src_media.id,
+            src_media.relpath,
+            src_url,
+        )
+
+        def _short(v: Any, max_len: int = 240) -> str:
+            text = str(v) if v is not None else ""
+            if len(text) <= max_len:
+                return text
+            return f"{text[:max_len]}...(+{len(text) - max_len} chars)"
 
         async def _persist_and_emit(
             out_bytes: bytes,
@@ -923,11 +1012,34 @@ class PhotoChatController:
                 )
 
                 yield self._emit(state, "generation_start", prompt=prompt_text)
-                result = await kie_service.change_pose(src_url, pose_prompt.prompt)
+                logger.info(
+                    "quick_action call kie | request=%s user=%s action=%s payload=%s prompt=%s",
+                    state.request_id,
+                    user_id,
+                    "change_pose",
+                    quick_action,
+                    _short(prompt_id),
+                )
+                result_container: dict[str, Any] = {}
+                async for chunk in self._await_kie_with_progress(
+                    state=state,
+                    action="change_pose",
+                    request_coro=kie_service.change_pose(src_url, pose_prompt.prompt, max_attempts=0),
+                    result_holder=result_container,
+                ):
+                    yield chunk
+                result = result_container.get("result", {})
                 out_bytes = result.get("image")
                 if not out_bytes:
                     yield _emit_error("No image in result")
                     return
+                logger.info(
+                    "quick_action result from KIE | request=%s action=%s user=%s bytes=%s",
+                    state.request_id,
+                    "change_pose",
+                    user_id,
+                    len(out_bytes),
+                )
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
                     yield chunk
@@ -962,11 +1074,34 @@ class PhotoChatController:
                 ) or self._text("change_background", locale=response_locale)
 
                 yield self._emit(state, "generation_start", prompt=prompt_text)
-                result = await kie_service.change_scene(src_url, full_prompt)
+                logger.info(
+                    "quick_action call kie | request=%s user=%s action=%s prompt=%s src=%s",
+                    state.request_id,
+                    user_id,
+                    "change-background",
+                    _short(full_prompt),
+                    src_url,
+                )
+                result_container = {}
+                async for chunk in self._await_kie_with_progress(
+                    state=state,
+                    action="change-background",
+                    request_coro=kie_service.change_scene(src_url, full_prompt, max_attempts=0),
+                    result_holder=result_container,
+                ):
+                    yield chunk
+                result = result_container.get("result", {})
                 out_bytes = result.get("image")
                 if not out_bytes:
                     yield _emit_error("No image in result")
                     return
+                logger.info(
+                    "quick_action result from KIE | request=%s action=%s user=%s bytes=%s",
+                    state.request_id,
+                    "change-background",
+                    user_id,
+                    len(out_bytes),
+                )
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
                     yield chunk
@@ -995,16 +1130,41 @@ class PhotoChatController:
                     return
 
                 yield self._emit(state, "generation_start", prompt=self._text("put_on_model", locale=response_locale))
-                result = await kie_service.normalize_new_model(
-                    item_image_url=src_url,
-                    model_prompt=final_prompt,
-                    ghost_prompt_override=None,
-                    new_model_prompt_override=new_model_prompt or None,
+                logger.info(
+                    "quick_action call kie | request=%s user=%s action=%s prompt_type=%s final_prompt=%s src=%s",
+                    state.request_id,
+                    user_id,
+                    "put-on-model",
+                    "model_prompt",
+                    _short(final_prompt),
+                    src_url,
                 )
+                result_container = {}
+                async for chunk in self._await_kie_with_progress(
+                    state=state,
+                    action="put-on-model",
+                    request_coro=kie_service.normalize_new_model(
+                        item_image_url=src_url,
+                        model_prompt=final_prompt,
+                        ghost_prompt_override=None,
+                        new_model_prompt_override=new_model_prompt or None,
+                        max_attempts=0,
+                    ),
+                    result_holder=result_container,
+                ):
+                    yield chunk
+                result = result_container.get("result", {})
                 out_bytes = result.get("image")
                 if not out_bytes:
                     yield _emit_error("No image in result")
                     return
+                logger.info(
+                    "quick_action result from KIE | request=%s action=%s user=%s bytes=%s",
+                    state.request_id,
+                    "put-on-model",
+                    user_id,
+                    len(out_bytes),
+                )
 
                 async for chunk in _persist_and_emit(out_bytes, final_prompt):
                     yield chunk
@@ -1017,11 +1177,34 @@ class PhotoChatController:
                 prompt_text = self._text("enhance_quality", locale=response_locale)
 
                 yield self._emit(state, "generation_start", prompt=prompt_text)
-                result = await kie_service.enhance_photo(src_url, level)
+                logger.info(
+                    "quick_action call kie | request=%s user=%s action=%s level=%s src=%s",
+                    state.request_id,
+                    user_id,
+                    "enhance",
+                    level,
+                    src_url,
+                )
+                result_container = {}
+                async for chunk in self._await_kie_with_progress(
+                    state=state,
+                    action="enhance",
+                    request_coro=kie_service.enhance_photo(src_url, level, max_attempts=0),
+                    result_holder=result_container,
+                ):
+                    yield chunk
+                result = result_container.get("result", {})
                 out_bytes = result.get("image")
                 if not out_bytes:
                     yield _emit_error("No image in result")
                     return
+                logger.info(
+                    "quick_action result from KIE | request=%s action=%s user=%s bytes=%s",
+                    state.request_id,
+                    "enhance",
+                    user_id,
+                    len(out_bytes),
+                )
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
                     yield chunk
@@ -1060,14 +1243,38 @@ class PhotoChatController:
                 prompt_text = self._text("normalize_own_model", locale=response_locale)
 
                 yield self._emit(state, "generation_start", prompt=prompt_text)
-                result = await kie_service.normalize_own_model(
-                    item_image_url=garment_url,
-                    model_image_url=model_url,
+                logger.info(
+                    "quick_action call kie | request=%s user=%s action=%s garment=%s model=%s",
+                    state.request_id,
+                    user_id,
+                    "normalize-own-model",
+                    garment_url,
+                    model_url,
                 )
+                result_container = {}
+                async for chunk in self._await_kie_with_progress(
+                    state=state,
+                    action="normalize-own-model",
+                    request_coro=kie_service.normalize_own_model(
+                        item_image_url=garment_url,
+                        model_image_url=model_url,
+                        max_attempts=0,
+                    ),
+                    result_holder=result_container,
+                ):
+                    yield chunk
+                result = result_container.get("result", {})
                 out_bytes = result.get("image")
                 if not out_bytes:
                     yield _emit_error("No image in result")
                     return
+                logger.info(
+                    "quick_action result from KIE | request=%s action=%s user=%s bytes=%s",
+                    state.request_id,
+                    "normalize-own-model",
+                    user_id,
+                    len(out_bytes),
+                )
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
                     yield chunk
@@ -1081,11 +1288,34 @@ class PhotoChatController:
                 prompt_text = custom_prompt[:100]
 
                 yield self._emit(state, "generation_start", prompt=prompt_text)
-                result = await kie_service.custom_generation(src_url, custom_prompt)
+                logger.info(
+                    "quick_action call kie | request=%s user=%s action=%s prompt=%s src=%s",
+                    state.request_id,
+                    user_id,
+                    "custom-generation",
+                    _short(custom_prompt),
+                    src_url,
+                )
+                result_container = {}
+                async for chunk in self._await_kie_with_progress(
+                    state=state,
+                    action="custom-generation",
+                    request_coro=kie_service.custom_generation(src_url, custom_prompt, max_attempts=0),
+                    result_holder=result_container,
+                ):
+                    yield chunk
+                result = result_container.get("result", {})
                 out_bytes = result.get("image")
                 if not out_bytes:
                     yield _emit_error("No image in result")
                     return
+                logger.info(
+                    "quick_action result from KIE | request=%s action=%s user=%s bytes=%s",
+                    state.request_id,
+                    "custom-generation",
+                    user_id,
+                    len(out_bytes),
+                )
 
                 async for chunk in _persist_and_emit(out_bytes, prompt_text):
                     yield chunk
@@ -1099,17 +1329,44 @@ class PhotoChatController:
                 prompt_text = self._text("video_generation", locale=response_locale)
 
                 yield self._emit(state, "generation_start", prompt=prompt_text)
-                result = await kie_service.generate_video(
-                    image_url=src_url,
-                    prompt=video_prompt,
-                    model=video_model,
-                    duration=video_duration,
-                    resolution=video_resolution,
+                logger.info(
+                    "quick_action call kie | request=%s user=%s action=%s video_model=%s duration=%s resolution=%s prompt=%s src=%s",
+                    state.request_id,
+                    user_id,
+                    "generate-video",
+                    video_model,
+                    video_duration,
+                    video_resolution,
+                    _short(video_prompt),
+                    src_url,
                 )
+                result_container = {}
+                async for chunk in self._await_kie_with_progress(
+                    state=state,
+                    action="generate-video",
+                    request_coro=kie_service.generate_video(
+                        image_url=src_url,
+                        prompt=video_prompt,
+                        model=video_model,
+                        duration=video_duration,
+                        resolution=video_resolution,
+                        max_attempts=0,
+                    ),
+                    result_holder=result_container,
+                ):
+                    yield chunk
+                result = result_holder.get("result", {})
                 out_bytes = result.get("video") or result.get("image")
                 if not out_bytes:
                     yield _emit_error("No video in result")
                     return
+                logger.info(
+                    "quick_action result from KIE | request=%s action=%s user=%s bytes=%s",
+                    state.request_id,
+                    "generate-video",
+                    user_id,
+                    len(out_bytes),
+                )
 
                 async for chunk in _persist_and_emit(out_bytes, video_prompt, media_type="video"):
                     yield chunk
@@ -1268,6 +1525,18 @@ class PhotoChatController:
         request_id = str((payload.get("request_id") or "").strip() or uuid.uuid4().hex)
         requested_thread_id = _coerce_int(payload.get("thread_id"))
         uid = _user_id(user)
+        incoming_asset_ids_raw = payload.get("asset_ids") or []
+        quick_action = payload.get("quick_action")
+        logger.info(
+            "chat_stream request received | request=%s user=%s thread=%s message_len=%s quick_action=%s asset_ids=%s photo_urls=%s",
+            request_id,
+            uid,
+            requested_thread_id,
+            len(str(payload.get("message") or "")),
+            _short_payload(quick_action),
+            incoming_asset_ids_raw if isinstance(incoming_asset_ids_raw, list) else [incoming_asset_ids_raw],
+            payload.get("photo_urls") or payload.get("photo_url"),
+        )
 
         if uid is None:
             mapped = map_photo_error("Unauthorized", context="chat_stream")
@@ -1306,6 +1575,14 @@ class PhotoChatController:
             base_url=base_url,
             context_state=repo.get_thread_context(thread.id),
         )
+        # Persist locale preference at the thread level when provided by the client.
+        incoming_locale = str(payload.get("locale") or "").strip()
+        if incoming_locale:
+            try:
+                self._update_context_state(repo, state, locale=incoming_locale)
+            except Exception:
+                # Locale is best-effort and must not break streaming.
+                pass
 
         msg_count = self._thread_message_count(repo, thread.id)
         if _is_chat_locked(msg_count):
@@ -1325,7 +1602,6 @@ class PhotoChatController:
         message = str(payload.get("message") or "").strip()
         client_session_id = str(int(uid))
 
-        incoming_asset_ids_raw = payload.get("asset_ids") or []
         if not isinstance(incoming_asset_ids_raw, list):
             incoming_asset_ids_raw = [incoming_asset_ids_raw]
         incoming_asset_ids: list[int] = []
@@ -1501,7 +1777,23 @@ class PhotoChatController:
             yield self._emit(state, "ack", user_message_id=user_msg.id)
 
         quick_action = payload.get("quick_action")
+        if quick_action is not None and not isinstance(quick_action, dict):
+            logger.warning(
+                "chat_stream: quick_action has unexpected type | request=%s user=%s type=%s value=%s",
+                request_id,
+                uid,
+                type(quick_action).__name__,
+                _short_payload(quick_action),
+            )
+
         if isinstance(quick_action, dict) and (quick_action.get("type") or quick_action.get("action")):
+            logger.info(
+                "chat_stream dispatching to quick_action | request=%s user=%s action=%s keys=%s",
+                request_id,
+                uid,
+                (quick_action.get("type") or quick_action.get("action")),
+                sorted([str(key) for key in quick_action.keys()]),
+            )
             async for chunk in self._handle_quick_action(
                 user_id=uid,
                 client_session_id=client_session_id,
@@ -1515,6 +1807,13 @@ class PhotoChatController:
             ):
                 yield chunk
             return
+
+        logger.info(
+            "chat_stream planner path used | request=%s user=%s quick_action=%s",
+            request_id,
+            uid,
+            _short_payload(quick_action),
+        )
 
         history, assets, context_state = await self._build_planner_context(
             repo,
@@ -1651,7 +1950,6 @@ class PhotoChatController:
         yield self._emit(state, "images_start", total=image_count)
 
         enhanced_prompt = self._strip_multi_words(enhanced_prompt)
-        poses = self._pose_variants(image_count)
         generated_asset_ids: List[int] = []
 
         for index in range(image_count):
@@ -1659,7 +1957,9 @@ class PhotoChatController:
 
             per_image_prompt = self._make_single_image_prompt(
                 base_prompt=enhanced_prompt,
-                pose_text=poses[index],
+                # Never force pose/framing. Follow-up edits must keep the original composition unless
+                # the user explicitly asked for pose/framing changes.
+                pose_text="",
             )
 
             def _emit_stream_error(raw_error: Any) -> str:
@@ -1705,7 +2005,6 @@ class PhotoChatController:
             url = get_file_url(rel, base_url=base_url)
 
             gen_meta = {"source_asset_ids": selected_ids} if selected_ids else {}
-            gen_meta["pose_variant"] = poses[index]
             gen_meta["prompt_used"] = per_image_prompt
 
             try:
@@ -1752,7 +2051,6 @@ class PhotoChatController:
                         "seq": gen_media.seq,
                         "prompt": plan.image_prompt or message,
                         "prompt_used": per_image_prompt,
-                        "pose_variant": poses[index],
                         **(gen_meta or {}),
                     },
                 )
