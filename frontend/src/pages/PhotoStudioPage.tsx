@@ -1040,8 +1040,8 @@ export default function PhotoStudioPage() {
                 }
                 else if (d.type === 'images_start') {
                   sawGenerationStart = true;
-                  botContent = '';
-                  addOrUpdateBot('action-progress', true);
+                  // Keep the typing indicator visible until the server confirms
+                  // that image rendering has actually started.
                 }
                 else if (d.type === 'image_started') {
                   sawGenerationStart = true;
