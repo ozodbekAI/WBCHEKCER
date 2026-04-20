@@ -218,13 +218,17 @@ async def chat_stream(
 ):
     quick_action = payload.quick_action
     logger.info(
-        "photo chat stream endpoint called | user=%s request_id=%s thread=%s quick_action=%s photo_urls=%s asset_ids=%s",
+        "photo chat stream endpoint called | user=%s request_id=%s thread=%s quick_action=%s photo_urls=%s asset_ids=%s planner_model=%s generation_model=%s profile=%s allow_quality_fallback=%s",
         getattr(current_user, "id", None) if not isinstance(current_user, dict) else current_user.get("id") or current_user.get("user_id"),
         payload.request_id,
         payload.thread_id,
         bool(quick_action),
         payload.photo_urls or payload.photo_url,
         payload.asset_ids,
+        payload.planner_model,
+        payload.generation_model,
+        payload.model_profile,
+        payload.allow_quality_fallback,
     )
 
     controller = PhotoChatController()

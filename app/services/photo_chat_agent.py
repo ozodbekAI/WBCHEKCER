@@ -82,6 +82,99 @@ _UZ_LATIN_HINTS = (
 
 _SYSTEM_PLACEHOLDER_RE = re.compile(r"^\[user sent \d+ image\(s\) without text", flags=re.IGNORECASE)
 
+_MODEL_PROFILE_ALIASES = {
+    "fast": "fast",
+    "lite": "fast",
+    "smart": "smart",
+    "default": "smart",
+    "quality": "quality",
+    "best": "quality",
+    "pro": "quality",
+}
+
+_FAST_TEXT_MODEL = "gemini-3.1-flash-lite-preview"
+_SMART_TEXT_MODEL = "gemini-3.1-pro-preview"
+_QUALITY_TEXT_MODEL = "gemini-3.1-pro-preview"
+_FAST_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
+_SMART_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
+_QUALITY_IMAGE_MODEL = "gemini-3-pro-image-preview"
+
+_IMAGE_EDIT_HINTS = (
+    "shu rasm",
+    "shu surat",
+    "fonni almashtir",
+    "fonini almashtir",
+    "oq fon",
+    "oq background",
+    "kiydir",
+    "birlashtir",
+    "video qil",
+    "rasmni yaxshila",
+    "фон",
+    "переодень",
+    "надень",
+    "с первого фото",
+    "со второго фото",
+    "объедини",
+    "улучши",
+    "remove background",
+    "change background",
+    "background",
+    "put on model",
+    "enhance",
+    "edit",
+    "merge",
+    "combine",
+    "swap",
+    "replace",
+    "make it brighter",
+    "same but",
+    "use the last result",
+)
+
+_FOLLOWUP_IMAGE_HINTS = (
+    "make it",
+    "same but",
+    "change it",
+    "use the last result",
+    "last result",
+    "last one",
+    "fix it",
+    "edit it",
+    "uni",
+    "shuni",
+    "o'shani",
+    "это",
+    "его",
+    "ее",
+)
+
+_MULTI_IMAGE_HINTS = (
+    "image 1",
+    "image 2",
+    "photo 1",
+    "photo 2",
+    "first photo",
+    "second photo",
+    "1-rasm",
+    "2-rasm",
+    "birinchi rasm",
+    "ikkinchi rasm",
+    "2 ta rasm",
+    "ikki rasm",
+    "2 фото",
+    "two images",
+    "two photos",
+    "both images",
+    "both photos",
+    "с первого фото",
+    "со второго фото",
+    "combine",
+    "merge",
+    "swap",
+    "put the",
+)
+
 
 def _normalize_asset_refs(text: str, selected_asset_ids: List[int]) -> str:
     if not text or not selected_asset_ids:
@@ -177,6 +270,156 @@ def _default_clarifying_question(locale: str) -> str:
     return _DEFAULT_CLARIFYING_QUESTION.get(normalized, _DEFAULT_CLARIFYING_QUESTION["en"])
 
 
+def _normalize_model_profile(value: Any) -> Optional[str]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    return _MODEL_PROFILE_ALIASES.get(raw)
+
+
+def _normalize_requested_model(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    return raw or None
+
+
+def _trimmed_text(value: Any, *, limit: int = 240) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].strip()
+
+
+def _lowered_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _has_any_hint(text: str, hints: Tuple[str, ...]) -> bool:
+    lowered = _lowered_text(text)
+    return bool(lowered and any(hint in lowered for hint in hints))
+
+
+def _working_asset_count(
+    assets: Optional[List[Dict[str, Any]]],
+    recent_image_bytes: Optional[List[Tuple[int, bytes, str]]],
+    thread_context: Optional[Dict[str, Any]],
+) -> int:
+    explicit_assets = len(assets or [])
+    recent_assets = len(recent_image_bytes or [])
+    working_assets = len((thread_context or {}).get("working_asset_ids") or [])
+    generated_asset = 1 if (thread_context or {}).get("last_generated_asset_id") else 0
+    return max(explicit_assets, recent_assets, working_assets, generated_asset)
+
+
+def _actual_model_from_response(resp: Dict[str, Any], fallback: str) -> str:
+    return str(resp.get("modelVersion") or fallback or "").strip() or fallback
+
+
+def _normalize_planner_assets(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    compact: List[Dict[str, Any]] = []
+    for asset in assets:
+        compact.append(
+            {
+                "asset_id": asset.get("asset_id"),
+                "seq": asset.get("seq"),
+                "kind": asset.get("kind"),
+                "source": asset.get("source"),
+                "caption": _trimmed_text(asset.get("caption") or asset.get("prompt"), limit=160),
+            }
+        )
+    return compact
+
+
+def _normalize_planner_history(history: List[Dict[str, Any]], *, limit: int = 6) -> List[Dict[str, Any]]:
+    relevant = [
+        {
+            "role": item.get("role"),
+            "text": _trimmed_text(item.get("text"), limit=400),
+            "asset_ids": item.get("asset_ids") or None,
+        }
+        for item in history
+        if _trimmed_text(item.get("text"), limit=400) or item.get("asset_ids")
+    ]
+    return relevant[-limit:]
+
+
+def _normalize_thread_context_for_planner(thread_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    ctx = dict(thread_context or {})
+    return {
+        "last_generated_asset_id": ctx.get("last_generated_asset_id"),
+        "working_asset_ids": list(ctx.get("working_asset_ids") or [])[:4],
+        "pending_question": _trimmed_text(ctx.get("pending_question"), limit=240) or None,
+        "last_action": ctx.get("last_action"),
+        "locale": ctx.get("locale"),
+    }
+
+
+def _parse_planner_response_dict(raw: str, *, response_locale: str) -> Dict[str, Any]:
+    if not raw:
+        raise GeminiApiError("Planner returned empty response")
+
+    try:
+        plan = json.loads(raw)
+    except Exception:
+        cleaned = raw.strip().strip("`").replace("```json", "").replace("```", "").strip()
+        plan = json.loads(cleaned)
+
+    if not isinstance(plan, dict):
+        raise GeminiApiError("Planner returned an invalid JSON object")
+
+    intent = str(plan.get("intent") or "chat").strip().lower()
+    if intent not in {"chat", "question", "edit_image", "generate_image"}:
+        intent = "chat"
+
+    assistant_message = str(plan.get("assistant_message") or "").strip()
+    raw_prompt = plan.get("image_prompt")
+    image_prompt = str(raw_prompt).strip() if isinstance(raw_prompt, str) else None
+    image_prompt = image_prompt or None
+
+    raw_selected_ids = plan.get("selected_asset_ids")
+    selected_asset_ids: List[int] | None = None
+    if isinstance(raw_selected_ids, list):
+        normalized_ids: List[int] = []
+        seen_ids: set[int] = set()
+        for item in raw_selected_ids:
+            try:
+                asset_id = int(item)
+            except (TypeError, ValueError):
+                continue
+            if asset_id in seen_ids:
+                continue
+            seen_ids.add(asset_id)
+            normalized_ids.append(asset_id)
+        selected_asset_ids = normalized_ids or None
+
+    raw_image_count = plan.get("image_count")
+    image_count: Optional[int]
+    try:
+        image_count = int(raw_image_count) if raw_image_count is not None else None
+    except (TypeError, ValueError):
+        image_count = None
+    if image_count is not None:
+        image_count = max(1, min(image_count, 4))
+
+    raw_aspect_ratio = plan.get("aspect_ratio")
+    aspect_ratio = str(raw_aspect_ratio).strip() if raw_aspect_ratio is not None else None
+    aspect_ratio = aspect_ratio or None
+
+    if intent in {"edit_image", "generate_image"} and not image_prompt:
+        intent = "question"
+        assistant_message = assistant_message or _default_clarifying_question(response_locale)
+
+    if intent == "question" and not assistant_message:
+        assistant_message = _default_clarifying_question(response_locale)
+
+    return {
+        "intent": intent,
+        "assistant_message": assistant_message,
+        "selected_asset_ids": selected_asset_ids,
+        "image_prompt": image_prompt,
+        "image_count": image_count,
+        "aspect_ratio": aspect_ratio,
+    }
+
 
 def _truncate(s: str, n: int = 900) -> str:
     s = s or ""
@@ -238,6 +481,178 @@ class PhotoChatAgent:
         await self.api.aclose()
 
     @staticmethod
+    def _normalize_service_tier(value: Any) -> Optional[str]:
+        raw = str(value or "").strip().lower()
+        if raw in {"standard", "flex", "priority"}:
+            return raw
+        return None
+
+    @staticmethod
+    def _is_gemini_3_model(model: Optional[str]) -> bool:
+        return str(model or "").strip().lower().startswith("gemini-3")
+
+    @staticmethod
+    def _gemini_3_generation_config(
+        *,
+        thinking_level: Optional[str] = None,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        config = {k: v for k, v in extra.items() if v is not None}
+        level = str(thinking_level or "").strip().lower()
+        if level in {"minimal", "low", "medium", "high"}:
+            config["thinkingConfig"] = {"thinkingLevel": level}
+        return config
+
+    @staticmethod
+    def _allowed_text_models() -> set[str]:
+        return {
+            _normalize_requested_model(settings.GEMINI_TEXT_MODEL) or "",
+            _normalize_requested_model(settings.GEMINI_TEXT_MODEL_FALLBACK) or "",
+            _FAST_TEXT_MODEL,
+            _SMART_TEXT_MODEL,
+            _QUALITY_TEXT_MODEL,
+            "gemini-3-flash-preview",
+            "gemini-2.5-flash",
+        }
+
+    @staticmethod
+    def _allowed_vision_models() -> set[str]:
+        return {
+            _normalize_requested_model(settings.GEMINI_VISION_MODEL) or "",
+            _normalize_requested_model(settings.GEMINI_VISION_MODEL_FALLBACK) or "",
+            _FAST_TEXT_MODEL,
+            _SMART_TEXT_MODEL,
+            _QUALITY_TEXT_MODEL,
+            "gemini-3-flash-preview",
+            "gemini-2.5-flash",
+        }
+
+    @staticmethod
+    def _allowed_image_models() -> set[str]:
+        return {
+            _normalize_requested_model(settings.GEMINI_IMAGE_MODEL) or "",
+            _normalize_requested_model(settings.GEMINI_IMAGE_MODEL_FALLBACK) or "",
+            _FAST_IMAGE_MODEL,
+            _SMART_IMAGE_MODEL,
+            _QUALITY_IMAGE_MODEL,
+            "gemini-2.5-flash-image",
+        }
+
+    def _resolve_text_model(self, requested_model: Optional[str], model_profile: Optional[str]) -> str:
+        normalized_profile = _normalize_model_profile(model_profile)
+        requested = _normalize_requested_model(requested_model)
+        default_model = settings.GEMINI_TEXT_MODEL
+        if normalized_profile == "fast":
+            default_model = settings.GEMINI_TEXT_MODEL_FALLBACK or _FAST_TEXT_MODEL
+        elif normalized_profile in {"smart", "quality"}:
+            default_model = settings.GEMINI_TEXT_MODEL or _SMART_TEXT_MODEL
+
+        if requested and requested in self._allowed_text_models():
+            return requested
+        if requested:
+            logger.warning("photo.chat.agent: invalid requested text model=%s profile=%s, using default=%s", requested, normalized_profile, default_model)
+        return default_model
+
+    def _resolve_vision_model(self, requested_model: Optional[str], model_profile: Optional[str]) -> str:
+        normalized_profile = _normalize_model_profile(model_profile)
+        requested = _normalize_requested_model(requested_model)
+        default_model = settings.GEMINI_VISION_MODEL
+        if normalized_profile == "fast":
+            default_model = settings.GEMINI_VISION_MODEL_FALLBACK or _FAST_TEXT_MODEL
+        elif normalized_profile in {"smart", "quality"}:
+            default_model = settings.GEMINI_VISION_MODEL or _SMART_TEXT_MODEL
+
+        if requested and requested in self._allowed_vision_models():
+            return requested
+        if requested:
+            logger.warning("photo.chat.agent: invalid requested vision model=%s profile=%s, using default=%s", requested, normalized_profile, default_model)
+        return default_model
+
+    def _resolve_image_model(self, requested_model: Optional[str], model_profile: Optional[str]) -> str:
+        normalized_profile = _normalize_model_profile(model_profile)
+        requested = _normalize_requested_model(requested_model)
+        default_model = settings.GEMINI_IMAGE_MODEL
+        if normalized_profile in {"fast", "smart"}:
+            default_model = settings.GEMINI_IMAGE_MODEL_FALLBACK or _SMART_IMAGE_MODEL
+        elif normalized_profile == "quality":
+            default_model = settings.GEMINI_IMAGE_MODEL or _QUALITY_IMAGE_MODEL
+
+        if requested and requested in self._allowed_image_models():
+            return requested
+        if requested:
+            logger.warning("photo.chat.agent: invalid requested image model=%s profile=%s, using default=%s", requested, normalized_profile, default_model)
+        return default_model
+
+    def _resolve_text_fallback_model(self, selected_model: str) -> Optional[str]:
+        fallback = _normalize_requested_model(settings.GEMINI_TEXT_MODEL_FALLBACK)
+        if not fallback or fallback == selected_model:
+            return None
+        return fallback
+
+    def _resolve_vision_fallback_model(self, selected_model: str) -> Optional[str]:
+        fallback = _normalize_requested_model(settings.GEMINI_VISION_MODEL_FALLBACK)
+        if not fallback or fallback == selected_model:
+            return None
+        return fallback
+
+    def _resolve_image_fallback_model(self, selected_model: str) -> Optional[str]:
+        fallback = _normalize_requested_model(settings.GEMINI_IMAGE_MODEL_FALLBACK)
+        if not fallback or fallback == selected_model:
+            return None
+        return fallback
+
+    def _is_explicit_multi_image_request(
+        self,
+        user_message: str,
+        assets: Optional[List[Dict[str, Any]]] = None,
+        recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,
+        thread_context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if _working_asset_count(assets, recent_image_bytes, thread_context) < 2:
+            return False
+        return _has_any_hint(user_message, _MULTI_IMAGE_HINTS)
+
+    def planner_image_limit(
+        self,
+        *,
+        user_message: str,
+        assets: Optional[List[Dict[str, Any]]] = None,
+        recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,
+        thread_context: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        return 4 if self._is_explicit_multi_image_request(user_message, assets, recent_image_bytes, thread_context) else 2
+
+    def _needs_vision_planner(
+        self,
+        user_message: str,
+        assets: Optional[List[Dict[str, Any]]],
+        recent_image_bytes: Optional[List[Tuple[int, bytes, str]]],
+        thread_context: Optional[Dict[str, Any]],
+    ) -> bool:
+        ctx = thread_context or {}
+        if assets:
+            return True
+        if recent_image_bytes:
+            return True
+        if ctx.get("working_asset_ids"):
+            return True
+        if ctx.get("last_generated_asset_id") and _has_any_hint(user_message, _FOLLOWUP_IMAGE_HINTS):
+            return True
+        if _has_any_hint(user_message, _IMAGE_EDIT_HINTS):
+            return True
+        return False
+
+    def needs_vision_planner(
+        self,
+        *,
+        user_message: str,
+        assets: Optional[List[Dict[str, Any]]] = None,
+        recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,
+        thread_context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        return self._needs_vision_planner(user_message, assets, recent_image_bytes, thread_context)
+
+    @staticmethod
     def _should_use_fallback_model(exc: Exception) -> bool:
         msg = str(exc or "")
         lowered = msg.lower()
@@ -245,10 +660,45 @@ class PhotoChatAgent:
             "404" in msg
             or "429" in msg
             or "503" in msg
+            or "timeout" in lowered
+            or "timed out" in lowered
+            or "deadline_exceeded" in lowered
             or "not found" in lowered
             or "not_found" in lowered
             or "unavailable" in lowered
             or "high demand" in lowered
+        )
+
+    @staticmethod
+    def _should_retry_same_model(exc: Exception) -> bool:
+        msg = str(exc or "")
+        lowered = msg.lower()
+        return (
+            "429" in msg
+            or "503" in msg
+            or "timeout" in lowered
+            or "timed out" in lowered
+            or "deadline_exceeded" in lowered
+            or "unavailable" in lowered
+            or "high demand" in lowered
+        )
+
+    @staticmethod
+    def _should_retry_without_service_tier(exc: Exception) -> bool:
+        msg = str(exc or "")
+        lowered = msg.lower()
+        return (
+            ("service_tier" in lowered or "service tier" in lowered or "priority" in lowered or "flex" in lowered)
+            and (
+                "400" in msg
+                or "403" in msg
+                or "invalid" in lowered
+                or "permission" in lowered
+                or "tier 2" in lowered
+                or "tier 3" in lowered
+                or "unsupported" in lowered
+                or "not available" in lowered
+            )
         )
 
     async def _generate_content_with_fallback(
@@ -258,35 +708,116 @@ class PhotoChatAgent:
         contents: List[Dict[str, Any]],
         generation_config: Optional[Dict[str, Any]] = None,
         fallback_model: Optional[str] = None,
+        service_tier: Optional[str] = None,
+        fallback_service_tier: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        fallback_timeout_s: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        fallback_max_retries: Optional[int] = None,
+        allow_quality_fallback: bool = True,
+        retry_same_model_once: bool = True,
         trace_id: str = "-",
         operation: str = "generate_content",
     ) -> Dict[str, Any]:
-        try:
-            async with self._sem:
-                return await self.api.generate_content(
-                    model=model,
-                    contents=contents,
-                    generation_config=generation_config,
-                )
-        except GeminiApiError as e:
-            fallback = (fallback_model or "").strip()
-            if not fallback or fallback == model or not self._should_use_fallback_model(e):
+        normalized_service_tier = self._normalize_service_tier(service_tier)
+        normalized_fallback_tier = self._normalize_service_tier(fallback_service_tier) or normalized_service_tier
+        attempt_count = 0
+
+        async def _call(
+            call_model: str,
+            call_service_tier: Optional[str],
+            call_timeout_s: Optional[float],
+            call_max_retries: Optional[int],
+        ) -> Dict[str, Any]:
+            nonlocal attempt_count
+            attempt_count += 1
+            t0 = time.perf_counter()
+            try:
+                async with self._sem:
+                    resp = await self.api.generate_content(
+                        model=call_model,
+                        contents=contents,
+                        generation_config=generation_config,
+                        service_tier=call_service_tier,
+                        timeout_s=call_timeout_s,
+                        max_retries=call_max_retries,
+                    )
+            except GeminiApiError as exc:
+                if call_service_tier and self._should_retry_without_service_tier(exc):
+                    logger.warning(
+                        "[%s] %s: model=%s service_tier=%s unavailable for this key, retrying with standard tier",
+                        trace_id,
+                        operation,
+                        call_model,
+                        call_service_tier,
+                    )
+                    return await _call(call_model, None, call_timeout_s, call_max_retries)
                 raise
 
+            dt = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "[%s] %s:success selected_model=%s actual_model_used=%s retry_count=%s latency_ms=%.1f",
+                trace_id,
+                operation,
+                call_model,
+                _actual_model_from_response(resp, call_model),
+                max(0, attempt_count - 1),
+                dt,
+            )
+            return resp
+
+        last_error: Optional[GeminiApiError] = None
+        try:
+            return await _call(model, normalized_service_tier, timeout_s, max_retries)
+        except GeminiApiError as exc:
+            last_error = exc
+
+        if retry_same_model_once and last_error and self._should_retry_same_model(last_error):
             logger.warning(
-                "[%s] %s: model=%s unavailable, retrying with fallback=%s",
+                "[%s] %s:retry_same_model model=%s reason=%s retry_count=%s",
+                trace_id,
+                operation,
+                model,
+                _truncate(str(last_error), 300),
+                attempt_count,
+            )
+            try:
+                return await _call(model, normalized_service_tier, timeout_s, max_retries)
+            except GeminiApiError as exc:
+                last_error = exc
+
+        fallback = (fallback_model or "").strip()
+        if not last_error or not fallback or fallback == model or not self._should_use_fallback_model(last_error):
+            raise last_error or GeminiApiError("Unknown Gemini fallback error")
+
+        if not allow_quality_fallback:
+            logger.warning(
+                "[%s] %s:fallback_blocked from=%s to=%s reason=%s allow_quality_fallback=%s",
                 trace_id,
                 operation,
                 model,
                 fallback,
+                _truncate(str(last_error), 300),
+                allow_quality_fallback,
             )
+            raise last_error
 
-        async with self._sem:
-            return await self.api.generate_content(
-                model=fallback,
-                contents=contents,
-                generation_config=generation_config,
-            )
+        logger.warning(
+            "[%s] %s:fallback from=%s to=%s reason=%s allow_quality_fallback=%s retry_count=%s",
+            trace_id,
+            operation,
+            model,
+            fallback,
+            _truncate(str(last_error), 300),
+            allow_quality_fallback,
+            attempt_count,
+        )
+        return await _call(
+            fallback,
+            normalized_fallback_tier,
+            fallback_timeout_s or timeout_s,
+            fallback_max_retries,
+        )
 
     
     async def plan_action_with_context(
@@ -297,6 +828,9 @@ class PhotoChatAgent:
         thread_context: Optional[Dict[str, Any]] = None,
         trace_id: str = "-",
         recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,
+        model: Optional[str] = None,
+        model_profile: Optional[str] = None,
+        allow_quality_fallback: Optional[bool] = None,
     ) -> Dict[str, Any]:
         return await self.plan_action(
             user_message=user_message,
@@ -305,6 +839,9 @@ class PhotoChatAgent:
             thread_context=thread_context,
             trace_id=trace_id,
             recent_image_bytes=recent_image_bytes,
+            model=model,
+            model_profile=model_profile,
+            allow_quality_fallback=allow_quality_fallback,
         )
     
     def build_rich_prompt(
@@ -384,11 +921,18 @@ class PhotoChatAgent:
         prompt: str,
         history: Optional[List[Dict[str, Any]]] = None,
         model: Optional[str] = None,
+        model_profile: Optional[str] = None,
         *,
         trace_id: str = "-",
     ) -> str:
-        model = model or settings.GEMINI_TEXT_MODEL
-        fallback_model = settings.GEMINI_TEXT_MODEL_FALLBACK
+        requested_model = _normalize_requested_model(model)
+        model = self._resolve_text_model(requested_model, model_profile)
+        fallback_model = self._resolve_text_fallback_model(model)
+        service_tier = settings.GEMINI_TEXT_SERVICE_TIER
+        timeout_s = settings.GEMINI_TEXT_TIMEOUT_S
+        max_retries = settings.GEMINI_TEXT_MAX_RETRIES
+        fallback_max_retries = settings.GEMINI_TEXT_FALLBACK_MAX_RETRIES
+        thinking_level = settings.GEMINI_TEXT_THINKING_LEVEL
         contents = []
         if history:
             for h in history[-12:]:
@@ -399,8 +943,8 @@ class PhotoChatAgent:
         contents.append({"role": "user", "parts": [{"text": prompt}]})
 
         logger.info(
-            "[%s] generate_text: model=%s hist=%s prompt=%s",
-            trace_id, model, len(history or []), _truncate(prompt, 400),
+            "[%s] generate_text:start requested_model=%s selected_model=%s fallback_model=%s profile=%s hist=%s prompt=%s",
+            trace_id, requested_model, model, fallback_model, _normalize_model_profile(model_profile), len(history or []), _truncate(prompt, 400),
         )
 
         t0 = time.perf_counter()
@@ -408,6 +952,17 @@ class PhotoChatAgent:
             model=model,
             fallback_model=fallback_model,
             contents=contents,
+            generation_config=(
+                self._gemini_3_generation_config(thinking_level=thinking_level)
+                if self._is_gemini_3_model(model)
+                else None
+            ),
+            service_tier=service_tier,
+            timeout_s=timeout_s,
+            max_retries=max_retries,
+            fallback_max_retries=fallback_max_retries,
+            allow_quality_fallback=True,
+            retry_same_model_once=True,
             trace_id=trace_id,
             operation="generate_text",
         )
@@ -428,6 +983,11 @@ class PhotoChatAgent:
     ) -> Dict[str, Any]:
         model = settings.GEMINI_VISION_MODEL
         fallback_model = settings.GEMINI_VISION_MODEL_FALLBACK
+        service_tier = settings.GEMINI_VISION_SERVICE_TIER
+        timeout_s = settings.GEMINI_VISION_TIMEOUT_S
+        max_retries = settings.GEMINI_VISION_MAX_RETRIES
+        fallback_max_retries = settings.GEMINI_VISION_FALLBACK_MAX_RETRIES
+        thinking_level = settings.GEMINI_VISION_THINKING_LEVEL
         safe_bytes, safe_mime = _ensure_reasonable_image_bytes(image_bytes)
 
         logger.info(
@@ -456,7 +1016,14 @@ class PhotoChatAgent:
             ],
         }]
 
-        generation_config = {"responseMimeType": "application/json", "temperature": 0.2}
+        generation_config = (
+            self._gemini_3_generation_config(
+                responseMimeType="application/json",
+                thinking_level=thinking_level,
+            )
+            if self._is_gemini_3_model(model)
+            else {"responseMimeType": "application/json", "temperature": 0.2}
+        )
 
         t0 = time.perf_counter()
         resp = await self._generate_content_with_fallback(
@@ -464,6 +1031,10 @@ class PhotoChatAgent:
             fallback_model=fallback_model,
             contents=contents,
             generation_config=generation_config,
+            service_tier=service_tier,
+            timeout_s=timeout_s,
+            max_retries=max_retries,
+            fallback_max_retries=fallback_max_retries,
             trace_id=trace_id,
             operation="describe_image_rich",
         )
@@ -517,39 +1088,56 @@ class PhotoChatAgent:
         assets: List[Dict[str, Any]],
         thread_context: Optional[Dict[str, Any]] = None,
         session_state: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
+        model_profile: Optional[str] = None,
+        allow_quality_fallback: Optional[bool] = None,
         trace_id: str = "-",
         recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,  # [(asset_id, bytes, mime_type), ...]
     ) -> Dict[str, Any]:
-        model = settings.GEMINI_VISION_MODEL  # Use vision model to see images
-        fallback_model = settings.GEMINI_VISION_MODEL_FALLBACK
-
-        assets_compact = [{
-            "asset_id": a.get("asset_id"),
-            "seq": a.get("seq"),
-            "caption": (a.get("caption") or "")[:240],
-            "tags": (a.get("tags") or [])[:8],
-            "colors": (a.get("colors") or [])[:6],
-            "clothing": (a.get("clothing") or "")[:80],
-            "background": (a.get("background") or "")[:80],
-            "pose": (a.get("pose") or "")[:80],
-            "source": a.get("source"),
-        } for a in assets]
-
-        history_compact = [{
-            "role": h.get("role"),
-            "text": (h.get("text") or "")[:800],
-            "asset_ids": h.get("asset_ids") or None,
-        } for h in history[-12:] if (h.get("text") or "").strip() or h.get("asset_ids")]
-
         ctx = dict(thread_context or session_state or {})
-        response_locale = resolve_photo_chat_locale(
+        use_vision = self._needs_vision_planner(user_message, assets, recent_image_bytes, ctx)
+
+        logger.info(
+            "[%s] plan_action:start requested_model=%s profile=%s use_vision=%s assets=%s images=%s allow_quality_fallback=%s",
+            trace_id,
+            _normalize_requested_model(model),
+            _normalize_model_profile(model_profile),
+            use_vision,
+            len(assets or []),
+            len(recent_image_bytes or []),
+            allow_quality_fallback,
+        )
+
+        if use_vision:
+            return await self.plan_action_vision(
+                user_message=user_message,
+                history=history,
+                assets=assets,
+                thread_context=ctx,
+                model=model,
+                model_profile=model_profile,
+                allow_quality_fallback=allow_quality_fallback,
+                trace_id=trace_id,
+                recent_image_bytes=recent_image_bytes,
+            )
+        return await self.plan_action_text(
             user_message=user_message,
             history=history,
+            assets=assets,
             thread_context=ctx,
+            model=model,
+            model_profile=model_profile,
+            allow_quality_fallback=allow_quality_fallback,
+            trace_id=trace_id,
         )
-        response_language = _language_label(response_locale)
 
-        instruction = (
+    def _planner_instruction(self, *, response_language: str, response_locale: str, use_vision: bool) -> str:
+        modality_note = (
+            "- You have access to the attached image context for this request.\n"
+            if use_vision
+            else "- You do not have image pixels for this request. Use only text history and thread_context.\n"
+        )
+        return (
             "You are the AVEMOD Photo Studio planner. Decide whether the assistant should chat, ask a clarifying question, "
             "edit existing image(s), or generate a brand-new image.\n\n"
             f"Language:\n"
@@ -565,7 +1153,8 @@ class PhotoChatAgent:
             "    pending_question,\n"
             "    last_action,\n"
             "    locale\n"
-            "  }\n\n"
+            "  }\n"
+            f"{modality_note}\n"
             "Planning rules:\n"
             "- Ambiguous, underspecified, or conflicting requests must return intent='question'. Do not guess.\n"
             "- If pending_question is present, treat the user's latest message as a likely answer to that question.\n"
@@ -594,131 +1183,191 @@ class PhotoChatAgent:
             "}\n"
         )
 
+    async def plan_action_text(
+        self,
+        *,
+        user_message: str,
+        history: List[Dict[str, Any]],
+        assets: List[Dict[str, Any]],
+        thread_context: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
+        model_profile: Optional[str] = None,
+        allow_quality_fallback: Optional[bool] = None,
+        trace_id: str = "-",
+    ) -> Dict[str, Any]:
+        requested_model = _normalize_requested_model(model)
+        selected_model = self._resolve_text_model(requested_model, model_profile)
+        fallback_model = self._resolve_text_fallback_model(selected_model)
+        allow_fallback = True if allow_quality_fallback is None else bool(allow_quality_fallback)
+        history_compact = _normalize_planner_history(history, limit=6)
+        ctx = _normalize_thread_context_for_planner(thread_context)
+        response_locale = resolve_photo_chat_locale(
+            user_message=user_message,
+            history=history,
+            thread_context=ctx,
+        )
+        response_language = _language_label(response_locale)
+        payload = {
+            "history": history_compact,
+            "assets": [],
+            "thread_context": ctx,
+            "user_message": user_message,
+        }
+        contents = [{
+            "role": "user",
+            "parts": [{
+                "text": self._planner_instruction(
+                    response_language=response_language,
+                    response_locale=response_locale,
+                    use_vision=False,
+                ) + "\n\nCONTEXT:\n" + json.dumps(payload, ensure_ascii=False)
+            }],
+        }]
+        generation_config = (
+            self._gemini_3_generation_config(
+                responseMimeType="application/json",
+                thinking_level=settings.GEMINI_TEXT_THINKING_LEVEL,
+            )
+            if self._is_gemini_3_model(selected_model)
+            else {"responseMimeType": "application/json", "temperature": 0.3}
+        )
+
+        logger.info(
+            "[%s] plan_action_text:start requested_model=%s selected_model=%s fallback_model=%s profile=%s allow_quality_fallback=%s assets=%s hist=%s",
+            trace_id,
+            requested_model,
+            selected_model,
+            fallback_model,
+            _normalize_model_profile(model_profile),
+            allow_fallback,
+            len(assets or []),
+            len(history_compact),
+        )
+
+        resp = await self._generate_content_with_fallback(
+            model=selected_model,
+            fallback_model=fallback_model,
+            contents=contents,
+            generation_config=generation_config,
+            service_tier=settings.GEMINI_TEXT_SERVICE_TIER,
+            timeout_s=settings.GEMINI_TEXT_TIMEOUT_S,
+            max_retries=settings.GEMINI_TEXT_MAX_RETRIES,
+            fallback_max_retries=settings.GEMINI_TEXT_FALLBACK_MAX_RETRIES,
+            allow_quality_fallback=allow_fallback,
+            retry_same_model_once=True,
+            trace_id=trace_id,
+            operation="plan_action_text",
+        )
+
+        text, _parts = self.api.extract_text_and_images(resp)
+        raw = (text or "").strip()
+        logger.info("[%s] plan_action_text:raw=%s", trace_id, _truncate(raw, 900))
+        parsed = _parse_planner_response_dict(raw, response_locale=response_locale)
+        logger.info("[%s] plan_action_text:parsed=%s", trace_id, parsed)
+        return parsed
+
+    async def plan_action_vision(
+        self,
+        *,
+        user_message: str,
+        history: List[Dict[str, Any]],
+        assets: List[Dict[str, Any]],
+        thread_context: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
+        model_profile: Optional[str] = None,
+        allow_quality_fallback: Optional[bool] = None,
+        trace_id: str = "-",
+        recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,
+    ) -> Dict[str, Any]:
+        requested_model = _normalize_requested_model(model)
+        selected_model = self._resolve_vision_model(requested_model, model_profile)
+        fallback_model = self._resolve_vision_fallback_model(selected_model)
+        allow_fallback = True if allow_quality_fallback is None else bool(allow_quality_fallback)
+        history_compact = _normalize_planner_history(history, limit=6)
+        assets_compact = _normalize_planner_assets(assets)
+        ctx = _normalize_thread_context_for_planner(thread_context)
+        response_locale = resolve_photo_chat_locale(
+            user_message=user_message,
+            history=history,
+            thread_context=ctx,
+        )
+        response_language = _language_label(response_locale)
+        image_limit = self.planner_image_limit(
+            user_message=user_message,
+            assets=assets,
+            recent_image_bytes=recent_image_bytes,
+            thread_context=ctx,
+        )
+        limited_images = list(recent_image_bytes or [])[:image_limit]
         payload = {
             "history": history_compact,
             "assets": assets_compact,
             "thread_context": ctx,
             "user_message": user_message,
         }
+        parts = [{
+            "text": self._planner_instruction(
+                response_language=response_language,
+                response_locale=response_locale,
+                use_vision=True,
+            ) + "\n\nCONTEXT:\n" + json.dumps(payload, ensure_ascii=False)
+        }]
+        for asset_id, img_bytes, mime_type in limited_images:
+            try:
+                safe_bytes, safe_mime = _ensure_reasonable_image_bytes(img_bytes)
+                parts.append({
+                    "inline_data": {
+                        "mime_type": safe_mime if safe_mime.startswith("image/") else (mime_type or "image/jpeg"),
+                        "data": b64encode_bytes(safe_bytes),
+                    }
+                })
+                parts.append({"text": f"[This is asset_id={asset_id}]"})
+            except Exception as exc:
+                logger.warning("[%s] plan_action_vision: failed to include image asset_id=%s: %s", trace_id, asset_id, exc)
 
-        # Build content parts: text instruction + optional images
-        parts = [{"text": instruction + "\n\nCONTEXT:\n" + json.dumps(payload, ensure_ascii=False)}]
-        
-        # ✅ FIX: Include recent images so Gemini can actually SEE them
-        if recent_image_bytes:
-            for asset_id, img_bytes, mime_type in recent_image_bytes[:4]:  # Max 4 images
-                try:
-                    safe_bytes, safe_mime = _ensure_reasonable_image_bytes(img_bytes)
-                    parts.append({
-                        "inline_data": {
-                            "mime_type": safe_mime if safe_mime.startswith("image/") else (mime_type or "image/jpeg"),
-                            "data": b64encode_bytes(safe_bytes)
-                        }
-                    })
-                    parts.append({"text": f"[This is asset_id={asset_id}]"})
-                except Exception as e:
-                    logger.warning("[%s] plan_action: failed to include image asset_id=%s: %s", trace_id, asset_id, e)
-        
-        contents = [{"role": "user", "parts": parts}]
-        generation_config = {"responseMimeType": "application/json", "temperature": 0.3}
-
-        logger.info(
-            "[%s] plan_action: model=%s assets=%s hist=%s thread_context=%s locale=%s user=%s images=%s",
-            trace_id, model, len(assets_compact), len(history_compact),
-            {k: ctx.get(k) for k in ("last_generated_asset_id", "working_asset_ids", "pending_question", "last_action", "locale")},
-            response_locale,
-            _truncate(user_message, 300),
-            len(recent_image_bytes or []),
+        generation_config = (
+            self._gemini_3_generation_config(
+                responseMimeType="application/json",
+                thinking_level=settings.GEMINI_VISION_THINKING_LEVEL,
+            )
+            if self._is_gemini_3_model(selected_model)
+            else {"responseMimeType": "application/json", "temperature": 0.3}
         )
 
-        t0 = time.perf_counter()
-        try:
-            resp = await self._generate_content_with_fallback(
-                model=model,
-                fallback_model=fallback_model,
-                contents=contents,
-                generation_config=generation_config,
-                trace_id=trace_id,
-                operation="plan_action",
-            )
-        except Exception as e:
-            logger.exception("[%s] edit_or_generate_image: generate_content failed", trace_id)
-            raise GeminiApiError(f"Image model error: {type(e).__name__}: {e}")
-        dt = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "[%s] plan_action_vision:start requested_model=%s selected_model=%s fallback_model=%s profile=%s allow_quality_fallback=%s assets=%s images=%s hist=%s",
+            trace_id,
+            requested_model,
+            selected_model,
+            fallback_model,
+            _normalize_model_profile(model_profile),
+            allow_fallback,
+            len(assets_compact),
+            len(limited_images),
+            len(history_compact),
+        )
+
+        resp = await self._generate_content_with_fallback(
+            model=selected_model,
+            fallback_model=fallback_model,
+            contents=[{"role": "user", "parts": parts}],
+            generation_config=generation_config,
+            service_tier=settings.GEMINI_VISION_SERVICE_TIER,
+            timeout_s=settings.GEMINI_VISION_TIMEOUT_S,
+            max_retries=settings.GEMINI_VISION_MAX_RETRIES,
+            fallback_max_retries=settings.GEMINI_VISION_FALLBACK_MAX_RETRIES,
+            allow_quality_fallback=allow_fallback,
+            retry_same_model_once=True,
+            trace_id=trace_id,
+            operation="plan_action_vision",
+        )
 
         text, _parts = self.api.extract_text_and_images(resp)
         raw = (text or "").strip()
-        logger.info("[%s] plan_action: ms=%.1f raw=%s", trace_id, dt, _truncate(raw, 900))
-
-        if not raw:
-            raise GeminiApiError("Planner returned empty response")
-
-        try:
-            plan = json.loads(raw)
-        except Exception:
-            cleaned = raw.strip().strip("`").replace("```json", "").replace("```", "").strip()
-            plan = json.loads(cleaned)
-
-        if not isinstance(plan, dict):
-            raise GeminiApiError("Planner returned an invalid JSON object")
-
-        intent = str(plan.get("intent") or "chat").strip().lower()
-        if intent not in {"chat", "question", "edit_image", "generate_image"}:
-            intent = "chat"
-
-        assistant_message = str(plan.get("assistant_message") or "").strip()
-
-        raw_prompt = plan.get("image_prompt")
-        image_prompt = str(raw_prompt).strip() if isinstance(raw_prompt, str) else None
-        image_prompt = image_prompt or None
-
-        raw_selected_ids = plan.get("selected_asset_ids")
-        selected_asset_ids: List[int] | None = None
-        if isinstance(raw_selected_ids, list):
-            normalized_ids: List[int] = []
-            seen_ids: set[int] = set()
-            for item in raw_selected_ids:
-                try:
-                    asset_id = int(item)
-                except (TypeError, ValueError):
-                    continue
-                if asset_id in seen_ids:
-                    continue
-                seen_ids.add(asset_id)
-                normalized_ids.append(asset_id)
-            selected_asset_ids = normalized_ids or None
-
-        raw_image_count = plan.get("image_count")
-        image_count: Optional[int]
-        try:
-            image_count = int(raw_image_count) if raw_image_count is not None else None
-        except (TypeError, ValueError):
-            image_count = None
-        if image_count is not None:
-            image_count = max(1, min(image_count, 4))
-
-        raw_aspect_ratio = plan.get("aspect_ratio")
-        aspect_ratio = str(raw_aspect_ratio).strip() if raw_aspect_ratio is not None else None
-        aspect_ratio = aspect_ratio or None
-
-        if intent in {"edit_image", "generate_image"} and not image_prompt:
-            intent = "question"
-            assistant_message = assistant_message or _default_clarifying_question(response_locale)
-
-        if intent == "question" and not assistant_message:
-            assistant_message = _default_clarifying_question(response_locale)
-
-        plan = {
-            "intent": intent,
-            "assistant_message": assistant_message,
-            "selected_asset_ids": selected_asset_ids,
-            "image_prompt": image_prompt,
-            "image_count": image_count,
-            "aspect_ratio": aspect_ratio,
-        }
-
-        logger.info("[%s] plan_action: parsed=%s", trace_id, plan)
-        return plan
+        logger.info("[%s] plan_action_vision:raw=%s", trace_id, _truncate(raw, 900))
+        parsed = _parse_planner_response_dict(raw, response_locale=response_locale)
+        logger.info("[%s] plan_action_vision:parsed=%s", trace_id, parsed)
+        return parsed
     
     @staticmethod
     def ensure_wb_3x4(image_bytes: bytes, target_w: int = 900, target_h: int = 1200, quality: int = 90) -> Tuple[bytes, str]:
@@ -753,17 +1402,26 @@ class PhotoChatAgent:
         images: List[Tuple[bytes, str]],
         aspect_ratio: Optional[str] = None,
         model: Optional[str] = None,
+        model_profile: Optional[str] = None,
+        allow_quality_fallback: Optional[bool] = None,
         *,
         trace_id: str = "-",
     ) -> Tuple[str, Optional[bytes], Optional[str]]:
-        model = model or settings.GEMINI_IMAGE_MODEL
-        fallback_model = settings.GEMINI_IMAGE_MODEL_FALLBACK
+        requested_model = _normalize_requested_model(model)
+        model = self._resolve_image_model(requested_model, model_profile)
+        fallback_model = self._resolve_image_fallback_model(model)
+        allow_fallback = False if allow_quality_fallback is None else bool(allow_quality_fallback)
+        service_tier = settings.GEMINI_IMAGE_SERVICE_TIER
+        timeout_s = settings.GEMINI_IMAGE_TIMEOUT_S
+        fallback_timeout_s = settings.GEMINI_IMAGE_FALLBACK_TIMEOUT_S
+        max_retries = settings.GEMINI_IMAGE_MAX_RETRIES
+        fallback_max_retries = settings.GEMINI_IMAGE_FALLBACK_MAX_RETRIES
 
         sizes = [len(b) for b, _m in images]
         mimes = [_m for _b, _m in images]
         logger.info(
-            "[%s] edit_or_generate_image: model=%s imgs=%s sizes=%s mimes=%s ar=%s prompt=%s",
-            trace_id, model, len(images), sizes, mimes, aspect_ratio, _truncate(prompt, 500)
+            "[%s] edit_or_generate_image:start requested_model=%s selected_model=%s fallback_model=%s profile=%s allow_quality_fallback=%s imgs=%s sizes=%s mimes=%s ar=%s prompt=%s",
+            trace_id, requested_model, model, fallback_model, _normalize_model_profile(model_profile), allow_fallback, len(images), sizes, mimes, aspect_ratio, _truncate(prompt, 500)
         )
 
         parts: List[Dict[str, Any]] = [{"text": prompt}]
@@ -784,6 +1442,14 @@ class PhotoChatAgent:
             fallback_model=fallback_model,
             contents=contents,
             generation_config=generation_config,
+            service_tier=service_tier,
+            fallback_service_tier=service_tier,
+            timeout_s=timeout_s,
+            fallback_timeout_s=fallback_timeout_s,
+            max_retries=max_retries,
+            fallback_max_retries=fallback_max_retries,
+            allow_quality_fallback=allow_fallback,
+            retry_same_model_once=True,
             trace_id=trace_id,
             operation="edit_or_generate_image",
         )

@@ -54,13 +54,28 @@ class Settings(BaseSettings):
     
     # Gemini AI Settings
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.5-flash"
-    GEMINI_TEXT_MODEL: str = "gemini-2.5-flash"
-    GEMINI_TEXT_MODEL_FALLBACK: str = "gemini-2.5-flash"
-    GEMINI_VISION_MODEL: str = "gemini-2.5-flash"
-    GEMINI_VISION_MODEL_FALLBACK: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.1-pro-preview"
+    GEMINI_TEXT_MODEL: str = "gemini-3.1-pro-preview"
+    GEMINI_TEXT_MODEL_FALLBACK: str = "gemini-3.1-flash-lite-preview"
+    GEMINI_TEXT_SERVICE_TIER: str = "standard"
+    GEMINI_TEXT_TIMEOUT_S: float = 15.0
+    GEMINI_TEXT_MAX_RETRIES: int = 0
+    GEMINI_TEXT_FALLBACK_MAX_RETRIES: int = 1
+    GEMINI_TEXT_THINKING_LEVEL: str = "low"
+    GEMINI_VISION_MODEL: str = "gemini-3.1-pro-preview"
+    GEMINI_VISION_MODEL_FALLBACK: str = "gemini-3.1-flash-lite-preview"
+    GEMINI_VISION_SERVICE_TIER: str = "standard"
+    GEMINI_VISION_TIMEOUT_S: float = 12.0
+    GEMINI_VISION_MAX_RETRIES: int = 0
+    GEMINI_VISION_FALLBACK_MAX_RETRIES: int = 1
+    GEMINI_VISION_THINKING_LEVEL: str = "low"
     GEMINI_IMAGE_MODEL: str = "gemini-3-pro-image-preview"
-    GEMINI_IMAGE_MODEL_FALLBACK: str = "gemini-2.5-flash-image"
+    GEMINI_IMAGE_MODEL_FALLBACK: str = "gemini-3.1-flash-image-preview"
+    GEMINI_IMAGE_SERVICE_TIER: str = "standard"
+    GEMINI_IMAGE_TIMEOUT_S: float = 25.0
+    GEMINI_IMAGE_FALLBACK_TIMEOUT_S: float = 45.0
+    GEMINI_IMAGE_MAX_RETRIES: int = 0
+    GEMINI_IMAGE_FALLBACK_MAX_RETRIES: int = 1
     GEMINI_MAX_OUTPUT_TOKENS: int = 8192
     GEMINI_TEMPERATURE: float = 0.2
     GEMINI_AUDIT_MAX_OUTPUT_TOKENS: int = 3072

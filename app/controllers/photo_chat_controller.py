@@ -77,6 +77,11 @@ _PHOTO_CHAT_UI_TEXT = {
         "ru": "Не получилось обработать запрос. Попробуйте ещё раз.",
         "uz": "So'rovni qayta ishlay olmadim. Iltimos, yana urinib ko'ring.",
     },
+    "planner_failed_retry_image": {
+        "en": "I couldn't safely process that image request right now. Please try again in a moment.",
+        "ru": "Не получилось надёжно обработать запрос на редактирование изображения. Попробуйте ещё раз через минуту.",
+        "uz": "Rasm bilan bog'liq so'rovni hozir ishonchli qayta ishlay olmadim. Birozdan keyin yana urinib ko'ring.",
+    },
     "limit_reached": {
         "en": "The message limit has been reached. Delete some messages or clear the chat to continue.",
         "ru": "Лимит сообщений достигнут. Удалите лишние сообщения или очистите чат, чтобы продолжить.",
@@ -1404,7 +1409,28 @@ class PhotoChatController:
         assets: List[Dict[str, Any]],
         thread_context: Optional[Dict[str, Any]] = None,
         recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,
+        planner_model: Optional[str] = None,
+        model_profile: Optional[str] = None,
+        allow_quality_fallback: Optional[bool] = None,
+        trace_id: Optional[str] = None,
     ) -> PlannerResult:
+        planner_trace_id = str(trace_id or "-")
+        use_vision = self._agent.needs_vision_planner(
+            user_message=user_message,
+            assets=assets,
+            recent_image_bytes=recent_image_bytes,
+            thread_context=thread_context,
+        )
+        logger.info(
+            "[%s] planner:start requested_model=%s profile=%s allow_quality_fallback=%s use_vision=%s assets=%s images=%s",
+            planner_trace_id,
+            (planner_model or "").strip() or None,
+            (model_profile or "").strip() or None,
+            allow_quality_fallback,
+            use_vision,
+            len(assets or []),
+            len(recent_image_bytes or []),
+        )
         try:
             plan = await self._agent.plan_action(
                 user_message=user_message, 
@@ -1412,6 +1438,10 @@ class PhotoChatController:
                 assets=assets,
                 thread_context=thread_context,
                 recent_image_bytes=recent_image_bytes,
+                model=planner_model,
+                model_profile=model_profile,
+                allow_quality_fallback=allow_quality_fallback,
+                trace_id=planner_trace_id,
             )
             
             # ✅ FIX: Properly handle selected_asset_ids
@@ -1457,14 +1487,32 @@ class PhotoChatController:
                 aspect_ratio=plan.get("aspect_ratio"),
             )
         except Exception:
+            logger.exception("[%s] planner:failed use_vision=%s", planner_trace_id, use_vision)
+            locale = self._response_locale(
+                user_message=user_message,
+                history=history,
+                thread_context=thread_context,
+            )
+            if use_vision:
+                return PlannerResult(
+                    intent="question",
+                    assistant_message=self._text(
+                        "planner_failed_retry_image",
+                        locale=locale,
+                    ),
+                )
             try:
-                txt = await self._agent.generate_text(user_message, history=history)
+                txt = await self._agent.generate_text(
+                    user_message,
+                    history=history,
+                    model=planner_model,
+                    model_profile=model_profile,
+                    trace_id=planner_trace_id,
+                )
             except Exception:
                 txt = self._text(
                     "planner_failed",
-                    user_message=user_message,
-                    history=history,
-                    thread_context=thread_context,
+                    locale=locale,
                 )
             return PlannerResult(intent="chat", assistant_message=txt)
 
@@ -1540,8 +1588,12 @@ class PhotoChatController:
         uid = _user_id(user)
         incoming_asset_ids_raw = payload.get("asset_ids") or []
         quick_action = payload.get("quick_action")
+        planner_model = str(payload.get("planner_model") or "").strip() or None
+        generation_model = str(payload.get("generation_model") or "").strip() or None
+        model_profile = str(payload.get("model_profile") or "").strip() or None
+        allow_quality_fallback = payload.get("allow_quality_fallback")
         logger.info(
-            "chat_stream request received | request=%s user=%s thread=%s message_len=%s quick_action=%s asset_ids=%s photo_urls=%s",
+            "chat_stream request received | request=%s user=%s thread=%s message_len=%s quick_action=%s asset_ids=%s photo_urls=%s planner_model=%s generation_model=%s profile=%s allow_quality_fallback=%s",
             request_id,
             uid,
             requested_thread_id,
@@ -1549,6 +1601,10 @@ class PhotoChatController:
             _short_payload(quick_action),
             incoming_asset_ids_raw if isinstance(incoming_asset_ids_raw, list) else [incoming_asset_ids_raw],
             payload.get("photo_urls") or payload.get("photo_url"),
+            planner_model,
+            generation_model,
+            model_profile,
+            allow_quality_fallback,
         )
 
         if uid is None:
@@ -1694,7 +1750,17 @@ class PhotoChatController:
                     base_url=base_url,
                 )
                 state.context_state = context_state
-                recent_image_bytes = await self._load_recent_image_bytes(media_map, asset_ids, base_url=base_url)
+                planner_image_limit = self._agent.planner_image_limit(
+                    user_message=f"[User sent {len(asset_ids)} image(s) without text - understand intent from context]",
+                    assets=assets,
+                    thread_context=context_state,
+                )
+                recent_image_bytes = await self._load_recent_image_bytes(
+                    media_map,
+                    asset_ids[:planner_image_limit],
+                    base_url=base_url,
+                    max_items=planner_image_limit,
+                )
                 implicit_message = f"[User sent {len(asset_ids)} image(s) without text - understand intent from context]"
                 prefetched_plan = await self._planner(
                     implicit_message,
@@ -1702,6 +1768,10 @@ class PhotoChatController:
                     assets,
                     thread_context=context_state,
                     recent_image_bytes=recent_image_bytes,
+                    planner_model=planner_model,
+                    model_profile=model_profile,
+                    allow_quality_fallback=allow_quality_fallback,
+                    trace_id=request_id,
                 )
 
                 if prefetched_plan.intent in ("edit_image", "generate_image"):
@@ -1822,10 +1892,14 @@ class PhotoChatController:
             return
 
         logger.info(
-            "chat_stream planner path used | request=%s user=%s quick_action=%s",
+            "chat_stream planner path used | request=%s user=%s quick_action=%s planner_model=%s generation_model=%s profile=%s allow_quality_fallback=%s",
             request_id,
             uid,
             _short_payload(quick_action),
+            planner_model,
+            generation_model,
+            model_profile,
+            allow_quality_fallback,
         )
 
         history, assets, context_state = await self._build_planner_context(
@@ -1838,8 +1912,18 @@ class PhotoChatController:
         state.context_state = context_state
 
         planner_asset_ids = [int(asset.get("asset_id")) for asset in assets if _coerce_int(asset.get("asset_id")) is not None]
-        fetch_ids = asset_ids[:4] if asset_ids else planner_asset_ids[-4:]
-        recent_image_bytes = await self._load_recent_image_bytes(media_map, fetch_ids, base_url=base_url)
+        planner_image_limit = self._agent.planner_image_limit(
+            user_message=message,
+            assets=assets,
+            thread_context=context_state,
+        )
+        fetch_ids = asset_ids[:planner_image_limit] if asset_ids else planner_asset_ids[-planner_image_limit:]
+        recent_image_bytes = await self._load_recent_image_bytes(
+            media_map,
+            fetch_ids,
+            base_url=base_url,
+            max_items=planner_image_limit,
+        )
 
         plan = prefetched_plan or await self._planner(
             message,
@@ -1847,6 +1931,10 @@ class PhotoChatController:
             assets,
             thread_context=context_state,
             recent_image_bytes=recent_image_bytes,
+            planner_model=planner_model,
+            model_profile=model_profile,
+            allow_quality_fallback=allow_quality_fallback,
+            trace_id=request_id,
         )
 
         if plan.intent in ("question", "chat"):
@@ -1993,6 +2081,10 @@ class PhotoChatController:
                     prompt=per_image_prompt,
                     images=images,
                     aspect_ratio=aspect_ratio,
+                    model=generation_model,
+                    model_profile=model_profile,
+                    allow_quality_fallback=allow_quality_fallback,
+                    trace_id=request_id,
                 )
             except GeminiApiError as exc:
                 logger.error("edit_or_generate_image failed: %s", str(exc).strip() or "GeminiApiError")

@@ -67,11 +67,17 @@ class GeminiApiClient:
         model: str,
         contents: List[Dict[str, Any]],
         generation_config: Optional[Dict[str, Any]] = None,
+        *,
+        service_tier: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        max_retries: Optional[int] = None,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}/models/{model}:generateContent"
         payload: Dict[str, Any] = {"contents": contents}
         if generation_config:
             payload["generationConfig"] = generation_config
+        if service_tier:
+            payload["service_tier"] = service_tier
 
         def _retry_after_s(resp: httpx.Response) -> Optional[float]:
             raw = (resp.headers.get("retry-after") or "").strip()
@@ -82,14 +88,15 @@ class GeminiApiClient:
             except Exception:
                 return None
 
+        retries = self.max_retries if max_retries is None else max(0, int(max_retries))
         last_error_text = ""
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(retries + 1):
             try:
-                resp = await self._client.post(url, json=payload)
-            except httpx.ReadTimeout as e:
-                last_error_text = f"ReadTimeout: {e}"
+                resp = await self._client.post(url, json=payload, timeout=timeout_s)
+            except httpx.TimeoutException as e:
+                last_error_text = f"{type(e).__name__}: {e}"
                 retryable = True
-                if attempt >= self.max_retries:
+                if attempt >= retries:
                     raise GeminiApiError(f"Gemini error timeout: {last_error_text}")
 
                 wait_s = min(self.backoff_max_s, self.backoff_base_s * (2 ** attempt))
@@ -100,8 +107,10 @@ class GeminiApiClient:
                 data = resp.json()
                 usage = data.get("usageMetadata") or {}
                 logger.info(
-                    "gemini usage model=%s prompt=%s candidates=%s total=%s",
+                    "gemini usage model=%s tier=%s effective_tier=%s prompt=%s candidates=%s total=%s",
                     model,
+                    service_tier or "standard",
+                    resp.headers.get("x-gemini-service-tier") or "standard",
                     usage.get("promptTokenCount"),
                     usage.get("candidatesTokenCount"),
                     usage.get("totalTokenCount"),
@@ -110,7 +119,7 @@ class GeminiApiClient:
 
             last_error_text = resp.text
             retryable = resp.status_code in (408, 429) or 500 <= resp.status_code <= 599
-            if not retryable or attempt >= self.max_retries:
+            if not retryable or attempt >= retries:
                 raise GeminiApiError(f"Gemini error {resp.status_code}: {last_error_text}")
 
             wait_s = _retry_after_s(resp)

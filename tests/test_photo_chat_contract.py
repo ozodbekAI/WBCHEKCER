@@ -57,6 +57,15 @@ async def _collect_chunks(stream) -> list[str]:
 
 
 class _FakeGenerateAgent:
+    def __init__(self):
+        self.last_generation_kwargs = None
+
+    def needs_vision_planner(self, **kwargs):
+        return True
+
+    def planner_image_limit(self, **kwargs):
+        return 2
+
     async def plan_action(self, **kwargs):
         return {
             "intent": "generate_image",
@@ -71,6 +80,7 @@ class _FakeGenerateAgent:
         return basic_prompt
 
     async def edit_or_generate_image(self, **kwargs):
+        self.last_generation_kwargs = kwargs
         return "", b"fake-image-bytes", "image/jpeg"
 
     async def describe_image_rich(self, *args, **kwargs):
@@ -81,6 +91,12 @@ class _FakeGenerateAgent:
 
 
 class _FakeQuestionAgent:
+    def needs_vision_planner(self, **kwargs):
+        return False
+
+    def planner_image_limit(self, **kwargs):
+        return 2
+
     async def plan_action(self, **kwargs):
         return {
             "intent": "question",
@@ -96,6 +112,12 @@ class _FakeQuestionAgent:
 
 
 class _FakeQuickActionAgent:
+    def needs_vision_planner(self, **kwargs):
+        return True
+
+    def planner_image_limit(self, **kwargs):
+        return 2
+
     async def describe_image_rich(self, *args, **kwargs):
         return {}
 
@@ -170,6 +192,39 @@ def test_generate_image_stream_is_not_coerced_to_edit_image(monkeypatch):
     repo.db.close()
 
 
+def test_generation_model_is_forwarded_to_image_generation(monkeypatch):
+    repo = _make_repo()
+    controller = PhotoChatController.__new__(PhotoChatController)
+    controller._agent = _FakeGenerateAgent()
+
+    monkeypatch.setattr(controller_module, "_save_bytes_to_media_photos", lambda content, ext: "photos/contract-generated.jpg")
+    monkeypatch.setattr(controller_module, "save_generated_metadata", lambda *args, **kwargs: None)
+
+    asyncio.run(
+        _collect_chunks(
+            controller.chat_stream(
+                user={"id": 809},
+                db=repo.db,
+                payload={
+                    "message": "Create a new hero image for this campaign",
+                    "request_id": "req-generate-model",
+                    "generation_model": "gemini-3-pro-image-preview",
+                    "model_profile": "quality",
+                    "allow_quality_fallback": False,
+                    "base_url": "https://backend.example.com",
+                },
+            )
+        )
+    )
+
+    assert controller._agent.last_generation_kwargs["model"] == "gemini-3-pro-image-preview"
+    assert controller._agent.last_generation_kwargs["model_profile"] == "quality"
+    assert controller._agent.last_generation_kwargs["allow_quality_fallback"] is False
+    assert controller._agent.last_generation_kwargs["trace_id"] == "req-generate-model"
+
+    repo.db.close()
+
+
 def test_locale_behavior_uses_uzbek_for_question_fallback():
     controller = PhotoChatController.__new__(PhotoChatController)
     controller._agent = _FakeQuestionAgent()
@@ -185,6 +240,38 @@ def test_locale_behavior_uses_uzbek_for_question_fallback():
 
     assert result.intent == "question"
     assert result.assistant_message == "Iltimos, aynan nimani o'zgartirish yoki yaratish kerakligini aniqlashtirib bering."
+
+
+def test_image_sensitive_planner_failure_returns_controlled_question_without_text_degrade():
+    class _FailingVisionAgent:
+        def needs_vision_planner(self, **kwargs):
+            return True
+
+        async def plan_action(self, **kwargs):
+            raise RuntimeError("planner crashed")
+
+        async def generate_text(self, *args, **kwargs):
+            raise AssertionError("generate_text must not be called for image-sensitive planner failures")
+
+    controller = PhotoChatController.__new__(PhotoChatController)
+    controller._agent = _FailingVisionAgent()
+
+    result = asyncio.run(
+        controller._planner(
+            user_message="remove background from this image",
+            history=[{"role": "user", "text": "remove background from this image"}],
+            assets=[{"asset_id": 1, "caption": "shirt"}],
+            thread_context={"working_asset_ids": [1]},
+            recent_image_bytes=[(1, b"123", "image/jpeg")],
+            planner_model="gemini-3.1-pro-preview",
+            model_profile="quality",
+            allow_quality_fallback=False,
+            trace_id="planner-fail",
+        )
+    )
+
+    assert result.intent == "question"
+    assert "couldn't safely process that image request" in result.assistant_message.lower()
 
 
 def test_generate_video_quick_action_stream_persists_result_without_name_error(monkeypatch):

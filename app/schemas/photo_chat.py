@@ -39,6 +39,8 @@ class PhotoChatThreadContext(BaseModel):
 
 
 class PhotoChatQuickActionIn(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     type: Optional[str] = None
     action: Optional[str] = None
     pose_prompt_id: Optional[int] = None
@@ -55,6 +57,8 @@ class PhotoChatQuickActionIn(BaseModel):
 
 
 class PhotoChatStreamRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     message: str = ""
     asset_ids: List[int] = Field(default_factory=list)
     photo_urls: List[str] = Field(default_factory=list)
@@ -64,6 +68,10 @@ class PhotoChatStreamRequest(BaseModel):
     request_id: Optional[str] = None
     locale: Optional[str] = None
     client_session_id: Optional[str] = None
+    planner_model: Optional[str] = None
+    generation_model: Optional[str] = None
+    model_profile: Optional[str] = None
+    allow_quality_fallback: Optional[bool] = None
 
     @field_validator("asset_ids", mode="before")
     @classmethod
@@ -99,7 +107,16 @@ class PhotoChatStreamRequest(BaseModel):
             return ""
         return str(value).strip()
 
-    @field_validator("photo_url", "request_id", "locale", "client_session_id", mode="before")
+    @field_validator(
+        "photo_url",
+        "request_id",
+        "locale",
+        "client_session_id",
+        "planner_model",
+        "generation_model",
+        "model_profile",
+        mode="before",
+    )
     @classmethod
     def _normalize_string_fields(cls, value: object) -> Optional[str]:
         if value is None:
@@ -173,6 +190,8 @@ class PhotoChatDeleteResponse(BaseModel):
 
 
 class PhotoGeneratorRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     generator_type: str
     asset_ids: List[int] = Field(default_factory=list)
     thread_id: Optional[int] = None
