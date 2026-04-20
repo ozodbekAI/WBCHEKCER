@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.controllers.photo_chat_controller import PhotoChatController
+from app.services.gemini_api import GeminiApiError
 from app.services.photo_chat_agent import PhotoChatAgent, resolve_photo_chat_locale
 
 
@@ -87,3 +88,57 @@ def test_plan_action_with_context_delegates_to_plan_action_with_thread_context()
     assert captured["thread_context"] == {"last_generated_asset_id": 99}
     assert captured["trace_id"] == "test-trace"
     assert captured["recent_image_bytes"] == [(1, b"123", "image/jpeg")]
+
+
+def test_generate_content_with_fallback_retries_when_model_is_missing():
+    class _FakeApi:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_content(self, *, model, contents, generation_config=None):
+            self.calls.append(model)
+            if model == "gemini-3-flash-preview":
+                raise GeminiApiError("Gemini error 404: NOT_FOUND")
+            return {"ok": True, "model": model, "contents": contents}
+
+    agent = PhotoChatAgent.__new__(PhotoChatAgent)
+    agent.api = _FakeApi()
+    agent._sem = asyncio.Semaphore(1)
+
+    result = asyncio.run(
+        agent._generate_content_with_fallback(
+            model="gemini-3-flash-preview",
+            fallback_model="gemini-2.5-flash",
+            contents=[{"role": "user", "parts": [{"text": "hello"}]}],
+            trace_id="fallback-test",
+            operation="generate_text",
+        )
+    )
+
+    assert result["model"] == "gemini-2.5-flash"
+    assert agent.api.calls == ["gemini-3-flash-preview", "gemini-2.5-flash"]
+
+
+def test_generate_content_with_fallback_does_not_retry_for_non_missing_model_errors():
+    class _FakeApi:
+        async def generate_content(self, *, model, contents, generation_config=None):
+            raise GeminiApiError("Gemini error 429: rate limited")
+
+    agent = PhotoChatAgent.__new__(PhotoChatAgent)
+    agent.api = _FakeApi()
+    agent._sem = asyncio.Semaphore(1)
+
+    try:
+        asyncio.run(
+            agent._generate_content_with_fallback(
+                model="gemini-3-flash-preview",
+                fallback_model="gemini-2.5-flash",
+                contents=[{"role": "user", "parts": [{"text": "hello"}]}],
+                trace_id="fallback-test",
+                operation="generate_text",
+            )
+        )
+    except GeminiApiError as exc:
+        assert "429" in str(exc)
+    else:
+        raise AssertionError("Expected GeminiApiError to be raised")

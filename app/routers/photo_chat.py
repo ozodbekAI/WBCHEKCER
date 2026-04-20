@@ -11,7 +11,12 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db_dependency
 from app.core.dependencies import get_current_user
 from app.controllers.photo_chat_controller import PhotoChatController
-from app.schemas.photo_chat import PhotoChatAssetImportRequest, PhotoChatStreamRequest
+from app.schemas.photo_chat import (
+    PhotoChatAssetImportRequest,
+    PhotoChatStreamRequest,
+    PhotoGeneratorRequest,
+    PhotoGeneratorResponse,
+)
 from app.services.model_repository import ModelRepository
 from app.services.scence_repositories import PoseRepository, SceneCategoryRepository
 from app.models.generator import VideoScenario
@@ -241,6 +246,31 @@ async def chat_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/generator/run", response_model=PhotoGeneratorResponse)
+async def run_generator(
+    request: Request,
+    payload: PhotoGeneratorRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_dependency),
+):
+    controller = PhotoChatController()
+    try:
+        return await controller.run_generator(
+            user=current_user,
+            db=db,
+            payload=payload.model_dump(exclude_none=True),
+            base_url=_request_base_url(request),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("photo generator/run failed")
+        raise _mapped_photo_http_exception(e, context="generator_run", default_status=400)
+    finally:
+        await controller.close()
 
 
 @router.post("/threads/new")

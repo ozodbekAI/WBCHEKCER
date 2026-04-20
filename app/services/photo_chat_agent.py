@@ -237,6 +237,49 @@ class PhotoChatAgent:
     async def close(self) -> None:
         await self.api.aclose()
 
+    @staticmethod
+    def _is_model_unavailable_error(exc: Exception) -> bool:
+        msg = str(exc or "")
+        lowered = msg.lower()
+        return "404" in msg or "not found" in lowered or "not_found" in lowered
+
+    async def _generate_content_with_fallback(
+        self,
+        *,
+        model: str,
+        contents: List[Dict[str, Any]],
+        generation_config: Optional[Dict[str, Any]] = None,
+        fallback_model: Optional[str] = None,
+        trace_id: str = "-",
+        operation: str = "generate_content",
+    ) -> Dict[str, Any]:
+        try:
+            async with self._sem:
+                return await self.api.generate_content(
+                    model=model,
+                    contents=contents,
+                    generation_config=generation_config,
+                )
+        except GeminiApiError as e:
+            fallback = (fallback_model or "").strip()
+            if not fallback or fallback == model or not self._is_model_unavailable_error(e):
+                raise
+
+            logger.warning(
+                "[%s] %s: model=%s unavailable, retrying with fallback=%s",
+                trace_id,
+                operation,
+                model,
+                fallback,
+            )
+
+        async with self._sem:
+            return await self.api.generate_content(
+                model=fallback,
+                contents=contents,
+                generation_config=generation_config,
+            )
+
     
     async def plan_action_with_context(
         self,
@@ -336,7 +379,8 @@ class PhotoChatAgent:
         *,
         trace_id: str = "-",
     ) -> str:
-        model = model or getattr(settings, "GEMINI_TEXT_MODEL", "gemini-2.5-flash")
+        model = model or settings.GEMINI_TEXT_MODEL
+        fallback_model = settings.GEMINI_TEXT_MODEL_FALLBACK
         contents = []
         if history:
             for h in history[-12:]:
@@ -352,8 +396,13 @@ class PhotoChatAgent:
         )
 
         t0 = time.perf_counter()
-        async with self._sem:
-            resp = await self.api.generate_content(model=model, contents=contents)
+        resp = await self._generate_content_with_fallback(
+            model=model,
+            fallback_model=fallback_model,
+            contents=contents,
+            trace_id=trace_id,
+            operation="generate_text",
+        )
         dt = (time.perf_counter() - t0) * 1000
 
         text, _parts = self.api.extract_text_and_images(resp)
@@ -369,7 +418,8 @@ class PhotoChatAgent:
         trace_id: str = "-",
         asset_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        model = getattr(settings, "GEMINI_VISION_MODEL", "gemini-2.5-flash")
+        model = settings.GEMINI_VISION_MODEL
+        fallback_model = settings.GEMINI_VISION_MODEL_FALLBACK
         safe_bytes, safe_mime = _ensure_reasonable_image_bytes(image_bytes)
 
         logger.info(
@@ -401,18 +451,14 @@ class PhotoChatAgent:
         generation_config = {"responseMimeType": "application/json", "temperature": 0.2}
 
         t0 = time.perf_counter()
-        async with self._sem:
-            try:
-                resp = await self.api.generate_content(model=model, contents=contents, generation_config=generation_config)
-            except GeminiApiError as e:
-                # Fallback if Pro image model is not available for this API key/project.
-                fb = getattr(settings, "GEMINI_IMAGE_MODEL_FALLBACK", "gemini-2.5-flash-image")
-                msg = str(e)
-                if fb and fb != model and ("404" in msg or "not found" in msg.lower() or "NOT_FOUND" in msg):
-                    logger.warning("[%s] edit_or_generate_image: model=%s unavailable, retrying with fallback=%s", trace_id, model, fb)
-                    resp = await self.api.generate_content(model=fb, contents=contents, generation_config=generation_config)
-                else:
-                    raise
+        resp = await self._generate_content_with_fallback(
+            model=model,
+            fallback_model=fallback_model,
+            contents=contents,
+            generation_config=generation_config,
+            trace_id=trace_id,
+            operation="describe_image_rich",
+        )
         dt = (time.perf_counter() - t0) * 1000
 
         text, _parts = self.api.extract_text_and_images(resp)
@@ -466,7 +512,8 @@ class PhotoChatAgent:
         trace_id: str = "-",
         recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,  # [(asset_id, bytes, mime_type), ...]
     ) -> Dict[str, Any]:
-        model = getattr(settings, "GEMINI_VISION_MODEL", "gemini-2.5-flash")  # Use vision model to see images
+        model = settings.GEMINI_VISION_MODEL  # Use vision model to see images
+        fallback_model = settings.GEMINI_VISION_MODEL_FALLBACK
 
         assets_compact = [{
             "asset_id": a.get("asset_id"),
@@ -578,8 +625,14 @@ class PhotoChatAgent:
 
         t0 = time.perf_counter()
         try:
-            async with self._sem:
-                resp = await self.api.generate_content(model=model, contents=contents, generation_config=generation_config)
+            resp = await self._generate_content_with_fallback(
+                model=model,
+                fallback_model=fallback_model,
+                contents=contents,
+                generation_config=generation_config,
+                trace_id=trace_id,
+                operation="plan_action",
+            )
         except Exception as e:
             logger.exception("[%s] edit_or_generate_image: generate_content failed", trace_id)
             raise GeminiApiError(f"Image model error: {type(e).__name__}: {e}")
@@ -695,7 +748,8 @@ class PhotoChatAgent:
         *,
         trace_id: str = "-",
     ) -> Tuple[str, Optional[bytes], Optional[str]]:
-        model = model or getattr(settings, "GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+        model = model or settings.GEMINI_IMAGE_MODEL
+        fallback_model = settings.GEMINI_IMAGE_MODEL_FALLBACK
 
         sizes = [len(b) for b, _m in images]
         mimes = [_m for _b, _m in images]
@@ -717,8 +771,14 @@ class PhotoChatAgent:
         contents = [{"role": "user", "parts": parts}]
 
         t0 = time.perf_counter()
-        async with self._sem:
-            resp = await self.api.generate_content(model=model, contents=contents, generation_config=generation_config)
+        resp = await self._generate_content_with_fallback(
+            model=model,
+            fallback_model=fallback_model,
+            contents=contents,
+            generation_config=generation_config,
+            trace_id=trace_id,
+            operation="edit_or_generate_image",
+        )
         dt = (time.perf_counter() - t0) * 1000
 
         text, parts_out = self.api.extract_text_and_images(resp)

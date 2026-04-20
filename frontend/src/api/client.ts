@@ -636,6 +636,17 @@ class ApiClient {
     );
   }
 
+  async runPhotoGenerator(payload: Record<string, any>) {
+    return this.requestJson<any>(
+      '/photo/generator/run',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      { contentType: 'application/json' },
+    );
+  }
+
   async clearPhotoChat(threadId?: number, clearMode: 'messages' | 'context' | 'all' = 'all') {
     return this.requestJson<any>(
       '/photo/chat/clear',

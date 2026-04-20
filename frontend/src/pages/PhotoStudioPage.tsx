@@ -371,8 +371,10 @@ export default function PhotoStudioPage() {
   const [genCustomPrompt, setGenCustomPrompt] = useState('');
   const [genNewModelPrompt, setGenNewModelPrompt] = useState('');
   const [genVideoPrompt, setGenVideoPrompt] = useState('');
+  const [genSelectedModel, setGenSelectedModel] = useState<{ id?: string; label: string; prompt: string; quickAction?: Record<string, any> } | null>(null);
   const [genSelectedScene, setGenSelectedScene] = useState<{ id: string; label: string; quickAction: Record<string, any> } | null>(null);
   const [genSelectedPose, setGenSelectedPose] = useState<{ id: string; label: string; quickAction: Record<string, any> } | null>(null);
+  const [genSelectedVideo, setGenSelectedVideo] = useState<{ id: string; label: string; prompt: string; quickAction: Record<string, any> } | null>(null);
   const [genRunning, setGenRunning] = useState(false);
   const [genShowProductPicker, setGenShowProductPicker] = useState(false);
   const [genLatestResult, setGenLatestResult] = useState<PhotoMedia | null>(null);
@@ -509,8 +511,15 @@ export default function PhotoStudioPage() {
         id: `video-${item?.id}`,
         label: String(item?.label || item?.name || `Видео ${item?.id || ''}`),
         prompt: String(item?.prompt || ''),
-        quickAction: { type: 'create-video', prompt: String(item?.prompt || '') },
-      })).filter((item: any) => !!item.prompt);
+        quickAction: {
+          type: 'generate-video',
+          video_scenario_id: Number(item?.id || 0),
+          prompt: String(item?.prompt || ''),
+          model: String(item?.model || 'hailuo/minimax-video-01-live'),
+          duration: Number(item?.duration || 5),
+          resolution: String(item?.resolution || '720p'),
+        },
+      })).filter((item: any) => item.quickAction.video_scenario_id > 0);
 
       setCatalogVideos(videos);
 
@@ -765,34 +774,7 @@ export default function PhotoStudioPage() {
     return { assetId: data.asset_id || data.id, url: toAbsoluteMediaUrl(data.file_url || data.url) };
   };
 
-  const sendMessage = async ({
-    text,
-    photos,
-    quickAction,
-  }: {
-    text: string;
-    photos: PhotoMedia[];
-    quickAction?: Record<string, any>;
-  }) => {
-    const normalizedText = (text || '').trim();
-    if (!normalizedText && photos.length === 0 && !quickAction) return;
-    if (isStreaming) return;
-
-    setIsStreaming(true);
-    setIsBotTyping(true);
-    setInputText('');
-    setAttachedPhotos([]);
-
-    const userMsg: ChatMessage = {
-      id: uid(),
-      role: 'user',
-      type: photos.length > 0 && !normalizedText ? 'image' : 'text',
-      content: normalizedText,
-      timestamp: new Date(),
-      photos: photos.length > 0 ? photos : undefined,
-    };
-    setMessages((prev) => [...prev, userMsg]);
-
+  const preparePhotoAssets = async (photos: PhotoMedia[]) => {
     const assetIds: number[] = [];
     const fallbackPhotoUrls: string[] = [];
     const addFallbackUrl = (raw?: string) => {
@@ -836,7 +818,55 @@ export default function PhotoStudioPage() {
       }
     }
 
-    const uniqueAssetIds = Array.from(new Set(assetIds));
+    return {
+      assetIds: Array.from(new Set(assetIds)),
+      fallbackPhotoUrls,
+    };
+  };
+
+  const mapGeneratorAssetToPhoto = (asset: any): PhotoMedia | null => {
+    const url = toAbsoluteMediaUrl(asset?.file_url || asset?.url || '');
+    const assetId = Number(asset?.asset_id || asset?.id || 0);
+    if (!url || assetId <= 0) return null;
+    return {
+      id: `asset-${assetId}`,
+      assetId,
+      url,
+      fileName: asset?.file_name || fileNameFromUrl(url),
+      type: (/\.(mp4|mov|webm)/i.test(url) ? 'video' : 'image') as 'image' | 'video',
+      prompt: asset?.prompt || asset?.caption || '',
+    };
+  };
+
+  const sendMessage = async ({
+    text,
+    photos,
+    quickAction,
+  }: {
+    text: string;
+    photos: PhotoMedia[];
+    quickAction?: Record<string, any>;
+  }) => {
+    const normalizedText = (text || '').trim();
+    if (!normalizedText && photos.length === 0 && !quickAction) return;
+    if (isStreaming) return;
+
+    setIsStreaming(true);
+    setIsBotTyping(true);
+    setInputText('');
+    setAttachedPhotos([]);
+
+    const userMsg: ChatMessage = {
+      id: uid(),
+      role: 'user',
+      type: photos.length > 0 && !normalizedText ? 'image' : 'text',
+      content: normalizedText,
+      timestamp: new Date(),
+      photos: photos.length > 0 ? photos : undefined,
+    };
+    setMessages((prev) => [...prev, userMsg]);
+
+    const { assetIds: uniqueAssetIds, fallbackPhotoUrls } = await preparePhotoAssets(photos);
 
     try {
       const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1478,6 +1508,7 @@ export default function PhotoStudioPage() {
     if (!photo.assetId) {
       setGeneratedPhotos((prev) => prev.filter((p) => p.id !== photo.id));
       setMessages((prev) => prev.filter((msg) => !msg.photos?.some((item) => item.id === photo.id)));
+      setGenLatestResult((prev) => (prev?.id === photo.id ? null : prev));
       setPreviewPhoto((prev) => (prev?.id === photo.id ? null : prev));
       return;
     }
@@ -1540,6 +1571,7 @@ export default function PhotoStudioPage() {
           });
         }
       }
+      setGenLatestResult((prev) => (prev?.id === photo.id ? null : prev));
       setPreviewPhoto((prev) => (prev?.id === photo.id ? null : prev));
     } catch (e) {
       console.error('Delete history asset error', e);
@@ -1930,8 +1962,9 @@ export default function PhotoStudioPage() {
     if (genRunning || isStreaming) return;
 
     let photos: PhotoMedia[] = [];
-    let quickAction: Record<string, any> | undefined;
-    let text = '';
+    const payload: Record<string, any> = {
+      locale: contextState.locale || undefined,
+    };
 
     if (genTab === 'own-model') {
       if (!genGarmentPhoto || !genModelPhoto) {
@@ -1939,31 +1972,32 @@ export default function PhotoStudioPage() {
         return;
       }
       photos = [genGarmentPhoto, genModelPhoto];
-      quickAction = { type: 'normalize-own-model' };
-      text = 'Нормализация: своя фотомодель';
+      payload.generator_type = 'normalize-own-model';
     } else if (genTab === 'new-model') {
       if (!genGarmentPhoto) {
         toast.error('Загрузите фото изделия');
         return;
       }
-      const modelOpt = catalogModels[0];
+      if (!(genNewModelPrompt || genSelectedModel?.prompt || '').trim()) {
+        toast.error('Выберите тип модели или введите свой промпт');
+        return;
+      }
       photos = [genGarmentPhoto];
-      quickAction = {
-        type: 'put-on-model',
-        new_model_prompt: genNewModelPrompt || modelOpt?.prompt || 'Надень одежду на модель',
-        ...(modelOpt?.quickAction || {}),
-      };
-      text = `На новую модель: ${genNewModelPrompt || 'авто'}`;
+      payload.generator_type = 'put-on-model';
+      payload.prompt = (genNewModelPrompt || genSelectedModel?.prompt || '').trim() || undefined;
+      payload.model_item_id = genSelectedModel?.quickAction?.model_item_id;
     } else if (genTab === 'custom-prompt') {
       if (!genCustomPrompt.trim()) {
         toast.error('Введите промпт');
         return;
       }
-      if (genSourcePhoto) photos = [genSourcePhoto];
-      quickAction = genSourcePhoto
-        ? { type: 'custom-generation', prompt: genCustomPrompt }
-        : undefined;
-      text = genCustomPrompt;
+      if (!genSourcePhoto) {
+        toast.error('Выберите исходное фото');
+        return;
+      }
+      photos = [genSourcePhoto];
+      payload.generator_type = 'custom-generation';
+      payload.prompt = genCustomPrompt.trim();
     } else if (genTab === 'scenes') {
       if (!genSourcePhoto) {
         toast.error('Выберите исходное фото');
@@ -1974,8 +2008,9 @@ export default function PhotoStudioPage() {
         return;
       }
       photos = [genSourcePhoto];
-      quickAction = genSelectedScene.quickAction;
-      text = `Сцена: ${genSelectedScene.label}`;
+      payload.generator_type = 'change-background';
+      payload.scene_item_id = genSelectedScene.quickAction?.scene_item_id;
+      payload.prompt = genSelectedScene.quickAction?.scene_prompt || genSelectedScene.label;
     } else if (genTab === 'poses') {
       if (!genSourcePhoto) {
         toast.error('Выберите исходное фото');
@@ -1986,36 +2021,183 @@ export default function PhotoStudioPage() {
         return;
       }
       photos = [genSourcePhoto];
-      quickAction = genSelectedPose.quickAction;
-      text = `Поза: ${genSelectedPose.label}`;
+      payload.generator_type = 'change-pose';
+      payload.pose_prompt_id = genSelectedPose.quickAction?.pose_prompt_id;
+      payload.prompt = genSelectedPose.quickAction?.pose_prompt || genSelectedPose.label;
     } else if (genTab === 'video') {
       if (!genSourcePhoto) {
         toast.error('Выберите исходное фото');
         return;
       }
+      if (!(genVideoPrompt || genSelectedVideo?.prompt || '').trim()) {
+        toast.error('Выберите сценарий видео или введите свой промпт');
+        return;
+      }
       photos = [genSourcePhoto];
-      quickAction = {
-        type: 'generate-video',
-        prompt: genVideoPrompt || 'Оживи фото, сделай естественное движение',
-        model: 'hailuo/minimax-video-01-live',
-        duration: 5,
-        resolution: '720p',
-      };
-      text = `Видео: ${genVideoPrompt || 'авто'}`;
+      payload.generator_type = 'generate-video';
+      payload.prompt = (genVideoPrompt || genSelectedVideo?.prompt || '').trim() || undefined;
+      payload.video_scenario_id = genSelectedVideo?.quickAction?.video_scenario_id;
+      payload.model = genSelectedVideo?.quickAction?.model || 'hailuo/minimax-video-01-live';
+      payload.duration = genSelectedVideo?.quickAction?.duration || 5;
+      payload.resolution = genSelectedVideo?.quickAction?.resolution || '720p';
     }
 
     setGenRunning(true);
     try {
-      await sendMessage({ text, photos, quickAction });
+      const { assetIds } = await preparePhotoAssets(photos);
+      if (assetIds.length === 0) {
+        toast.error('Не удалось подготовить фото для генерации');
+        return;
+      }
+
+      payload.asset_ids = assetIds;
+      if (activeThreadId) payload.thread_id = activeThreadId;
+
+      const result = await api.runPhotoGenerator(payload);
+      const nextPhoto = mapGeneratorAssetToPhoto(result?.asset);
+      if (!nextPhoto) {
+        throw new Error('Generator result asset is missing');
+      }
+
+      if (result?.active_thread_id) setActiveThreadId(Number(result.active_thread_id));
+      else if (result?.thread_id) setActiveThreadId(Number(result.thread_id));
+      if (result?.context_state) setContextState(result.context_state);
+
+      setGeneratedPhotos((prev) => [nextPhoto, ...prev.filter((item) => item.assetId !== nextPhoto.assetId)]);
+      setGenLatestResult(nextPhoto);
+      setHistoryTab(nextPhoto.type);
+      toast.success(nextPhoto.type === 'video' ? 'Видео готово' : 'Результат готов');
+    } catch (e) {
+      console.error('Generator run error', e);
+      toast.error('Не удалось выполнить генерацию');
     } finally {
       setGenRunning(false);
     }
+  };
+
+  const sendGeneratorResultToChat = (photo: PhotoMedia | null) => {
+    if (!photo || photo.type !== 'image') return;
+    attachByUrl(photo.url, photo.assetId);
+    if (isMobile) setMobileTab('chat');
+    toast.success('Результат добавлен в чат');
   };
 
   const handleGenPhotoPick = (photo: PhotoMedia, target: 'garment' | 'model' | 'source') => {
     if (target === 'garment') setGenGarmentPhoto(photo);
     else if (target === 'model') setGenModelPhoto(photo);
     else setGenSourcePhoto(photo);
+  };
+
+  const renderGeneratorResult = () => {
+    if (!genLatestResult) return null;
+
+    return (
+      <div style={{
+        marginTop: 16,
+        padding: 12,
+        borderRadius: 16,
+        border: '1px solid rgba(148, 163, 184, 0.25)',
+        background: 'rgba(255, 255, 255, 0.82)',
+        backdropFilter: 'blur(10px)',
+        display: 'grid',
+        gap: 10,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>Последний результат генератора</div>
+            <div style={{ fontSize: 12, color: '#64748b' }}>
+              {genLatestResult.type === 'video' ? 'Видео готово и сохранено в историю' : 'Изображение готово и можно отправить в чат'}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setPreviewPhoto(genLatestResult)}
+            style={{
+              border: '1px solid rgba(148, 163, 184, 0.35)',
+              background: '#fff',
+              color: '#0f172a',
+              borderRadius: 999,
+              padding: '8px 12px',
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            Открыть
+          </button>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setPreviewPhoto(genLatestResult)}
+          style={{
+            width: '100%',
+            padding: 0,
+            border: 'none',
+            background: 'transparent',
+            cursor: 'pointer',
+            borderRadius: 14,
+            overflow: 'hidden',
+          }}
+        >
+          {genLatestResult.type === 'video' ? (
+            <video src={genLatestResult.url} muted playsInline style={{ width: '100%', display: 'block', maxHeight: 320, objectFit: 'cover', background: '#0f172a' }} />
+          ) : (
+            <ProxiedImg src={genLatestResult.url} alt="" crossOrigin="anonymous" style={{ width: '100%', display: 'block', maxHeight: 320, objectFit: 'cover', background: '#f8fafc' }} />
+          )}
+        </button>
+
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {genLatestResult.type === 'image' && (
+            <button
+              type="button"
+              onClick={() => sendGeneratorResultToChat(genLatestResult)}
+              disabled={!canAttachMore}
+              style={{
+                flex: '1 1 180px',
+                border: 'none',
+                borderRadius: 12,
+                padding: '12px 14px',
+                background: canAttachMore ? '#0f172a' : '#cbd5e1',
+                color: '#fff',
+                fontSize: 13,
+                fontWeight: 700,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 8,
+                cursor: canAttachMore ? 'pointer' : 'not-allowed',
+              }}
+            >
+              <Paperclip size={15} />
+              В чат для edit
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => handleDownload(genLatestResult)}
+            style={{
+              flex: '1 1 160px',
+              border: '1px solid rgba(148, 163, 184, 0.35)',
+              borderRadius: 12,
+              padding: '12px 14px',
+              background: '#fff',
+              color: '#0f172a',
+              fontSize: 13,
+              fontWeight: 700,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 8,
+              cursor: 'pointer',
+            }}
+          >
+            <Download size={15} />
+            Скачать
+          </button>
+        </div>
+      </div>
+    );
   };
 
   // ===================== MOBILE LAYOUT =====================
@@ -2300,12 +2482,16 @@ export default function PhotoStudioPage() {
                         <div className="ps-mgen-select-wrap">
                           <select
                             className="ps-mgen-select"
-                            value={catalogModels.some((o) => o.prompt === genNewModelPrompt) ? genNewModelPrompt : ''}
-                            onChange={(e) => setGenNewModelPrompt(e.target.value)}
+                            value={genSelectedModel?.id || ''}
+                            onChange={(e) => {
+                              const next = catalogModels.find((opt) => (opt.id || opt.label) === e.target.value) || null;
+                              setGenSelectedModel(next);
+                              setGenNewModelPrompt(next?.prompt || '');
+                            }}
                           >
                             <option value="">Выберите тип</option>
                             {catalogModels.map((opt) => (
-                              <option key={opt.id || opt.label} value={opt.prompt}>
+                              <option key={opt.id || opt.label} value={opt.id || opt.label}>
                                 {opt.label}
                               </option>
                             ))}
@@ -2314,7 +2500,17 @@ export default function PhotoStudioPage() {
                         </div>
                       </div>
                     )}
-                    <input type="text" className="ps-mgen-text-input" value={genNewModelPrompt} onChange={e => setGenNewModelPrompt(e.target.value)} placeholder="Или опишите модель вручную..." />
+                    <input
+                      type="text"
+                      className="ps-mgen-text-input"
+                      value={genNewModelPrompt}
+                      onChange={e => {
+                        const next = e.target.value;
+                        setGenNewModelPrompt(next);
+                        if (genSelectedModel?.prompt !== next) setGenSelectedModel(null);
+                      }}
+                      placeholder="Или опишите модель вручную..."
+                    />
                   </div>
                 )}
 
@@ -2532,12 +2728,16 @@ export default function PhotoStudioPage() {
                         <div className="ps-mgen-select-wrap">
                           <select
                             className="ps-mgen-select"
-                            value={catalogVideos.some((v) => v.prompt === genVideoPrompt) ? genVideoPrompt : ''}
-                            onChange={(e) => setGenVideoPrompt(e.target.value)}
+                            value={genSelectedVideo?.id || ''}
+                            onChange={(e) => {
+                              const next = catalogVideos.find((video) => video.id === e.target.value) || null;
+                              setGenSelectedVideo(next);
+                              setGenVideoPrompt(next?.prompt || '');
+                            }}
                           >
                             <option value="">Выберите тип</option>
                             {catalogVideos.map((v) => (
-                              <option key={v.id} value={v.prompt}>
+                              <option key={v.id} value={v.id}>
                                 {v.label}
                               </option>
                             ))}
@@ -2546,13 +2746,24 @@ export default function PhotoStudioPage() {
                         </div>
                       </div>
                     )}
-                    <input type="text" className="ps-mgen-text-input" value={genVideoPrompt} onChange={e => setGenVideoPrompt(e.target.value)} placeholder="Или опишите движение вручную..." />
+                    <input
+                      type="text"
+                      className="ps-mgen-text-input"
+                      value={genVideoPrompt}
+                      onChange={e => {
+                        const next = e.target.value;
+                        setGenVideoPrompt(next);
+                        if (genSelectedVideo?.prompt !== next) setGenSelectedVideo(null);
+                      }}
+                      placeholder="Или опишите движение вручную..."
+                    />
                   </div>
                 )}
               </div>
 
 
               {renderProductPicker()}
+              {renderGeneratorResult()}
               {/* Run button - sticky bottom */}
               {genRunning ? (
                 <div className="ps-mgen-generating-overlay">
@@ -3512,8 +3723,12 @@ export default function PhotoStudioPage() {
                           {catalogModels.map((opt) => (
                             <button
                               key={opt.id || opt.label}
-                              className={`ps-gen-catalog-option ${genNewModelPrompt === opt.prompt ? 'active' : ''}`}
-                              onClick={() => setGenNewModelPrompt(opt.prompt)}
+                              className={`ps-gen-catalog-option ${genSelectedModel?.id === opt.id ? 'active' : ''}`}
+                              onClick={() => {
+                                const next = genSelectedModel?.id === opt.id ? null : opt;
+                                setGenSelectedModel(next);
+                                setGenNewModelPrompt(next?.prompt || '');
+                              }}
                             >
                               {opt.label}
                             </button>
@@ -3526,7 +3741,11 @@ export default function PhotoStudioPage() {
                       type="text"
                       className="ps-gen-prompt-input"
                       value={genNewModelPrompt}
-                      onChange={(e) => setGenNewModelPrompt(e.target.value)}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        setGenNewModelPrompt(next);
+                        if (genSelectedModel?.prompt !== next) setGenSelectedModel(null);
+                      }}
                       placeholder="Описание модели (необязательно)..."
                     />
                   </div>
@@ -3747,8 +3966,12 @@ export default function PhotoStudioPage() {
                           {catalogVideos.map((v) => (
                             <button
                               key={v.id}
-                              className={`ps-gen-catalog-option ${genVideoPrompt === v.prompt ? 'active' : ''}`}
-                              onClick={() => setGenVideoPrompt(genVideoPrompt === v.prompt ? '' : v.prompt)}
+                              className={`ps-gen-catalog-option ${genSelectedVideo?.id === v.id ? 'active' : ''}`}
+                              onClick={() => {
+                                const next = genSelectedVideo?.id === v.id ? null : v;
+                                setGenSelectedVideo(next);
+                                setGenVideoPrompt(next?.prompt || '');
+                              }}
                             >
                               {v.label}
                             </button>
@@ -3761,12 +3984,18 @@ export default function PhotoStudioPage() {
                       type="text"
                       className="ps-gen-prompt-input"
                       value={genVideoPrompt}
-                      onChange={(e) => setGenVideoPrompt(e.target.value)}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        setGenVideoPrompt(next);
+                        if (genSelectedVideo?.prompt !== next) setGenSelectedVideo(null);
+                      }}
                       placeholder="Или введите своё описание движения..."
                     />
                   </div>
                 )}
               </div>
+
+              {renderGeneratorResult()}
 
               {/* Run button */}
               <div className="ps-gen-footer">

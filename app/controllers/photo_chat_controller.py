@@ -25,6 +25,7 @@ from app.services.media_storage import (
 )
 from app.services.photo_chat_agent import PhotoChatAgent, resolve_photo_chat_locale
 from app.models.photo_chat import PhotoChatMedia, PhotoChatMessage, PhotoChatThread
+from app.models.generator import VideoScenario
 
 from app.services.scence_repositories import SceneCategoryRepository, PoseRepository
 from app.services.model_repository import ModelRepository
@@ -2176,6 +2177,283 @@ class PhotoChatController:
             assets=assets,
             message_count=msg_count,
         )
+
+    async def run_generator(
+        self,
+        *,
+        user: Any,
+        db,
+        payload: Dict[str, Any],
+        base_url: str | None = None,
+    ) -> Dict[str, Any]:
+        uid = _user_id(user)
+        if uid is None:
+            raise ValueError("unauthorized")
+
+        base_url = _normalize_base_url(base_url)
+        repo = PhotoChatRepository(db)
+        sess = repo.get_or_create_user_session(uid)
+        active_thread = repo.get_or_create_active_thread(sess.id)
+        thread = self._resolve_thread(repo, session_id=sess.id, requested_thread_id=_coerce_int(payload.get("thread_id")))
+        context_state = repo.get_thread_context(thread.id)
+
+        action_type = (payload.get("generator_type") or payload.get("type") or payload.get("action") or "").strip().lower().replace("_", "-")
+        action_aliases = {
+            "create_video": "generate-video",
+            "create-video": "generate-video",
+            "change-background": "change-background",
+            "change-pose": "change-pose",
+            "put-on-model": "put-on-model",
+            "normalize-own-model": "normalize-own-model",
+            "custom-generation": "custom-generation",
+            "generate-video": "generate-video",
+        }
+        action_type = action_aliases.get(action_type, action_type)
+        if not action_type:
+            raise ValueError("quick_action.type is required")
+
+        response_locale = self._response_locale(
+            user_message=str(payload.get("prompt") or ""),
+            thread_context=context_state,
+        )
+
+        raw_asset_ids = payload.get("asset_ids") or []
+        if not isinstance(raw_asset_ids, list):
+            raw_asset_ids = [raw_asset_ids]
+
+        selected_ids: list[int] = []
+        for item in raw_asset_ids:
+            asset_id = _coerce_int(item)
+            if asset_id is None:
+                continue
+            selected_ids.append(asset_id)
+
+        media_list = repo.list_media(sess.id, limit=None)
+        media_map = {int(media.id): media for media in media_list}
+        selected_ids = [asset_id for asset_id in selected_ids if asset_id in media_map]
+
+        def _require_asset_count(min_count: int = 1) -> None:
+            if len(selected_ids) >= min_count:
+                return
+            if min_count >= 2:
+                raise ValueError(self._text("need_two_photos", locale=response_locale))
+            raise ValueError(self._text("need_asset", locale=response_locale))
+
+        def _get_source_media(index: int = 0) -> PhotoChatMedia:
+            _require_asset_count(index + 1)
+            media = media_map.get(int(selected_ids[index]))
+            if not media:
+                raise ValueError(self._text("uploaded_photos_missing", locale=response_locale))
+            return media
+
+        def _persist_generated_asset(
+            out_bytes: bytes,
+            *,
+            prompt_text: str,
+            media_type: str,
+        ) -> Dict[str, Any]:
+            rel_path = save_generated_file(out_bytes, kind=media_type)
+            generator_meta = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"thread_id", "asset_ids", "locale"}
+            }
+            gen_media = repo.add_media(
+                session_id=sess.id,
+                relpath=rel_path,
+                kind=media_type,
+                source="generated",
+                source_url=None,
+                prompt=prompt_text,
+                meta={
+                    "source_asset_ids": selected_ids,
+                    "generator": {
+                        "type": action_type,
+                        **generator_meta,
+                    },
+                },
+            )
+            repo.set_last_generated(sess.id, rel_path)
+            next_context_state = repo.update_thread_context(
+                thread.id,
+                last_generated_asset_id=gen_media.id,
+                working_asset_ids=[gen_media.id],
+                pending_question=None,
+                last_action={
+                    "type": action_type,
+                    "status": "completed",
+                    "origin": "generator",
+                    "source_asset_ids": selected_ids,
+                    "generated_asset_id": gen_media.id,
+                    "media_type": media_type,
+                },
+            )
+            db.commit()
+
+            try:
+                save_generated_metadata(
+                    rel_path,
+                    {
+                        "source": "kie",
+                        "origin": "generator",
+                        "user_id": uid,
+                        "thread_id": thread.id,
+                        "asset_id": gen_media.id,
+                        "seq": gen_media.seq,
+                        "prompt": prompt_text,
+                        "generator_action": action_type,
+                        "media_type": media_type,
+                    },
+                )
+            except Exception:
+                pass
+
+            return {
+                "thread_id": thread.id,
+                "active_thread_id": active_thread.id,
+                "generator_action": action_type,
+                "context_state": next_context_state,
+                "asset": self._serialize_asset(gen_media, base_url=base_url),
+            }
+
+        if action_type == "normalize-own-model":
+            garment_media = _get_source_media(0)
+            model_media = _get_source_media(1)
+            garment_url = get_file_url(garment_media.relpath, base_url=base_url)
+            model_url = get_file_url(model_media.relpath, base_url=base_url)
+            prompt_text = self._text("normalize_own_model", locale=response_locale)
+
+            result = await kie_service.normalize_own_model(
+                item_image_url=garment_url,
+                model_image_url=model_url,
+                max_attempts=0,
+            )
+            out_bytes = result.get("image")
+            if not out_bytes:
+                raise ValueError("No image in result")
+            return _persist_generated_asset(out_bytes, prompt_text=prompt_text, media_type="image")
+
+        source_media = _get_source_media(0)
+        source_url = get_file_url(source_media.relpath, base_url=base_url)
+
+        if action_type == "put-on-model":
+            model_item_id = _coerce_int(payload.get("model_item_id"))
+            manual_prompt = (payload.get("prompt") or "").strip()
+            model_prompt = ""
+            if model_item_id:
+                repo_model = ModelRepository(db)
+                model_item = repo_model.get_item(model_item_id)
+                if model_item and getattr(model_item, "is_active", True):
+                    model_prompt = str(getattr(model_item, "prompt", "") or "").strip()
+
+            final_prompt = (model_prompt or manual_prompt).strip()
+            if not final_prompt:
+                raise ValueError("new_model_prompt or model_item_id is required")
+
+            result = await kie_service.normalize_new_model(
+                item_image_url=source_url,
+                model_prompt=final_prompt,
+                ghost_prompt_override=None,
+                new_model_prompt_override=(manual_prompt or None) if not model_prompt else None,
+                max_attempts=0,
+            )
+            out_bytes = result.get("image")
+            if not out_bytes:
+                raise ValueError("No image in result")
+            return _persist_generated_asset(out_bytes, prompt_text=final_prompt, media_type="image")
+
+        if action_type == "custom-generation":
+            custom_prompt = (payload.get("prompt") or "").strip()
+            if not custom_prompt:
+                raise ValueError(self._text("prompt_required", locale=response_locale))
+
+            result = await kie_service.custom_generation(source_url, custom_prompt, max_attempts=0)
+            out_bytes = result.get("image")
+            if not out_bytes:
+                raise ValueError("No image in result")
+            return _persist_generated_asset(out_bytes, prompt_text=custom_prompt, media_type="image")
+
+        if action_type == "change-background":
+            scene_item_id = _coerce_int(payload.get("scene_item_id"))
+            if not scene_item_id:
+                raise ValueError("scene_item_id is required")
+
+            scene_repo = SceneCategoryRepository(db)
+            scene_item = scene_repo.get_item(scene_item_id)
+            if not scene_item or not getattr(scene_item, "is_active", True):
+                raise ValueError("Scene item not found")
+            scene_sub = scene_repo.get_subcategory(scene_item.subcategory_id)
+            scene_cat = scene_repo.get_category(scene_sub.category_id) if scene_sub else None
+
+            full_prompt = (
+                f"Create a professional product card. "
+                f"Scene: {getattr(scene_cat, 'name', '')} -> {getattr(scene_sub, 'name', '')} -> {getattr(scene_item, 'name', '')}. "
+                f"{getattr(scene_item, 'prompt', '')}"
+            ).strip()
+            prompt_text = " — ".join(
+                [
+                    part
+                    for part in [
+                        getattr(scene_cat, "name", ""),
+                        getattr(scene_sub, "name", ""),
+                        getattr(scene_item, "name", ""),
+                    ]
+                    if part
+                ]
+            ) or self._text("change_background", locale=response_locale)
+
+            result = await kie_service.change_scene(source_url, full_prompt, max_attempts=0)
+            out_bytes = result.get("image")
+            if not out_bytes:
+                raise ValueError("No image in result")
+            return _persist_generated_asset(out_bytes, prompt_text=prompt_text, media_type="image")
+
+        if action_type == "change-pose":
+            pose_prompt_id = _coerce_int(payload.get("pose_prompt_id"))
+            if not pose_prompt_id:
+                raise ValueError("pose_prompt_id is required")
+
+            pose_repo = PoseRepository(db)
+            pose_prompt = pose_repo.get_prompt(pose_prompt_id)
+            if not pose_prompt or not getattr(pose_prompt, "is_active", True):
+                raise ValueError("Pose prompt not found")
+
+            prompt_text = str(getattr(pose_prompt, "name", "") or getattr(pose_prompt, "prompt", "") or "").strip()
+            prompt_text = prompt_text or self._text("change_pose", locale=response_locale)
+            result = await kie_service.change_pose(source_url, pose_prompt.prompt, max_attempts=0)
+            out_bytes = result.get("image")
+            if not out_bytes:
+                raise ValueError("No image in result")
+            return _persist_generated_asset(out_bytes, prompt_text=prompt_text, media_type="image")
+
+        if action_type == "generate-video":
+            video_prompt = (payload.get("prompt") or "").strip()
+            video_scenario_id = _coerce_int(payload.get("video_scenario_id"))
+            if video_scenario_id:
+                video_scenario = db.get(VideoScenario, video_scenario_id)
+                if video_scenario and getattr(video_scenario, "is_active", True):
+                    video_prompt = str(getattr(video_scenario, "prompt", "") or "").strip() or video_prompt
+            if not video_prompt:
+                video_prompt = self._text("create_video_from_photo", locale=response_locale)
+
+            video_model = (payload.get("model") or "hailuo/minimax-video-01-live").strip()
+            video_duration = int(payload.get("duration") or 5)
+            video_resolution = (payload.get("resolution") or "720p").strip()
+
+            result = await kie_service.generate_video(
+                image_url=source_url,
+                prompt=video_prompt,
+                model=video_model,
+                duration=video_duration,
+                resolution=video_resolution,
+                max_attempts=0,
+            )
+            out_bytes = result.get("video") or result.get("image")
+            if not out_bytes:
+                raise ValueError("No video in result")
+            return _persist_generated_asset(out_bytes, prompt_text=video_prompt, media_type="video")
+
+        raise ValueError(self._text("quick_action_unsupported", locale=response_locale))
 
     async def delete_messages(self, *, user: Any, db, payload: Dict[str, Any]) -> Dict[str, Any]:
         uid = _user_id(user)

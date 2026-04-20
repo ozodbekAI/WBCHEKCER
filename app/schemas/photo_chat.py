@@ -172,6 +172,78 @@ class PhotoChatDeleteResponse(BaseModel):
     locked: bool = False
 
 
+class PhotoGeneratorRequest(BaseModel):
+    generator_type: str
+    asset_ids: List[int] = Field(default_factory=list)
+    thread_id: Optional[int] = None
+    locale: Optional[str] = None
+    prompt: Optional[str] = None
+    scene_item_id: Optional[int] = None
+    pose_prompt_id: Optional[int] = None
+    model_item_id: Optional[int] = None
+    video_scenario_id: Optional[int] = None
+    model: Optional[str] = None
+    duration: Optional[int] = None
+    resolution: Optional[str] = None
+
+    @field_validator("asset_ids", mode="before")
+    @classmethod
+    def _normalize_generator_asset_ids(cls, value: object) -> List[int]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+
+        normalized: List[int] = []
+        for item in value:
+            try:
+                normalized.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    @field_validator(
+        "generator_type",
+        "locale",
+        "prompt",
+        "model",
+        "resolution",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_generator_strings(cls, value: object) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @field_validator(
+        "thread_id",
+        "scene_item_id",
+        "pose_prompt_id",
+        "model_item_id",
+        "video_scenario_id",
+        "duration",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_generator_ints(cls, value: object) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+
+class PhotoGeneratorResponse(BaseModel):
+    thread_id: int
+    active_thread_id: int
+    generator_action: str
+    context_state: PhotoChatThreadContext = Field(default_factory=PhotoChatThreadContext)
+    asset: PhotoChatAssetOut
+
+
 class PhotoChatThreadOut(BaseModel):
     id: int
     session_id: int
