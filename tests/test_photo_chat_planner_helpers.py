@@ -142,3 +142,32 @@ def test_generate_content_with_fallback_does_not_retry_for_non_missing_model_err
         assert "429" in str(exc)
     else:
         raise AssertionError("Expected GeminiApiError to be raised")
+
+
+def test_generate_content_with_fallback_retries_when_model_is_temporarily_unavailable():
+    class _FakeApi:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_content(self, *, model, contents, generation_config=None):
+            self.calls.append(model)
+            if model == "gemini-3-pro-image-preview":
+                raise GeminiApiError("Gemini error 503: model is experiencing high demand and is UNAVAILABLE")
+            return {"ok": True, "model": model, "contents": contents}
+
+    agent = PhotoChatAgent.__new__(PhotoChatAgent)
+    agent.api = _FakeApi()
+    agent._sem = asyncio.Semaphore(1)
+
+    result = asyncio.run(
+        agent._generate_content_with_fallback(
+            model="gemini-3-pro-image-preview",
+            fallback_model="gemini-2.5-flash-image",
+            contents=[{"role": "user", "parts": [{"text": "hello"}]}],
+            trace_id="fallback-test",
+            operation="edit_or_generate_image",
+        )
+    )
+
+    assert result["model"] == "gemini-2.5-flash-image"
+    assert agent.api.calls == ["gemini-3-pro-image-preview", "gemini-2.5-flash-image"]

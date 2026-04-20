@@ -95,6 +95,11 @@ class _FakeQuestionAgent:
         return "fallback"
 
 
+class _FakeQuickActionAgent:
+    async def describe_image_rich(self, *args, **kwargs):
+        return {}
+
+
 def test_only_message_event_is_used_for_supported_sse_payload_types():
     controller = PhotoChatController.__new__(PhotoChatController)
     state = StreamState(request_id="req-contract", thread_id=77)
@@ -180,6 +185,58 @@ def test_locale_behavior_uses_uzbek_for_question_fallback():
 
     assert result.intent == "question"
     assert result.assistant_message == "Iltimos, aynan nimani o'zgartirish yoki yaratish kerakligini aniqlashtirib bering."
+
+
+def test_generate_video_quick_action_stream_persists_result_without_name_error(monkeypatch):
+    repo = _make_repo()
+    controller = PhotoChatController.__new__(PhotoChatController)
+    controller._agent = _FakeQuickActionAgent()
+
+    session = repo.get_or_create_user_session(user_id=1202)
+    source_media = repo.add_media(session.id, relpath="photos/source.jpg", kind="image", source="upload")
+    repo.db.commit()
+
+    async def _fake_generate_video(**kwargs):
+        return {"video": b"fake-video-bytes"}
+
+    monkeypatch.setattr(controller_module.kie_service, "generate_video", _fake_generate_video)
+    monkeypatch.setattr(controller_module, "_save_bytes_to_media_photos", lambda content, ext: "photos/generated-video.mp4")
+    monkeypatch.setattr(controller_module, "save_generated_file", lambda content, kind="image": "photos/generated-video.mp4")
+    monkeypatch.setattr(controller_module, "save_generated_metadata", lambda *args, **kwargs: None)
+
+    chunks = asyncio.run(
+        _collect_chunks(
+            controller.chat_stream(
+                user={"id": 1202},
+                db=repo.db,
+                payload={
+                    "message": "make a short promo video",
+                    "request_id": "req-video",
+                    "asset_ids": [source_media.id],
+                    "quick_action": {
+                        "type": "generate-video",
+                        "prompt": "Create a short promo video",
+                        "model": "hailuo/minimax-video-01-live",
+                        "duration": 5,
+                        "resolution": "720p",
+                    },
+                    "base_url": "https://backend.example.com",
+                },
+            )
+        )
+    )
+
+    payloads = [_parse_sse_chunk(chunk) for chunk in chunks]
+    types = [payload["type"] for payload in payloads]
+
+    assert types == ["ack", "generation_start", "generation_complete", "context_state"]
+    assert payloads[2]["media_type"] == "video"
+    assert payloads[2]["image_url"].endswith("/media/photos/generated-video.mp4")
+
+    session_assets = repo.list_media(session.id, limit=None)
+    assert any(item.kind == "video" for item in session_assets)
+
+    repo.db.close()
 
 
 def test_clear_mode_all_resets_messages_and_context_but_keeps_media():

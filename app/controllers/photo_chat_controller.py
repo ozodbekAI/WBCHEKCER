@@ -1368,7 +1368,7 @@ class PhotoChatController:
                     result_holder=result_container,
                 ):
                     yield chunk
-                result = result_holder.get("result", {})
+                result = result_container.get("result", {})
                 out_bytes = result.get("video") or result.get("image")
                 if not out_bytes:
                     yield _emit_error("No video in result")

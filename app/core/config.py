@@ -55,11 +55,11 @@ class Settings(BaseSettings):
     # Gemini AI Settings
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
-    GEMINI_TEXT_MODEL: str = "gemini-3-flash-preview"
+    GEMINI_TEXT_MODEL: str = "gemini-2.5-flash"
     GEMINI_TEXT_MODEL_FALLBACK: str = "gemini-2.5-flash"
-    GEMINI_VISION_MODEL: str = "gemini-3-flash-preview"
+    GEMINI_VISION_MODEL: str = "gemini-2.5-flash"
     GEMINI_VISION_MODEL_FALLBACK: str = "gemini-2.5-flash"
-    GEMINI_IMAGE_MODEL: str = "gemini-2.5-flash-image"
+    GEMINI_IMAGE_MODEL: str = "gemini-3-pro-image-preview"
     GEMINI_IMAGE_MODEL_FALLBACK: str = "gemini-2.5-flash-image"
     GEMINI_MAX_OUTPUT_TOKENS: int = 8192
     GEMINI_TEMPERATURE: float = 0.2

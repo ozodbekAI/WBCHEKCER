@@ -238,10 +238,18 @@ class PhotoChatAgent:
         await self.api.aclose()
 
     @staticmethod
-    def _is_model_unavailable_error(exc: Exception) -> bool:
+    def _should_use_fallback_model(exc: Exception) -> bool:
         msg = str(exc or "")
         lowered = msg.lower()
-        return "404" in msg or "not found" in lowered or "not_found" in lowered
+        return (
+            "404" in msg
+            or "429" in msg
+            or "503" in msg
+            or "not found" in lowered
+            or "not_found" in lowered
+            or "unavailable" in lowered
+            or "high demand" in lowered
+        )
 
     async def _generate_content_with_fallback(
         self,
@@ -262,7 +270,7 @@ class PhotoChatAgent:
                 )
         except GeminiApiError as e:
             fallback = (fallback_model or "").strip()
-            if not fallback or fallback == model or not self._is_model_unavailable_error(e):
+            if not fallback or fallback == model or not self._should_use_fallback_model(e):
                 raise
 
             logger.warning(

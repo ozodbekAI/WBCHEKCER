@@ -4,6 +4,7 @@ import { useStore } from '../contexts/StoreContext';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import api, { API_ORIGIN } from '../api/client';
 import { useIsMobile } from '../hooks/use-mobile';
+import { applyStreamErrorToMessages, parseSsePayloads, upsertGeneratedPhoto } from '../lib/photoChatStream';
 import {
   ChevronLeft,
   Send,
@@ -265,6 +266,25 @@ function fileNameFromUrl(url: string) {
 function prependUniquePhoto(list: PhotoMedia[], photo: PhotoMedia) {
   const exists = list.some((item) => (photo.assetId ? item.assetId === photo.assetId : false) || item.url === photo.url);
   return exists ? list : [photo, ...list];
+}
+
+function buildStreamMediaPhoto(event: any): PhotoMedia | null {
+  const mediaUrl = toAbsoluteMediaUrl(event?.image_url || event?.url || event?.file_url || '');
+  if (!mediaUrl) return null;
+
+  const assetId = Number(event?.asset_id || event?.assetId || 0) || undefined;
+  const fileName = String(event?.file_name || event?.filename || fileNameFromUrl(mediaUrl));
+  const explicitMediaType = String(event?.media_type || '').toLowerCase();
+  const isVideo = explicitMediaType === 'video' || /\.(mp4|mov|webm)/i.test(mediaUrl) || /\.(mp4|mov|webm)/i.test(fileName);
+
+  return {
+    id: assetId ? `gen-${assetId}` : `gen-${Date.now()}`,
+    assetId,
+    url: mediaUrl,
+    fileName,
+    type: isVideo ? 'video' : 'image',
+    prompt: event?.prompt ? String(event.prompt) : undefined,
+  };
 }
 
 type MobileTab = 'chat' | 'generator' | 'history' | 'products';
@@ -892,6 +912,9 @@ export default function PhotoStudioPage() {
       let botPhotos: PhotoMedia[] = [];
       let botMsgId = uid();
       let botAdded = false;
+      let streamThreadId = activeThreadId;
+      let sawGenerationStart = false;
+      let sawGeneratedMedia = false;
 
       const addOrUpdateBot = (type: ChatMessage['type'] = 'text', loading = false) => {
         setIsBotTyping(false);
@@ -918,8 +941,56 @@ export default function PhotoStudioPage() {
         }
       };
 
+      const syncRequestResultsFromHistory = async () => {
+        const history = await api.getPhotoChatHistory(streamThreadId || undefined);
+        if (history?.active_thread_id) setActiveThreadId(history.active_thread_id);
+        else if (history?.thread_id) setActiveThreadId(history.thread_id);
+        if (history?.context_state) setContextState(history.context_state);
+
+        if (!history?.messages) return false;
+
+        const resultMsgs = history.messages.filter(
+          (item: any) => item.request_id === requestId && item.role === 'model',
+        );
+        if (!resultMsgs.length) return false;
+
+        const nextPhotos: PhotoMedia[] = [];
+        for (const resultMsg of resultMsgs) {
+          if (resultMsg.msg_type === 'image' && Array.isArray(resultMsg.meta?.asset_ids)) {
+            for (const assetId of resultMsg.meta.asset_ids) {
+              const asset = history.assets?.find((entry: any) => Number(entry.asset_id) === Number(assetId));
+              const photo = buildStreamMediaPhoto({
+                asset_id: asset?.asset_id,
+                image_url: asset?.file_url,
+                file_name: asset?.file_name,
+                prompt: asset?.prompt || asset?.caption,
+              });
+              if (photo) nextPhotos.push(photo);
+            }
+          }
+          if (resultMsg.msg_type === 'text' && resultMsg.content) {
+            botContent = String(resultMsg.content);
+          }
+        }
+
+        if (nextPhotos.length > 0) {
+          botPhotos = nextPhotos.reduce<PhotoMedia[]>((acc, photo) => prependUniquePhoto(acc, photo), botPhotos);
+          setGeneratedPhotos((prev) => nextPhotos.reduce((acc, photo) => upsertGeneratedPhoto(acc, photo), prev));
+          sawGeneratedMedia = true;
+        }
+
+        if (!botContent && nextPhotos.length > 0) {
+          botContent = 'Готово!';
+        }
+
+        if (botContent || nextPhotos.length > 0) {
+          addOrUpdateBot(nextPhotos.length > 0 ? 'action-complete' : 'text', false);
+        }
+
+        return !!(botContent || nextPhotos.length > 0);
+      };
+
       let receivedComplete = false;
-      let lastEventTime = Date.now();
 
       if (reader) {
         let buf = '';
@@ -927,25 +998,22 @@ export default function PhotoStudioPage() {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            lastEventTime = Date.now();
             buf += dec.decode(value, { stream: true });
-            const lines = buf.split('\n');
-            buf = lines.pop() || '';
+            const parsed = parseSsePayloads(buf, '');
+            buf = parsed.buffer;
 
-            for (const ln of lines) {
-              if (!ln.startsWith('data: ')) continue;
+            for (const d of parsed.events) {
               try {
-                const d = JSON.parse(ln.slice(6));
-
                 if (d.type === 'ack') {
                   if (d.thread_id) {
-                    setActiveThreadId(d.thread_id);
+                    streamThreadId = Number(d.thread_id);
+                    setActiveThreadId(streamThreadId);
                     setThreadList((prev) => {
                       const next = upsertThread(prev, {
-                        id: d.thread_id,
+                        id: Number(d.thread_id),
                         preview: (normalizedText || 'Фото').slice(0, 60),
                         createdAt: new Date().toISOString(),
-                        messageCount: (prev.find((t) => t.id === d.thread_id)?.messageCount || 0) + 1,
+                        messageCount: (prev.find((t) => t.id === Number(d.thread_id))?.messageCount || 0) + 1,
                       });
                       saveStoredThreads(next);
                       return next;
@@ -971,49 +1039,41 @@ export default function PhotoStudioPage() {
                   receivedComplete = true;
                 }
                 else if (d.type === 'images_start') {
+                  sawGenerationStart = true;
                   botContent = '';
                   addOrUpdateBot('action-progress', true);
                 }
                 else if (d.type === 'image_started') {
+                  sawGenerationStart = true;
                   botContent = '';
                   addOrUpdateBot('action-progress', true);
                 }
                 else if (d.type === 'generation_start') {
+                  sawGenerationStart = true;
                   botContent = '';
                   addOrUpdateBot('action-progress', true);
                 }
                 else if (d.type === 'generation_complete') {
-                  const mediaUrl = toAbsoluteMediaUrl(d.image_url || d.url);
-                  const isVideo = /\.(mp4|mov|webm)/i.test(mediaUrl) || /\.(mp4|mov|webm)/i.test(d.file_name || '');
-                  const newPhoto: PhotoMedia = {
-                    id: `gen-${d.asset_id || Date.now()}`,
-                    assetId: d.asset_id,
-                    url: mediaUrl,
-                    fileName: d.file_name,
-                    type: isVideo ? 'video' : 'image',
-                    prompt: d.prompt,
-                  };
-                  botPhotos.push(newPhoto);
-                  setGeneratedPhotos((prev) => [newPhoto, ...prev]);
+                  const newPhoto = buildStreamMediaPhoto(d);
+                  if (newPhoto) {
+                    sawGeneratedMedia = true;
+                    botPhotos = prependUniquePhoto(botPhotos, newPhoto);
+                    setGeneratedPhotos((prev) => upsertGeneratedPhoto(prev, newPhoto));
+                  }
                   const total = Number(d.total || 1);
                   const index = Number(d.index || total);
                   const hasMore = index < total;
                   botContent = hasMore
                     ? `Генерация изображения ${index} из ${total}...`
                     : 'Готово!';
-                  addOrUpdateBot('action-complete', hasMore);
-                  if (!hasMore) receivedComplete = true;
+                  addOrUpdateBot(hasMore ? 'action-progress' : 'action-complete', hasMore);
+                  if (!hasMore && newPhoto) receivedComplete = true;
                 }
                 else if (d.type === 'media' || d.type === 'image') {
-                  const u = toAbsoluteMediaUrl(d.url || d.image_url);
-                  if (!u) continue;
-                  botPhotos.push({
-                    id: uid(),
-                    assetId: Number(d.asset_id || d.assetId || 0) || undefined,
-                    url: u,
-                    type: 'image',
-                    fileName: d.filename,
-                  });
+                  const photo = buildStreamMediaPhoto(d);
+                  if (!photo) continue;
+                  sawGeneratedMedia = true;
+                  botPhotos = prependUniquePhoto(botPhotos, photo);
                   addOrUpdateBot('text');
                 }
                 else if (d.type === 'context_state' && d.context_state) {
@@ -1039,42 +1099,12 @@ export default function PhotoStudioPage() {
             for (let attempt = 0; attempt < 12; attempt++) {
               await new Promise((r) => setTimeout(r, 10000));
               try {
-                const history = await api.getPhotoChatHistory();
-                if (history?.messages) {
-                  const resultMsgs = history.messages.filter(
-                    (m: any) => m.request_id === requestId && m.role === 'model'
-                  );
-                  if (resultMsgs.length > 0) {
-                    // Found results — update UI
-                    for (const rm of resultMsgs) {
-                      if (rm.msg_type === 'image' && rm.meta?.asset_ids) {
-                        for (const aId of rm.meta.asset_ids) {
-                          const asset = history.assets?.find((a: any) => a.asset_id === aId);
-                          if (asset) {
-                            const mediaUrl = toAbsoluteMediaUrl(asset.file_url);
-                            const isVideo = /\.(mp4|mov|webm)/i.test(mediaUrl);
-                            const newPhoto: PhotoMedia = {
-                              id: `gen-${aId}`,
-                              assetId: aId,
-                              url: mediaUrl,
-                              fileName: asset.file_name,
-                              type: isVideo ? 'video' : 'image',
-                              prompt: asset.prompt,
-                            };
-                            botPhotos.push(newPhoto);
-                            setGeneratedPhotos((prev) => [newPhoto, ...prev]);
-                          }
-                        }
-                      }
-                      if (rm.msg_type === 'text' && rm.content) {
-                        botContent = rm.content;
-                      }
-                    }
+                const found = await syncRequestResultsFromHistory();
+                if (found) {
                     botContent = botContent || 'Готово!';
                     addOrUpdateBot('action-complete', false);
                     receivedComplete = true;
                     break;
-                  }
                 }
                 botContent = `Ожидание результата... (${attempt + 1}/12)`;
                 addOrUpdateBot('action-progress', true);
@@ -1096,6 +1126,15 @@ export default function PhotoStudioPage() {
         }
       }
 
+      if (sawGenerationStart && !sawGeneratedMedia && requestId) {
+        try {
+          const found = await syncRequestResultsFromHistory();
+          if (found) receivedComplete = true;
+        } catch (historyErr) {
+          console.warn('[PhotoStudio] History reconciliation failed:', historyErr);
+        }
+      }
+
       if (!botAdded) {
         botContent = 'Готово.';
         addOrUpdateBot('text');
@@ -1105,16 +1144,12 @@ export default function PhotoStudioPage() {
       console.error('[PhotoStudio] Error name:', e?.name, '| message:', e?.message);
       console.error('[PhotoStudio] Stack:', e?.stack);
       const errDetail = e?.message || String(e);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: uid(),
-          role: 'assistant',
-          type: 'action-error',
-          content: `Ошибка соединения: ${errDetail}`,
-          timestamp: new Date(),
-        },
-      ]);
+      setMessages((prev) => applyStreamErrorToMessages(prev, {
+        botAdded,
+        botMsgId,
+        errorText: `Ошибка соединения: ${errDetail}`,
+        now: new Date(),
+      }));
     } finally {
       setIsStreaming(false);
       setIsBotTyping(false);
