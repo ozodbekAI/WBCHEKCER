@@ -362,6 +362,56 @@ class PhotoChatController:
     async def close(self) -> None:
         await self._agent.close()
 
+    def _coerce_planner_result(
+        self,
+        plan: Dict[str, Any],
+        *,
+        user_message: str,
+        history: List[Dict[str, Any]],
+        thread_context: Optional[Dict[str, Any]] = None,
+    ) -> PlannerResult:
+        raw_ids = plan.get("selected_asset_ids")
+        selected_ids = None
+        if isinstance(raw_ids, list) and len(raw_ids) > 0:
+            valid_ids = []
+            for item in raw_ids:
+                try:
+                    valid_ids.append(int(item))
+                except (ValueError, TypeError):
+                    pass
+            selected_ids = valid_ids if valid_ids else None
+
+        intent = str(plan.get("intent") or "chat").strip().lower()
+        assistant_message = str(plan.get("assistant_message") or "").strip()
+        image_prompt = str(plan.get("image_prompt") or "").strip() or None
+        locale = self._response_locale(
+            user_message=user_message,
+            history=history,
+            thread_context=thread_context,
+        )
+
+        if intent in ("edit_image", "generate_image") and not image_prompt:
+            intent = "question"
+            assistant_message = assistant_message or self._text(
+                "clarify_request",
+                locale=locale,
+            )
+
+        if intent == "question" and not assistant_message:
+            assistant_message = self._text(
+                "clarify_request",
+                locale=locale,
+            )
+
+        return PlannerResult(
+            intent=intent,
+            assistant_message=assistant_message,
+            image_prompt=image_prompt,
+            image_count=plan.get("image_count"),
+            selected_asset_ids=selected_ids,
+            aspect_ratio=plan.get("aspect_ratio"),
+        )
+
     def _emit(self, state: StreamState, message_type: str, **payload: Any) -> str:
         body = {
             "type": message_type,
@@ -1465,48 +1515,11 @@ class PhotoChatController:
                 allow_quality_fallback=allow_quality_fallback,
                 trace_id=planner_trace_id,
             )
-            
-            # ✅ FIX: Properly handle selected_asset_ids
-            raw_ids = plan.get("selected_asset_ids")
-            selected_ids = None
-            if isinstance(raw_ids, list) and len(raw_ids) > 0:
-                valid_ids = []
-                for x in raw_ids:
-                    try:
-                        valid_ids.append(int(x))
-                    except (ValueError, TypeError):
-                        pass
-                selected_ids = valid_ids if valid_ids else None
-
-            intent = str(plan.get("intent") or "chat").strip().lower()
-            assistant_message = str(plan.get("assistant_message") or "").strip()
-            image_prompt = str(plan.get("image_prompt") or "").strip() or None
-            locale = self._response_locale(
+            return self._coerce_planner_result(
+                plan,
                 user_message=user_message,
                 history=history,
                 thread_context=thread_context,
-            )
-
-            if intent in ("edit_image", "generate_image") and not image_prompt:
-                intent = "question"
-                assistant_message = assistant_message or self._text(
-                    "clarify_request",
-                    locale=locale,
-                )
-
-            if intent == "question" and not assistant_message:
-                assistant_message = self._text(
-                    "clarify_request",
-                    locale=locale,
-                )
-            
-            return PlannerResult(
-                intent=intent,
-                assistant_message=assistant_message,
-                image_prompt=image_prompt,
-                image_count=plan.get("image_count"),
-                selected_asset_ids=selected_ids,
-                aspect_ratio=plan.get("aspect_ratio"),
             )
         except Exception:
             logger.exception("[%s] planner:failed use_vision=%s", planner_trace_id, use_vision)
@@ -1516,10 +1529,30 @@ class PhotoChatController:
                 thread_context=thread_context,
             )
             if use_vision:
+                try:
+                    logger.warning("[%s] planner:vision_failed retrying with text planner fallback", planner_trace_id)
+                    fallback_plan = await self._agent.plan_action_text(
+                        user_message=user_message,
+                        history=history,
+                        assets=assets,
+                        thread_context=thread_context,
+                        model=planner_model,
+                        model_profile=model_profile,
+                        allow_quality_fallback=allow_quality_fallback,
+                        trace_id=f"{planner_trace_id}:text-fallback",
+                    )
+                    return self._coerce_planner_result(
+                        fallback_plan,
+                        user_message=user_message,
+                        history=history,
+                        thread_context=thread_context,
+                    )
+                except Exception:
+                    logger.exception("[%s] planner:text_fallback_failed after vision planner failure", planner_trace_id)
                 return PlannerResult(
                     intent="question",
                     assistant_message=self._text(
-                        "planner_failed_retry_image",
+                        "clarify_request",
                         locale=locale,
                     ),
                 )

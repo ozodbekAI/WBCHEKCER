@@ -80,7 +80,32 @@ interface ThreadMeta {
   isActive?: boolean;
 }
 
+interface PhotoChatGenerationModelOption {
+  id: string;
+  label: string;
+  description?: string | null;
+}
+
 const THREADS_STORAGE_KEY = 'photo_studio_threads';
+const PHOTO_CHAT_MODEL_STORAGE_KEY = 'photo_studio_generation_model';
+
+const FALLBACK_GENERATION_MODELS: PhotoChatGenerationModelOption[] = [
+  {
+    id: 'gemini-3-pro-image-preview',
+    label: 'Gemini 3 Pro Image',
+    description: 'Максимальное качество.',
+  },
+  {
+    id: 'gemini-3.1-flash-image-preview',
+    label: 'Gemini 3.1 Flash Image',
+    description: 'Быстрее и обычно стабильнее под нагрузкой.',
+  },
+  {
+    id: 'gemini-2.5-flash-image',
+    label: 'Gemini 2.5 Flash Image',
+    description: 'Лёгкий резервный режим.',
+  },
+];
 
 function loadStoredThreads(): ThreadMeta[] {
   try {
@@ -93,6 +118,26 @@ function saveStoredThreads(threads: ThreadMeta[]) {
   try {
     localStorage.setItem(THREADS_STORAGE_KEY, JSON.stringify(threads.slice(0, 50)));
   } catch { /* ignore */ }
+}
+
+function loadStoredGenerationModel(): string {
+  try {
+    return (localStorage.getItem(PHOTO_CHAT_MODEL_STORAGE_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function saveStoredGenerationModel(modelId: string) {
+  try {
+    if (modelId) {
+      localStorage.setItem(PHOTO_CHAT_MODEL_STORAGE_KEY, modelId);
+    } else {
+      localStorage.removeItem(PHOTO_CHAT_MODEL_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage failures
+  }
 }
 
 function upsertThread(threads: ThreadMeta[], meta: ThreadMeta): ThreadMeta[] {
@@ -377,6 +422,9 @@ export default function PhotoStudioPage() {
   const [isBotTyping, setIsBotTyping] = useState(false);
   const [botIndicatorMode, setBotIndicatorMode] = useState<StreamIndicatorMode | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
+  const [generationModelOptions, setGenerationModelOptions] = useState<PhotoChatGenerationModelOption[]>(FALLBACK_GENERATION_MODELS);
+  const [defaultGenerationModel, setDefaultGenerationModel] = useState<string>(FALLBACK_GENERATION_MODELS[0]?.id || '');
+  const [selectedGenerationModel, setSelectedGenerationModel] = useState<string>(() => loadStoredGenerationModel());
   const [contextState, setContextState] = useState<ThreadContextState>({
     last_generated_asset_id: null,
     working_asset_ids: [],
@@ -504,6 +552,7 @@ export default function PhotoStudioPage() {
 
   useEffect(() => {
     void loadQuickCatalog();
+    void loadPhotoChatModels();
   }, []);
 
   useEffect(() => {
@@ -623,6 +672,36 @@ export default function PhotoStudioPage() {
       console.error('Quick catalog load error', e);
       toast.error('Не удалось загрузить каталог фотостудии');
       setQuickMenu(QUICK_MENU);
+    }
+  };
+
+  const loadPhotoChatModels = async () => {
+    try {
+      const data = await api.getPhotoChatModels();
+      const mapped = (Array.isArray(data?.generation_models) ? data.generation_models : [])
+        .map((item: any) => {
+          const id = String(item?.id || '').trim();
+          if (!id) return null;
+          const nextItem: PhotoChatGenerationModelOption = {
+            id,
+            label: String(item?.label || id),
+            description: item?.description ? String(item.description) : null,
+          };
+          return nextItem;
+        })
+        .filter((item: PhotoChatGenerationModelOption | null): item is PhotoChatGenerationModelOption => item !== null);
+
+      const nextOptions = mapped.length > 0 ? mapped : FALLBACK_GENERATION_MODELS;
+      const nextDefault = String(data?.default_generation_model || nextOptions[0]?.id || '').trim();
+
+      setGenerationModelOptions(nextOptions);
+      setDefaultGenerationModel(nextDefault);
+      setSelectedGenerationModel((prev) => (nextOptions.some((item) => item.id === prev) ? prev : ''));
+    } catch (e) {
+      console.warn('Failed to load photo chat models', e);
+      setGenerationModelOptions(FALLBACK_GENERATION_MODELS);
+      setDefaultGenerationModel(FALLBACK_GENERATION_MODELS[0]?.id || '');
+      setSelectedGenerationModel((prev) => (FALLBACK_GENERATION_MODELS.some((item) => item.id === prev) ? prev : ''));
     }
   };
 
@@ -839,6 +918,25 @@ export default function PhotoStudioPage() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const selectedGenerationModelMeta = useMemo(
+    () => generationModelOptions.find((item) => item.id === selectedGenerationModel) || null,
+    [generationModelOptions, selectedGenerationModel],
+  );
+
+  const defaultGenerationModelMeta = useMemo(
+    () => generationModelOptions.find((item) => item.id === defaultGenerationModel) || null,
+    [generationModelOptions, defaultGenerationModel],
+  );
+
+  const handleGenerationModelSelect = useCallback((value: string) => {
+    const normalized = value.trim();
+    setSelectedGenerationModel(normalized);
+  }, []);
+
+  useEffect(() => {
+    saveStoredGenerationModel(selectedGenerationModel);
+  }, [selectedGenerationModel]);
+
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files) return;
@@ -967,6 +1065,46 @@ export default function PhotoStudioPage() {
     };
   };
 
+  const renderGenerationModelPicker = (variant: 'mobile' | 'desktop') => {
+    const isMobilePicker = variant === 'mobile';
+    const note = selectedGenerationModel
+      ? 'Выбранная модель фиксируется и при high demand пробуется до 10 раз.'
+      : 'Авто-режим сам переключается на fallback-модель при недоступности.';
+
+    return (
+      <div className={`ps-chat-model-picker${isMobilePicker ? ' ps-chat-model-picker--mobile' : ''}`}>
+        <div className="ps-chat-model-header">
+          <span className="ps-chat-model-label">Модель генерации</span>
+          <span className={`ps-chat-model-badge${selectedGenerationModel ? ' is-locked' : ''}`}>
+            {selectedGenerationModel ? 'Locked x10' : 'Auto'}
+          </span>
+        </div>
+        <div className="ps-chat-model-select-wrap">
+          <select
+            value={selectedGenerationModel}
+            onChange={(e) => handleGenerationModelSelect(e.target.value)}
+            className="ps-chat-model-select"
+            disabled={isStreaming}
+          >
+            <option value="">
+              {`Авто (${defaultGenerationModelMeta?.label || defaultGenerationModel || 'default'})`}
+            </option>
+            {generationModelOptions.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+          <ChevronDown size={14} className="ps-chat-model-select-icon" />
+        </div>
+        <div className="ps-chat-model-note">
+          <span>{selectedGenerationModelMeta?.description || defaultGenerationModelMeta?.description || note}</span>
+          <span>{note}</span>
+        </div>
+      </div>
+    );
+  };
+
   const sendMessage = async ({
     text,
     photos,
@@ -1019,12 +1157,18 @@ export default function PhotoStudioPage() {
       if (uniqueAssetIds.length > 0) body.asset_ids = uniqueAssetIds;
       if (fallbackPhotoUrls.length > 0) body.photo_urls = fallbackPhotoUrls;
       if (quickAction) body.quick_action = quickAction;
+      if (selectedGenerationModel) {
+        body.generation_model = selectedGenerationModel;
+        body.allow_quality_fallback = false;
+      }
       console.log('[PhotoStudio] Sending stream request payload:', {
         request_id: requestId,
         thread_id: body.thread_id || null,
         asset_ids: body.asset_ids || [],
         photo_urls: body.photo_urls || [],
         quick_action: body.quick_action || null,
+        generation_model: body.generation_model || null,
+        allow_quality_fallback: body.allow_quality_fallback ?? null,
       });
 
       const res = await api.streamPhotoChat(body);
@@ -2584,6 +2728,8 @@ export default function PhotoStudioPage() {
                 </div>
               )}
 
+              {renderGenerationModelPicker('mobile')}
+
               {/* Input bar */}
               <form className="ps-mobile-input-bar" onSubmit={(e) => { e.preventDefault(); void handleSend(); }}>
                 <button type="button" className="ps-mobile-input-icon" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || !canAttachMore}>
@@ -3814,6 +3960,8 @@ export default function PhotoStudioPage() {
                   )}
                 </div>
               )}
+
+              {renderGenerationModelPicker('desktop')}
 
               <form className="ps-input" onSubmit={(e) => { e.preventDefault(); void handleSend(); }}>
                 <button type="button" className="ps-icon-btn" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || !canAttachMore}>

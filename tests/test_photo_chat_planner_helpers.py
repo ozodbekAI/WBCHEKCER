@@ -267,6 +267,49 @@ def test_edit_or_generate_image_defaults_to_quality_fallback_when_omitted(monkey
     ]
 
 
+def test_edit_or_generate_image_uses_ten_attempt_budget_for_explicitly_selected_model(monkeypatch):
+    class _FakeApi:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_content(self, *, model, contents, generation_config=None, service_tier=None, timeout_s=None, max_retries=None):
+            self.calls.append((model, service_tier, timeout_s, max_retries))
+            return {"ok": True, "model": model}
+
+        @staticmethod
+        def extract_text_and_images(resp):
+            return "done", [GeminiPart(inline_data_b64=base64.b64encode(b"image-bytes").decode("utf-8"), inline_mime="image/png")]
+
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_MODEL_FALLBACK", "gemini-3.1-flash-image-preview")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_SERVICE_TIER", "standard")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_TIMEOUT_S", 25)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_FALLBACK_TIMEOUT_S", 45)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_MAX_RETRIES", 0)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_FALLBACK_MAX_RETRIES", 1)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_SELECTED_MODEL_MAX_RETRIES", 9)
+
+    agent = PhotoChatAgent.__new__(PhotoChatAgent)
+    agent.api = _FakeApi()
+    agent._sem = asyncio.Semaphore(1)
+
+    text, out_bytes, out_mime = asyncio.run(
+        agent.edit_or_generate_image(
+            prompt="make it brighter",
+            images=[(b"raw-image", "image/png")],
+            model="gemini-3-pro-image-preview",
+            trace_id="image-selected-model",
+        )
+    )
+
+    assert text == "done"
+    assert out_bytes == b"image-bytes"
+    assert out_mime == "image/png"
+    assert agent.api.calls == [
+        ("gemini-3-pro-image-preview", "standard", 25, 9),
+    ]
+
+
 def test_generate_content_with_fallback_retries_without_service_tier_when_not_entitled():
     class _FakeApi:
         def __init__(self):

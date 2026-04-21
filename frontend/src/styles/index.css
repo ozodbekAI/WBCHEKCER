@@ -2252,6 +2252,19 @@ tr:hover .row-actions {
 
 /* ── Input area ── */
 .ps-input { display: flex; align-items: flex-end; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); background: #fff; }
+.ps-chat-model-picker { display: grid; gap: 8px; padding: 10px 16px 0; background: #fff; }
+.ps-chat-model-picker--mobile { padding: 8px 10px 0; }
+.ps-chat-model-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ps-chat-model-label { font-size: 12px; font-weight: 700; color: #55627c; text-transform: uppercase; letter-spacing: 0.04em; }
+.ps-chat-model-badge { padding: 3px 8px; border-radius: 999px; border: 1px solid #d9e0ef; background: #f6f8fc; color: #65728c; font-size: 11px; font-weight: 700; }
+.ps-chat-model-badge.is-locked { border-color: #cbd6ff; background: #eef2ff; color: #4254c5; }
+.ps-chat-model-select-wrap { position: relative; }
+.ps-chat-model-select { width: 100%; appearance: none; -webkit-appearance: none; border: 1px solid #dbe2f1; border-radius: 12px; background: #f8faff; color: #24304a; font-size: 14px; font-weight: 600; padding: 10px 38px 10px 12px; outline: none; }
+.ps-chat-model-select:focus { border-color: #7367f0; box-shadow: 0 0 0 3px rgba(115, 103, 240, 0.12); }
+.ps-chat-model-select:disabled { opacity: 0.7; cursor: not-allowed; }
+.ps-chat-model-select-icon { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: #7b88a1; pointer-events: none; }
+.ps-chat-model-note { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 12px; color: #6a758d; line-height: 1.4; }
+.ps-chat-model-note span { min-width: 0; }
 .ps-icon-btn { width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center; justify-content: center; background: transparent; border: 1px solid var(--border); color: var(--text-secondary); cursor: pointer; transition: all 0.15s; flex-shrink: 0; }
 .ps-icon-btn:hover { background: #f0f0f5; color: var(--text-primary); }
 .ps-text-input { flex: 1; border: 1px solid var(--border); border-radius: 999px; padding: 10px 16px; font-size: 14px; background: #f3f4f6; resize: none; outline: none; min-height: 40px; max-height: 120px; font-family: inherit; transition: border-color 0.15s; }

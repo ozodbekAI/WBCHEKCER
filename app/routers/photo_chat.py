@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db_dependency
 from app.core.dependencies import get_current_user
 from app.controllers.photo_chat_controller import PhotoChatController
+from app.services.photo_chat_agent import PhotoChatAgent
 from app.schemas.photo_chat import (
     PhotoChatAssetImportRequest,
     PhotoChatStreamRequest,
@@ -47,6 +48,17 @@ class CatalogAllResponse(BaseModel):
     poses: List[CatalogItem]
     models: List[CatalogItem]
     videos: List[CatalogItem]
+
+
+class PhotoChatModelOption(BaseModel):
+    id: str
+    label: str
+    description: Optional[str] = None
+
+
+class PhotoChatModelsResponse(BaseModel):
+    generation_models: List[PhotoChatModelOption]
+    default_generation_model: str
 
 
 class PhotoChatClearRequest(BaseModel):
@@ -143,6 +155,20 @@ async def get_all_catalogs(
         ))
 
     return CatalogAllResponse(scenes=scenes, poses=poses, models=models, videos=videos)
+
+
+@router.get("/chat/models", response_model=PhotoChatModelsResponse)
+async def get_chat_models(
+    current_user: Any = Depends(get_current_user),
+):
+    _ = current_user
+    return PhotoChatModelsResponse(
+        generation_models=[
+            PhotoChatModelOption(**item)
+            for item in PhotoChatAgent.generation_model_options()
+        ],
+        default_generation_model=PhotoChatAgent.default_generation_model(),
+    )
 
 
 @router.post("/assets/upload")

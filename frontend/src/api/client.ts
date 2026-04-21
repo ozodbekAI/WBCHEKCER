@@ -595,6 +595,10 @@ class ApiClient {
     return this.requestJson<any>(`/photo-assets/catalog?asset_type=${encodeURIComponent(assetType)}`);
   }
 
+  async getPhotoChatModels() {
+    return this.requestJson<any>('/photo/chat/models');
+  }
+
   async getPhotoChatHistory(threadId?: number) {
     const params = threadId ? `?thread_id=${threadId}` : '';
     return this.requestJson<any>(`/photo/chat/history${params}`);

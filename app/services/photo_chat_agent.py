@@ -99,6 +99,22 @@ _FAST_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 _SMART_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 _QUALITY_IMAGE_MODEL = "gemini-3-pro-image-preview"
 
+_MODEL_LABELS = {
+    "gemini-3-pro-image-preview": "Gemini 3 Pro Image",
+    "gemini-3.1-flash-image-preview": "Gemini 3.1 Flash Image",
+    "gemini-2.5-flash-image": "Gemini 2.5 Flash Image",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
+    "gemini-3.1-flash-lite-preview": "Gemini 3.1 Flash Lite",
+    "gemini-3-flash-preview": "Gemini 3 Flash Preview",
+    "gemini-2.5-flash": "Gemini 2.5 Flash",
+}
+
+_MODEL_DESCRIPTIONS = {
+    "gemini-3-pro-image-preview": "Highest quality image generation.",
+    "gemini-3.1-flash-image-preview": "Faster image generation with better availability.",
+    "gemini-2.5-flash-image": "Lightweight backup image model.",
+}
+
 _IMAGE_EDIT_HINTS = (
     "shu rasm",
     "shu surat",
@@ -287,6 +303,18 @@ def _trimmed_text(value: Any, *, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].strip()
+
+
+def _ordered_unique_strings(values: List[Any]) -> List[str]:
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
 
 
 def _lowered_text(value: Any) -> str:
@@ -537,6 +565,31 @@ class PhotoChatAgent:
             _QUALITY_IMAGE_MODEL,
             "gemini-2.5-flash-image",
         }
+
+    @staticmethod
+    def default_generation_model() -> str:
+        return _normalize_requested_model(settings.GEMINI_IMAGE_MODEL) or _QUALITY_IMAGE_MODEL
+
+    @classmethod
+    def generation_model_options(cls) -> List[Dict[str, Optional[str]]]:
+        models = _ordered_unique_strings(
+            [
+                settings.GEMINI_IMAGE_MODEL,
+                settings.GEMINI_IMAGE_MODEL_FALLBACK,
+                _QUALITY_IMAGE_MODEL,
+                _SMART_IMAGE_MODEL,
+                _FAST_IMAGE_MODEL,
+                "gemini-2.5-flash-image",
+            ]
+        )
+        return [
+            {
+                "id": model,
+                "label": _MODEL_LABELS.get(model, model),
+                "description": _MODEL_DESCRIPTIONS.get(model),
+            }
+            for model in models
+        ]
 
     def _resolve_text_model(self, requested_model: Optional[str], model_profile: Optional[str]) -> str:
         normalized_profile = _normalize_model_profile(model_profile)
@@ -1410,18 +1463,30 @@ class PhotoChatAgent:
         requested_model = _normalize_requested_model(model)
         model = self._resolve_image_model(requested_model, model_profile)
         fallback_model = self._resolve_image_fallback_model(model)
-        allow_fallback = True if allow_quality_fallback is None else bool(allow_quality_fallback)
+        user_selected_model = bool(requested_model and requested_model == model)
+        allow_fallback = (
+            False
+            if user_selected_model and allow_quality_fallback is None
+            else True
+            if allow_quality_fallback is None
+            else bool(allow_quality_fallback)
+        )
         service_tier = settings.GEMINI_IMAGE_SERVICE_TIER
         timeout_s = settings.GEMINI_IMAGE_TIMEOUT_S
         fallback_timeout_s = settings.GEMINI_IMAGE_FALLBACK_TIMEOUT_S
         max_retries = settings.GEMINI_IMAGE_MAX_RETRIES
         fallback_max_retries = settings.GEMINI_IMAGE_FALLBACK_MAX_RETRIES
+        retry_same_model_once = True
+
+        if user_selected_model:
+            max_retries = max(max_retries, settings.GEMINI_IMAGE_SELECTED_MODEL_MAX_RETRIES)
+            retry_same_model_once = False
 
         sizes = [len(b) for b, _m in images]
         mimes = [_m for _b, _m in images]
         logger.info(
-            "[%s] edit_or_generate_image:start requested_model=%s selected_model=%s fallback_model=%s profile=%s allow_quality_fallback=%s imgs=%s sizes=%s mimes=%s ar=%s prompt=%s",
-            trace_id, requested_model, model, fallback_model, _normalize_model_profile(model_profile), allow_fallback, len(images), sizes, mimes, aspect_ratio, _truncate(prompt, 500)
+            "[%s] edit_or_generate_image:start requested_model=%s selected_model=%s fallback_model=%s profile=%s user_selected_model=%s allow_quality_fallback=%s max_retries=%s imgs=%s sizes=%s mimes=%s ar=%s prompt=%s",
+            trace_id, requested_model, model, fallback_model, _normalize_model_profile(model_profile), user_selected_model, allow_fallback, max_retries, len(images), sizes, mimes, aspect_ratio, _truncate(prompt, 500)
         )
 
         parts: List[Dict[str, Any]] = [{"text": prompt}]
@@ -1449,7 +1514,7 @@ class PhotoChatAgent:
             max_retries=max_retries,
             fallback_max_retries=fallback_max_retries,
             allow_quality_fallback=allow_fallback,
-            retry_same_model_once=True,
+            retry_same_model_once=retry_same_model_once,
             trace_id=trace_id,
             operation="edit_or_generate_image",
         )

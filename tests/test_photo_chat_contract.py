@@ -242,13 +242,23 @@ def test_locale_behavior_uses_uzbek_for_question_fallback():
     assert result.assistant_message == "Iltimos, aynan nimani o'zgartirish yoki yaratish kerakligini aniqlashtirib bering."
 
 
-def test_image_sensitive_planner_failure_returns_controlled_question_without_text_degrade():
+def test_image_sensitive_planner_failure_falls_back_to_text_planner_without_failure_copy():
     class _FailingVisionAgent:
         def needs_vision_planner(self, **kwargs):
             return True
 
         async def plan_action(self, **kwargs):
             raise RuntimeError("planner crashed")
+
+        async def plan_action_text(self, **kwargs):
+            return {
+                "intent": "edit_image",
+                "assistant_message": "",
+                "selected_asset_ids": [1],
+                "image_prompt": "Remove the background from Image 1 and keep the product untouched.",
+                "image_count": 1,
+                "aspect_ratio": "1:1",
+            }
 
         async def generate_text(self, *args, **kwargs):
             raise AssertionError("generate_text must not be called for image-sensitive planner failures")
@@ -270,8 +280,41 @@ def test_image_sensitive_planner_failure_returns_controlled_question_without_tex
         )
     )
 
+    assert result.intent == "edit_image"
+    assert result.selected_asset_ids == [1]
+    assert "Remove the background" in str(result.image_prompt)
+
+
+def test_image_sensitive_planner_failure_returns_clarifying_question_when_text_fallback_also_fails():
+    class _DoubleFailingVisionAgent:
+        def needs_vision_planner(self, **kwargs):
+            return True
+
+        async def plan_action(self, **kwargs):
+            raise RuntimeError("vision planner crashed")
+
+        async def plan_action_text(self, **kwargs):
+            raise RuntimeError("text fallback crashed")
+
+        async def generate_text(self, *args, **kwargs):
+            raise AssertionError("generate_text must not be called for image-sensitive planner failures")
+
+    controller = PhotoChatController.__new__(PhotoChatController)
+    controller._agent = _DoubleFailingVisionAgent()
+
+    result = asyncio.run(
+        controller._planner(
+            user_message="iltimos fonini olib tashlang",
+            history=[{"role": "user", "text": "iltimos fonini olib tashlang"}],
+            assets=[{"asset_id": 1, "caption": "shirt"}],
+            thread_context={"working_asset_ids": [1], "locale": "uz"},
+            recent_image_bytes=[(1, b"123", "image/jpeg")],
+            trace_id="planner-double-fail",
+        )
+    )
+
     assert result.intent == "question"
-    assert "couldn't safely process that image request" in result.assistant_message.lower()
+    assert result.assistant_message == "Iltimos, aynan nimani o'zgartirish yoki yaratish kerakligini aniqlashtirib bering."
 
 
 def test_generate_video_quick_action_stream_persists_result_without_name_error(monkeypatch):
