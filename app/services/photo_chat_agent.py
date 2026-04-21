@@ -115,82 +115,6 @@ _MODEL_DESCRIPTIONS = {
     "gemini-2.5-flash-image": "Lightweight backup image model.",
 }
 
-_IMAGE_EDIT_HINTS = (
-    "shu rasm",
-    "shu surat",
-    "fonni almashtir",
-    "fonini almashtir",
-    "oq fon",
-    "oq background",
-    "kiydir",
-    "birlashtir",
-    "video qil",
-    "rasmni yaxshila",
-    "фон",
-    "переодень",
-    "надень",
-    "с первого фото",
-    "со второго фото",
-    "объедини",
-    "улучши",
-    "remove background",
-    "change background",
-    "background",
-    "put on model",
-    "enhance",
-    "edit",
-    "merge",
-    "combine",
-    "swap",
-    "replace",
-    "make it brighter",
-    "same but",
-    "use the last result",
-)
-
-_FOLLOWUP_IMAGE_HINTS = (
-    "make it",
-    "same but",
-    "change it",
-    "use the last result",
-    "last result",
-    "last one",
-    "fix it",
-    "edit it",
-    "uni",
-    "shuni",
-    "o'shani",
-    "это",
-    "его",
-    "ее",
-)
-
-_MULTI_IMAGE_HINTS = (
-    "image 1",
-    "image 2",
-    "photo 1",
-    "photo 2",
-    "first photo",
-    "second photo",
-    "1-rasm",
-    "2-rasm",
-    "birinchi rasm",
-    "ikkinchi rasm",
-    "2 ta rasm",
-    "ikki rasm",
-    "2 фото",
-    "two images",
-    "two photos",
-    "both images",
-    "both photos",
-    "с первого фото",
-    "со второго фото",
-    "combine",
-    "merge",
-    "swap",
-    "put the",
-)
-
 
 def _normalize_asset_refs(text: str, selected_asset_ids: List[int]) -> str:
     if not text or not selected_asset_ids:
@@ -315,15 +239,6 @@ def _ordered_unique_strings(values: List[Any]) -> List[str]:
         seen.add(normalized)
         ordered.append(normalized)
     return ordered
-
-
-def _lowered_text(value: Any) -> str:
-    return str(value or "").strip().lower()
-
-
-def _has_any_hint(text: str, hints: Tuple[str, ...]) -> bool:
-    lowered = _lowered_text(text)
-    return bool(lowered and any(hint in lowered for hint in hints))
 
 
 def _working_asset_count(
@@ -654,17 +569,6 @@ class PhotoChatAgent:
             return None
         return fallback
 
-    def _is_explicit_multi_image_request(
-        self,
-        user_message: str,
-        assets: Optional[List[Dict[str, Any]]] = None,
-        recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,
-        thread_context: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        if _working_asset_count(assets, recent_image_bytes, thread_context) < 2:
-            return False
-        return _has_any_hint(user_message, _MULTI_IMAGE_HINTS)
-
     def planner_image_limit(
         self,
         *,
@@ -673,7 +577,7 @@ class PhotoChatAgent:
         recent_image_bytes: Optional[List[Tuple[int, bytes, str]]] = None,
         thread_context: Optional[Dict[str, Any]] = None,
     ) -> int:
-        return 4 if self._is_explicit_multi_image_request(user_message, assets, recent_image_bytes, thread_context) else 2
+        return max(1, min(_working_asset_count(assets, recent_image_bytes, thread_context), 4))
 
     def _needs_vision_planner(
         self,
@@ -689,9 +593,7 @@ class PhotoChatAgent:
             return True
         if ctx.get("working_asset_ids"):
             return True
-        if ctx.get("last_generated_asset_id") and _has_any_hint(user_message, _FOLLOWUP_IMAGE_HINTS):
-            return True
-        if _has_any_hint(user_message, _IMAGE_EDIT_HINTS):
+        if ctx.get("last_generated_asset_id"):
             return True
         return False
 

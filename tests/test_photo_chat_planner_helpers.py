@@ -422,16 +422,16 @@ def test_plan_action_text_blocks_quality_downgrade_when_disabled(monkeypatch):
     ]
 
 
-def test_needs_vision_planner_routes_by_assets_context_and_message():
+def test_needs_vision_planner_uses_available_image_context_only():
     agent = PhotoChatAgent.__new__(PhotoChatAgent)
 
     assert agent.needs_vision_planner(user_message="hello there", assets=[], recent_image_bytes=None, thread_context={}) is False
-    assert agent.needs_vision_planner(user_message="remove background", assets=[], recent_image_bytes=None, thread_context={}) is True
+    assert agent.needs_vision_planner(user_message="remove background", assets=[], recent_image_bytes=None, thread_context={}) is False
     assert agent.needs_vision_planner(user_message="hello there", assets=[{"asset_id": 1}], recent_image_bytes=None, thread_context={}) is True
     assert agent.needs_vision_planner(user_message="same but brighter", assets=[], recent_image_bytes=None, thread_context={"last_generated_asset_id": 4}) is True
 
 
-def test_planner_image_limit_is_two_by_default_and_four_for_explicit_multi_image_requests():
+def test_planner_image_limit_uses_available_image_count_up_to_four():
     agent = PhotoChatAgent.__new__(PhotoChatAgent)
 
     assert agent.planner_image_limit(
@@ -442,8 +442,8 @@ def test_planner_image_limit_is_two_by_default_and_four_for_explicit_multi_image
     ) == 2
     assert agent.planner_image_limit(
         user_message="Put the outfit from Image 1 onto Image 2",
-        assets=[{"asset_id": 1}, {"asset_id": 2}],
-        recent_image_bytes=[(1, b"a", "image/jpeg"), (2, b"b", "image/jpeg")],
+        assets=[{"asset_id": 1}, {"asset_id": 2}, {"asset_id": 3}, {"asset_id": 4}, {"asset_id": 5}],
+        recent_image_bytes=[(1, b"a", "image/jpeg"), (2, b"b", "image/jpeg"), (3, b"c", "image/jpeg"), (4, b"d", "image/jpeg"), (5, b"e", "image/jpeg")],
         thread_context={},
     ) == 4
 
