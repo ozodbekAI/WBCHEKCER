@@ -75,7 +75,9 @@ interface ThreadMeta {
   id: number;
   preview: string;
   createdAt: string;
+  updatedAt?: string;
   messageCount: number;
+  isActive?: boolean;
 }
 
 const THREADS_STORAGE_KEY = 'photo_studio_threads';
@@ -101,6 +103,22 @@ function upsertThread(threads: ThreadMeta[], meta: ThreadMeta): ThreadMeta[] {
     return next;
   }
   return [meta, ...threads];
+}
+
+function mapServerThreadMeta(thread: any): ThreadMeta | null {
+  const id = Number(thread?.id || 0);
+  if (!Number.isFinite(id) || id <= 0) return null;
+
+  const createdAt = String(thread?.created_at || thread?.updated_at || new Date().toISOString());
+  const updatedAt = String(thread?.updated_at || thread?.created_at || createdAt);
+  return {
+    id,
+    preview: String(thread?.preview || 'Новый чат'),
+    createdAt,
+    updatedAt,
+    messageCount: Number(thread?.message_count || 0),
+    isActive: Boolean(thread?.is_active),
+  };
 }
 
 interface ChatMessage {
@@ -134,6 +152,8 @@ interface GalleryAsset {
   prompt?: string;
   category?: string | null;
 }
+
+type StreamIndicatorMode = 'typing' | 'image';
 
 type QuickActionId = 'change-background' | 'change-pose' | 'put-on-model' | 'enhance';
 
@@ -287,6 +307,33 @@ function buildStreamMediaPhoto(event: any): PhotoMedia | null {
   };
 }
 
+function StreamActivityIndicator({ mode }: { mode: StreamIndicatorMode }) {
+  return (
+    <div className="ps-typing">
+      <div className="ps-msg-avatar"><Bot size={16} /></div>
+      {mode === 'image' ? (
+        <div className="ps-typing-visual">
+          <div className="ps-gen-anim ps-gen-anim--indicator">
+            <div className="ps-gen-anim-shimmer">
+              <div className="ps-gen-anim-icon">
+                <Sparkles size={20} />
+              </div>
+              <div className="ps-gen-anim-bars">
+                <div className="ps-gen-anim-bar" style={{ animationDelay: '0s' }} />
+                <div className="ps-gen-anim-bar" style={{ animationDelay: '0.15s' }} />
+                <div className="ps-gen-anim-bar" style={{ animationDelay: '0.3s' }} />
+              </div>
+            </div>
+          </div>
+          <div className="ps-typing-label">Создаю изображение...</div>
+        </div>
+      ) : (
+        <div className="ps-typing-dots"><span /><span /><span /></div>
+      )}
+    </div>
+  );
+}
+
 type MobileTab = 'chat' | 'generator' | 'history' | 'products';
 
 export default function PhotoStudioPage() {
@@ -310,6 +357,7 @@ export default function PhotoStudioPage() {
   const [inputText, setInputText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [isBotTyping, setIsBotTyping] = useState(false);
+  const [botIndicatorMode, setBotIndicatorMode] = useState<StreamIndicatorMode | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
   const [contextState, setContextState] = useState<ThreadContextState>({
     last_generated_asset_id: null,
@@ -626,6 +674,33 @@ export default function PhotoStudioPage() {
     }
   };
 
+  const refreshThreadList = useCallback(async (preferredThreadId?: number | null) => {
+    try {
+      const data = await api.listPhotoThreads();
+      const mapped = (Array.isArray(data?.threads) ? data.threads : [])
+        .map((thread: any) => mapServerThreadMeta(thread))
+        .filter((thread: ThreadMeta | null): thread is ThreadMeta => thread !== null);
+
+      if (mapped.length > 0) {
+        setThreadList(mapped);
+        saveStoredThreads(mapped);
+      } else {
+        setThreadList([]);
+        saveStoredThreads([]);
+      }
+
+      const nextActiveThreadId = Number(preferredThreadId || data?.active_thread_id || 0) || null;
+      if (nextActiveThreadId) {
+        setActiveThreadId(nextActiveThreadId);
+      }
+
+      return mapped;
+    } catch (e) {
+      console.warn('Failed to refresh thread list', e);
+      return null;
+    }
+  }, []);
+
   useEffect(() => {
     if (!samplesOpen) return;
     void loadGalleryAssets(galleryType);
@@ -634,7 +709,10 @@ export default function PhotoStudioPage() {
   useEffect(() => {
     (async () => {
       try {
-        const data = await api.getPhotoChatHistory();
+        const [data] = await Promise.all([
+          api.getPhotoChatHistory(),
+          refreshThreadList(),
+        ]);
 
         // Thread info
         if (data.active_thread_id) setActiveThreadId(data.active_thread_id);
@@ -709,7 +787,7 @@ export default function PhotoStudioPage() {
 
         setGeneratedPhotos(genPhotos);
 
-        // Track thread in local thread list
+        // Track thread locally even if thread list refresh is temporarily unavailable.
         const threadId = data.active_thread_id || data.thread_id;
         if (threadId) {
           const firstUserMsg = rawMsgs.find((m: any) => m.role === 'user');
@@ -720,7 +798,9 @@ export default function PhotoStudioPage() {
               id: threadId,
               preview,
               createdAt: created,
+              updatedAt: created,
               messageCount: data.message_count || rawMsgs.length,
+              isActive: true,
             });
             saveStoredThreads(next);
             return next;
@@ -735,7 +815,7 @@ export default function PhotoStudioPage() {
         toast.error('Не удалось восстановить историю фотостудии');
       }
     })();
-  }, []);
+  }, [refreshThreadList]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -797,10 +877,14 @@ export default function PhotoStudioPage() {
   const preparePhotoAssets = async (photos: PhotoMedia[]) => {
     const assetIds: number[] = [];
     const fallbackPhotoUrls: string[] = [];
+    const failedPhotos: string[] = [];
     const addFallbackUrl = (raw?: string) => {
       const abs = toAbsoluteMediaUrl(raw || '');
       if (!abs || abs.startsWith('blob:')) return;
       if (!fallbackPhotoUrls.includes(abs)) fallbackPhotoUrls.push(abs);
+    };
+    const markFailed = (photo: PhotoMedia) => {
+      failedPhotos.push(photo.fileName || fileNameFromUrl(photo.url) || 'image');
     };
 
     for (const p of photos) {
@@ -811,9 +895,11 @@ export default function PhotoStudioPage() {
             assetIds.push(result.assetId);
           } else {
             addFallbackUrl(result.url);
+            if (!result.url) markFailed(p);
           }
         } catch (e) {
           console.warn('Upload failed:', e);
+          markFailed(p);
         }
         continue;
       }
@@ -830,17 +916,22 @@ export default function PhotoStudioPage() {
         if (imported.assetId) {
           assetIds.push(imported.assetId);
         } else {
+          const fallbackCountBefore = fallbackPhotoUrls.length;
           addFallbackUrl(imported.url || p.url);
+          if (fallbackPhotoUrls.length === fallbackCountBefore) markFailed(p);
         }
       } catch (e) {
         console.warn('Import failed:', e);
+        const fallbackCountBefore = fallbackPhotoUrls.length;
         addFallbackUrl(p.url);
+        if (fallbackPhotoUrls.length === fallbackCountBefore) markFailed(p);
       }
     }
 
     return {
       assetIds: Array.from(new Set(assetIds)),
       fallbackPhotoUrls,
+      failedPhotos,
     };
   };
 
@@ -873,22 +964,36 @@ export default function PhotoStudioPage() {
 
     setIsStreaming(true);
     setIsBotTyping(true);
-    setInputText('');
-    setAttachedPhotos([]);
-
-    const userMsg: ChatMessage = {
-      id: uid(),
-      role: 'user',
-      type: photos.length > 0 && !normalizedText ? 'image' : 'text',
-      content: normalizedText,
-      timestamp: new Date(),
-      photos: photos.length > 0 ? photos : undefined,
-    };
-    setMessages((prev) => [...prev, userMsg]);
-
-    const { assetIds: uniqueAssetIds, fallbackPhotoUrls } = await preparePhotoAssets(photos);
+    setBotIndicatorMode('typing');
+    let botMsgId = uid();
+    let botAdded = false;
+    let userMsg: ChatMessage | null = null;
 
     try {
+      const {
+        assetIds: uniqueAssetIds,
+        fallbackPhotoUrls,
+        failedPhotos,
+      } = await preparePhotoAssets(photos);
+      if (photos.length > 0 && uniqueAssetIds.length === 0 && fallbackPhotoUrls.length === 0) {
+        throw new Error('Не удалось подготовить прикреплённые фото. Запрос не был отправлен.');
+      }
+      if (failedPhotos.length > 0) {
+        toast.warning(`Часть вложений не удалось подготовить: ${failedPhotos.length}`);
+      }
+
+      userMsg = {
+        id: uid(),
+        role: 'user',
+        type: photos.length > 0 && !normalizedText ? 'image' : 'text',
+        content: normalizedText,
+        timestamp: new Date(),
+        photos: photos.length > 0 ? photos : undefined,
+      };
+      setMessages((prev) => [...prev, userMsg as ChatMessage]);
+      setInputText('');
+      setAttachedPhotos([]);
+
       const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const requestMessage = normalizedText || (quickAction ? 'Быстрая команда' : '');
       const body: any = { message: requestMessage, request_id: requestId };
@@ -896,6 +1001,13 @@ export default function PhotoStudioPage() {
       if (uniqueAssetIds.length > 0) body.asset_ids = uniqueAssetIds;
       if (fallbackPhotoUrls.length > 0) body.photo_urls = fallbackPhotoUrls;
       if (quickAction) body.quick_action = quickAction;
+      console.log('[PhotoStudio] Sending stream request payload:', {
+        request_id: requestId,
+        thread_id: body.thread_id || null,
+        asset_ids: body.asset_ids || [],
+        photo_urls: body.photo_urls || [],
+        quick_action: body.quick_action || null,
+      });
 
       const res = await api.streamPhotoChat(body);
       console.log('[PhotoStudio] Stream response status:', res.status, res.statusText);
@@ -910,14 +1022,13 @@ export default function PhotoStudioPage() {
       const dec = new TextDecoder();
       let botContent = '';
       let botPhotos: PhotoMedia[] = [];
-      let botMsgId = uid();
-      let botAdded = false;
       let streamThreadId = activeThreadId;
       let sawGenerationStart = false;
       let sawGeneratedMedia = false;
 
       const addOrUpdateBot = (type: ChatMessage['type'] = 'text', loading = false) => {
         setIsBotTyping(false);
+        setBotIndicatorMode(null);
         if (!botAdded) {
           botAdded = true;
           setMessages((prev) => [
@@ -1009,11 +1120,14 @@ export default function PhotoStudioPage() {
                     streamThreadId = Number(d.thread_id);
                     setActiveThreadId(streamThreadId);
                     setThreadList((prev) => {
+                      const nowIso = new Date().toISOString();
                       const next = upsertThread(prev, {
                         id: Number(d.thread_id),
                         preview: (normalizedText || 'Фото').slice(0, 60),
-                        createdAt: new Date().toISOString(),
+                        createdAt: prev.find((t) => t.id === Number(d.thread_id))?.createdAt || nowIso,
+                        updatedAt: nowIso,
                         messageCount: (prev.find((t) => t.id === Number(d.thread_id))?.messageCount || 0) + 1,
+                        isActive: true,
                       });
                       saveStoredThreads(next);
                       return next;
@@ -1021,7 +1135,7 @@ export default function PhotoStudioPage() {
                   }
                   if (d.user_message_id) {
                     setMessages((prev) => prev.map((m) =>
-                      m.id === userMsg.id ? { ...m, dbId: d.user_message_id, threadId: d.thread_id, requestId: d.request_id } : m,
+                      userMsg && m.id === userMsg.id ? { ...m, dbId: d.user_message_id, threadId: d.thread_id, requestId: d.request_id } : m,
                     ));
                   }
                 }
@@ -1040,18 +1154,20 @@ export default function PhotoStudioPage() {
                 }
                 else if (d.type === 'images_start') {
                   sawGenerationStart = true;
+                  setIsBotTyping(true);
+                  setBotIndicatorMode('typing');
                   // Keep the typing indicator visible until the server confirms
                   // that image rendering has actually started.
                 }
                 else if (d.type === 'image_started') {
                   sawGenerationStart = true;
-                  botContent = '';
-                  addOrUpdateBot('action-progress', true);
+                  setIsBotTyping(true);
+                  setBotIndicatorMode('image');
                 }
                 else if (d.type === 'generation_start') {
                   sawGenerationStart = true;
-                  botContent = '';
-                  addOrUpdateBot('action-progress', true);
+                  setIsBotTyping(true);
+                  setBotIndicatorMode('image');
                 }
                 else if (d.type === 'generation_complete') {
                   const newPhoto = buildStreamMediaPhoto(d);
@@ -1063,6 +1179,8 @@ export default function PhotoStudioPage() {
                   const total = Number(d.total || 1);
                   const index = Number(d.index || total);
                   const hasMore = index < total;
+                  setIsBotTyping(hasMore);
+                  setBotIndicatorMode(hasMore ? 'image' : null);
                   botContent = hasMore
                     ? `Генерация изображения ${index} из ${total}...`
                     : 'Готово!';
@@ -1153,6 +1271,7 @@ export default function PhotoStudioPage() {
     } finally {
       setIsStreaming(false);
       setIsBotTyping(false);
+      setBotIndicatorMode(null);
     }
   };
 
@@ -1404,11 +1523,14 @@ export default function PhotoStudioPage() {
             id: newThreadId,
             preview: 'Новый чат',
             createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
             messageCount: 0,
+            isActive: true,
           });
           saveStoredThreads(next);
           return next;
         });
+        await refreshThreadList(newThreadId);
       }
 
       toast.success('Новый чат создан');
@@ -1420,15 +1542,90 @@ export default function PhotoStudioPage() {
 
   const deleteThread = async (threadId: number) => {
     try {
-      await api.clearPhotoChat(threadId, 'all');
-      setThreadList((prev) => {
-        const next = prev.filter((t) => t.id !== threadId);
-        saveStoredThreads(next);
-        return next;
-      });
-      if (threadId === activeThreadId) {
+      const result = await api.deletePhotoThread(threadId);
+      const mappedThreads = (Array.isArray(result?.threads) ? result.threads : [])
+        .map((thread: any) => mapServerThreadMeta(thread))
+        .filter((thread: ThreadMeta | null): thread is ThreadMeta => thread !== null);
+
+      if (mappedThreads.length > 0) {
+        setThreadList(mappedThreads);
+        saveStoredThreads(mappedThreads);
+      } else {
+        setThreadList([]);
+        saveStoredThreads([]);
+      }
+
+      const nextActiveThreadId = Number(result?.active_thread_id || 0) || null;
+      if (threadId === activeThreadId && nextActiveThreadId) {
+        const history = await api.getPhotoChatHistory(nextActiveThreadId);
+        setActiveThreadId(nextActiveThreadId);
+        if (history?.context_state) setContextState(history.context_state);
+
+        const assets: any[] = history.assets || [];
+        const rawMsgs: any[] = history.messages || [];
+        const genPhotos = assets
+          .map((a: any) => ({
+            id: `asset-${a.asset_id}`,
+            assetId: a.asset_id,
+            url: toAbsoluteMediaUrl(a.file_url || ''),
+            fileName: a.file_name,
+            type: (/\.(mp4|mov|webm)/i.test(a.file_url || '') ? 'video' : 'image') as 'image' | 'video',
+            prompt: a.prompt || a.caption || '',
+          }))
+          .filter((p: PhotoMedia) => !!p.url)
+          .reverse();
+        setGeneratedPhotos(genPhotos);
+
+        const assetMap = new Map<number, PhotoMedia>();
+        for (const a of assets) {
+          const aid = Number(a.asset_id);
+          if (!aid) continue;
+          const url = toAbsoluteMediaUrl(a.file_url || a.fileUrl || '');
+          if (!url) continue;
+          assetMap.set(aid, {
+            id: `asset-${aid}`,
+            assetId: aid,
+            url,
+            fileName: a.file_name,
+            type: /\.(mp4|mov|webm)/i.test(url) ? 'video' : 'image',
+            prompt: a.prompt || a.caption || '',
+          });
+        }
+
+        const mappedMessages: ChatMessage[] = rawMsgs.map((m: any) => {
+          const dbId = Number(m.id);
+          const role: 'user' | 'assistant' = (m.role === 'model' || m.role === 'assistant') ? 'assistant' : 'user';
+          const aids: number[] = (m.meta?.asset_ids || []).map(Number).filter(Boolean);
+          const photos = aids.map((id) => assetMap.get(id)).filter(Boolean) as PhotoMedia[];
+
+          if (m.msg_type === 'image' && photos.length === 0 && m.content) {
+            const imgUrl = toAbsoluteMediaUrl(m.content);
+            if (imgUrl) {
+              photos.push({
+                id: `msg-img-${dbId}`,
+                url: imgUrl,
+                type: /\.(mp4|mov|webm)/i.test(imgUrl) ? 'video' : 'image',
+              });
+            }
+          }
+
+          return {
+            id: `db-${dbId}`,
+            dbId,
+            role,
+            type: m.msg_type === 'image' ? 'image' : 'text',
+            content: m.msg_type === 'image' ? '' : (m.content || ''),
+            timestamp: m.created_at ? new Date(m.created_at) : new Date(),
+            photos: photos.length ? photos : undefined,
+            threadId: m.thread_id,
+            requestId: m.request_id,
+          };
+        });
+
+        setMessages(mappedMessages.length > 0 ? [WELCOME_MSG, ...mappedMessages] : [WELCOME_MSG]);
+      } else if (threadId === activeThreadId) {
         setMessages([WELCOME_MSG]);
-        setActiveThreadId(null);
+        setActiveThreadId(nextActiveThreadId);
       }
       toast.success('Чат удалён');
     } catch (e) {
@@ -1511,6 +1708,7 @@ export default function PhotoStudioPage() {
       setGeneratedPhotos(genPhotos);
 
       setMessages(mapped.length > 0 ? [WELCOME_MSG, ...mapped] : [WELCOME_MSG]);
+      await refreshThreadList(resolvedThreadId);
       setThreadDropdownOpen(false);
     } catch (e) {
       console.error('Switch thread error', e);
@@ -2298,8 +2496,8 @@ export default function PhotoStudioPage() {
                     onToggleSelect={(id) => setSelectedMsgIds(prev => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; })}
                   />
                 ))}
-                {isBotTyping && (
-                  <div className="ps-typing"><div className="ps-msg-avatar"><Bot size={16} /></div><div className="ps-typing-dots"><span /><span /><span /></div></div>
+                {isBotTyping && botIndicatorMode && (
+                  <StreamActivityIndicator mode={botIndicatorMode} />
                 )}
                 <div ref={bottomRef} />
               </div>
@@ -3529,11 +3727,8 @@ export default function PhotoStudioPage() {
                     })}
                   />
                 ))}
-                {isBotTyping && (
-                  <div className="ps-typing">
-                    <div className="ps-msg-avatar"><Bot size={16} /></div>
-                    <div className="ps-typing-dots"><span /><span /><span /></div>
-                  </div>
+                {isBotTyping && botIndicatorMode && (
+                  <StreamActivityIndicator mode={botIndicatorMode} />
                 )}
                 <div ref={bottomRef} />
               </div>

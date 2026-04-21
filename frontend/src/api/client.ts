@@ -604,6 +604,14 @@ class ApiClient {
     return this.requestJson<any>('/photo/threads/new', { method: 'POST' });
   }
 
+  async listPhotoThreads() {
+    return this.requestJson<any>('/photo/threads');
+  }
+
+  async deletePhotoThread(threadId: number) {
+    return this.requestJson<any>(`/photo/threads/${threadId}`, { method: 'DELETE' });
+  }
+
   async uploadPhotoChatAsset(file: File) {
     const form = new FormData();
     form.append('file', file);

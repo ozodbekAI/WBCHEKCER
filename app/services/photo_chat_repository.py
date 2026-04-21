@@ -146,6 +146,38 @@ class PhotoChatRepository:
         self.db.flush()
         return active
 
+    def list_threads(self, session_id: int) -> List[PhotoChatThread]:
+        stmt = (
+            select(PhotoChatThread)
+            .where(PhotoChatThread.session_id == session_id)
+            .order_by(PhotoChatThread.is_active.desc(), PhotoChatThread.updated_at.desc(), PhotoChatThread.id.desc())
+        )
+        return list(self.db.execute(stmt).scalars().all())
+
+    def set_active_thread(self, session_id: int, thread_id: int) -> PhotoChatThread:
+        threads = self.list_threads(session_id)
+        target: PhotoChatThread | None = None
+
+        for thread in threads:
+            should_be_active = int(thread.id) == int(thread_id)
+            if should_be_active:
+                target = thread
+            if bool(thread.is_active) != should_be_active:
+                thread.is_active = should_be_active
+                self.db.add(thread)
+
+        if target is None:
+            raise ValueError(f"Photo chat thread {thread_id} not found for session {session_id}")
+
+        normalized = normalize_photo_chat_thread_context(target.context)
+        if target.context != normalized:
+            target.context = normalized
+            self.db.add(target)
+            flag_modified(target, "context")
+
+        self.db.flush()
+        return target
+
     def create_new_thread(self, session_id: int, context: dict[str, Any] | None = None) -> PhotoChatThread:
         existing_threads = list(
             self.db.execute(
@@ -175,6 +207,14 @@ class PhotoChatRepository:
         if session_id is not None and int(thread.session_id) != int(session_id):
             return None
         return thread
+
+    def delete_thread(self, session_id: int, thread_id: int) -> bool:
+        thread = self.get_thread(thread_id, session_id=session_id)
+        if thread is None:
+            return False
+        self.db.delete(thread)
+        self.db.flush()
+        return True
 
     def list_thread_messages(self, thread_id: int, limit: int | None = 30) -> List[PhotoChatMessage]:
         stmt = (

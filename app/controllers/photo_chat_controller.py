@@ -441,6 +441,28 @@ class PhotoChatController:
             "assets": assets,
         }
 
+    def _serialize_thread_summary(
+        self,
+        repo: PhotoChatRepository,
+        thread: PhotoChatThread,
+    ) -> Dict[str, Any]:
+        messages = repo.list_thread_messages(thread.id, limit=None)
+        preview = "Новый чат"
+        for message in reversed(messages):
+            text = re.sub(r"\s+", " ", str(message.content or "")).strip()
+            if text:
+                preview = text[:60]
+                break
+
+        return {
+            "id": int(thread.id),
+            "is_active": bool(thread.is_active),
+            "preview": preview,
+            "message_count": len(messages),
+            "created_at": thread.created_at.isoformat() if getattr(thread, "created_at", None) else None,
+            "updated_at": thread.updated_at.isoformat() if getattr(thread, "updated_at", None) else None,
+        }
+
     def _asset_to_planner_asset(self, media: PhotoChatMedia, *, base_url: str | None = None) -> Dict[str, Any]:
         meta = media.meta if isinstance(media.meta, dict) else {}
         return {
@@ -2236,6 +2258,62 @@ class PhotoChatController:
             message_count=0,
         )
 
+    async def list_threads(
+        self,
+        *,
+        user: Any,
+        db,
+    ) -> Dict[str, Any]:
+        uid = _user_id(user)
+        if uid is None:
+            return {"threads": [], "active_thread_id": None}
+
+        repo = PhotoChatRepository(db)
+        sess = repo.get_or_create_user_session(uid)
+        active_thread = repo.get_or_create_active_thread(sess.id)
+        threads = repo.list_threads(sess.id)
+
+        return {
+            "active_thread_id": active_thread.id,
+            "threads": [self._serialize_thread_summary(repo, thread) for thread in threads],
+        }
+
+    async def delete_thread(
+        self,
+        *,
+        user: Any,
+        db,
+        thread_id: int,
+    ) -> Dict[str, Any]:
+        uid = _user_id(user)
+        if uid is None:
+            raise ValueError("Unauthorized")
+
+        repo = PhotoChatRepository(db)
+        sess = repo.get_or_create_user_session(uid)
+        thread = repo.get_thread(thread_id, session_id=sess.id)
+        if thread is None:
+            raise HTTPException(status_code=404, detail="Photo chat thread not found")
+
+        deleted_locale = repo.get_thread_context(thread.id).get("locale")
+        repo.delete_thread(sess.id, thread.id)
+
+        remaining_threads = repo.list_threads(sess.id)
+        if remaining_threads:
+            active_thread = repo.get_or_create_active_thread(sess.id)
+        else:
+            new_thread_context = {"locale": deleted_locale} if deleted_locale else None
+            active_thread = repo.create_new_thread(sess.id, context=new_thread_context)
+
+        db.commit()
+
+        threads = repo.list_threads(sess.id)
+        return {
+            "deleted_thread_id": int(thread_id),
+            "active_thread_id": active_thread.id,
+            "threads": [self._serialize_thread_summary(repo, item) for item in threads],
+        }
+
     async def get_chat_history(
         self,
         *,
@@ -2253,6 +2331,9 @@ class PhotoChatController:
         sess = repo.get_or_create_user_session(uid)
         active_thread = repo.get_or_create_active_thread(sess.id)
         thread = self._resolve_thread(repo, session_id=sess.id, requested_thread_id=thread_id)
+        if thread_id is not None and int(active_thread.id) != int(thread.id):
+            active_thread = repo.set_active_thread(sess.id, thread.id)
+            db.commit()
 
         msgs = repo.list_thread_messages(thread.id, limit=None)
         media = repo.list_media(sess.id, limit=None)

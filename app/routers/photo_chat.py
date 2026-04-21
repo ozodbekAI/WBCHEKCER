@@ -300,6 +300,37 @@ async def create_chat_thread(
         await controller.close()
 
 
+@router.get("/threads")
+async def list_chat_threads(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_dependency),
+):
+    controller = PhotoChatController()
+    try:
+        return await controller.list_threads(user=current_user, db=db)
+    finally:
+        await controller.close()
+
+
+@router.delete("/threads/{thread_id}")
+async def delete_chat_thread(
+    thread_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_dependency),
+):
+    controller = PhotoChatController()
+    try:
+        return await controller.delete_thread(user=current_user, db=db, thread_id=thread_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("photo threads/delete failed")
+        raise _mapped_photo_http_exception(e, context="threads_delete", default_status=400)
+    finally:
+        await controller.close()
+
+
 @router.get("/chat/history")
 async def get_chat_history(
     request: Request,

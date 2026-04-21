@@ -367,7 +367,7 @@ def test_clear_mode_all_resets_messages_and_context_but_keeps_media():
     repo.db.close()
 
 
-def test_history_endpoint_returns_requested_thread_and_context_state():
+def test_history_endpoint_returns_requested_thread_and_activates_it():
     repo = _make_repo()
     controller = PhotoChatController.__new__(PhotoChatController)
 
@@ -402,7 +402,7 @@ def test_history_endpoint_returns_requested_thread_and_context_state():
     )
 
     assert result["thread_id"] == original_thread.id
-    assert result["active_thread_id"] == active_thread.id
+    assert result["active_thread_id"] == original_thread.id
     assert result["context_state"] == {
         "last_generated_asset_id": media.id,
         "working_asset_ids": [media.id],
@@ -415,5 +415,34 @@ def test_history_endpoint_returns_requested_thread_and_context_state():
     assert result["messages"][0]["request_id"] == "req-history"
     assert len(result["assets"]) == 1
     assert result["assets"][0]["file_url"] == "https://backend.example.com/media/photos/thread-asset.jpg"
+    assert repo.get_or_create_active_thread(session.id).id == original_thread.id
+
+    repo.db.close()
+
+
+def test_list_threads_and_delete_thread_follow_server_state():
+    repo = _make_repo()
+    controller = PhotoChatController.__new__(PhotoChatController)
+
+    session = repo.get_or_create_user_session(user_id=2002)
+    first_thread = repo.get_or_create_active_thread(session.id)
+    repo.add_message(session_id=session.id, thread_id=first_thread.id, role="user", content="first chat")
+    second_thread = repo.create_new_thread(session.id, context={"locale": "uz"})
+    repo.add_message(session_id=session.id, thread_id=second_thread.id, role="user", content="second chat")
+    repo.db.commit()
+
+    listed = asyncio.run(controller.list_threads(user={"id": 2002}, db=repo.db))
+
+    assert listed["active_thread_id"] == second_thread.id
+    assert [item["id"] for item in listed["threads"]] == [second_thread.id, first_thread.id]
+    assert listed["threads"][0]["preview"] == "second chat"
+    assert listed["threads"][1]["preview"] == "first chat"
+
+    deleted = asyncio.run(controller.delete_thread(user={"id": 2002}, db=repo.db, thread_id=second_thread.id))
+
+    assert deleted["deleted_thread_id"] == second_thread.id
+    assert deleted["active_thread_id"] == first_thread.id
+    assert [item["id"] for item in deleted["threads"]] == [first_thread.id]
+    assert repo.get_or_create_active_thread(session.id).id == first_thread.id
 
     repo.db.close()
