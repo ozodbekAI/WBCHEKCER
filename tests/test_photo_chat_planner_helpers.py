@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from pathlib import Path
 import sys
 
@@ -10,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.controllers.photo_chat_controller import PhotoChatController
-from app.services.gemini_api import GeminiApiError
+from app.services.gemini_api import GeminiApiError, GeminiPart
 from app.services.photo_chat_agent import PhotoChatAgent, resolve_photo_chat_locale
 
 
@@ -218,6 +219,51 @@ def test_generate_content_with_fallback_retries_when_model_times_out():
         ("gemini-3-pro-image-preview", None, 35, None),
         ("gemini-3-pro-image-preview", None, 35, None),
         ("gemini-3.1-flash-image-preview", None, 45, None),
+    ]
+
+
+def test_edit_or_generate_image_defaults_to_quality_fallback_when_omitted(monkeypatch):
+    class _FakeApi:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_content(self, *, model, contents, generation_config=None, service_tier=None, timeout_s=None, max_retries=None):
+            self.calls.append((model, service_tier, timeout_s, max_retries))
+            if model == "gemini-3-pro-image-preview":
+                raise GeminiApiError("Gemini error 503: This model is currently experiencing high demand and is UNAVAILABLE")
+            return {"ok": True, "model": model}
+
+        @staticmethod
+        def extract_text_and_images(resp):
+            return "done", [GeminiPart(inline_data_b64=base64.b64encode(b"image-bytes").decode("utf-8"), inline_mime="image/png")]
+
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_MODEL_FALLBACK", "gemini-3.1-flash-image-preview")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_SERVICE_TIER", "standard")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_TIMEOUT_S", 25)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_FALLBACK_TIMEOUT_S", 45)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_MAX_RETRIES", 0)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_IMAGE_FALLBACK_MAX_RETRIES", 1)
+
+    agent = PhotoChatAgent.__new__(PhotoChatAgent)
+    agent.api = _FakeApi()
+    agent._sem = asyncio.Semaphore(1)
+
+    text, out_bytes, out_mime = asyncio.run(
+        agent.edit_or_generate_image(
+            prompt="make it brighter",
+            images=[(b"raw-image", "image/png")],
+            trace_id="image-default-fallback",
+        )
+    )
+
+    assert text == "done"
+    assert out_bytes == b"image-bytes"
+    assert out_mime == "image/png"
+    assert agent.api.calls == [
+        ("gemini-3-pro-image-preview", "standard", 25, 0),
+        ("gemini-3-pro-image-preview", "standard", 25, 0),
+        ("gemini-3.1-flash-image-preview", "standard", 45, 1),
     ]
 
 

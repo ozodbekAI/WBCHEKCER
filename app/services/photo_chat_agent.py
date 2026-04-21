@@ -1410,7 +1410,7 @@ class PhotoChatAgent:
         requested_model = _normalize_requested_model(model)
         model = self._resolve_image_model(requested_model, model_profile)
         fallback_model = self._resolve_image_fallback_model(model)
-        allow_fallback = False if allow_quality_fallback is None else bool(allow_quality_fallback)
+        allow_fallback = True if allow_quality_fallback is None else bool(allow_quality_fallback)
         service_tier = settings.GEMINI_IMAGE_SERVICE_TIER
         timeout_s = settings.GEMINI_IMAGE_TIMEOUT_S
         fallback_timeout_s = settings.GEMINI_IMAGE_FALLBACK_TIMEOUT_S
