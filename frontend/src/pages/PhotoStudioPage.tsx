@@ -1072,13 +1072,11 @@ export default function PhotoStudioPage() {
       : 'Авто-режим сам переключается на fallback-модель при недоступности.';
 
     return (
-      <div className={`ps-chat-model-picker${isMobilePicker ? ' ps-chat-model-picker--mobile' : ''}`}>
-        <div className="ps-chat-model-header">
-          <span className="ps-chat-model-label">Модель генерации</span>
-          <span className={`ps-chat-model-badge${selectedGenerationModel ? ' is-locked' : ''}`}>
-            {selectedGenerationModel ? 'Locked x10' : 'Auto'}
-          </span>
-        </div>
+      <div
+        className={`ps-chat-model-picker${isMobilePicker ? ' ps-chat-model-picker--mobile' : ' ps-chat-model-picker--desktop'}`}
+        title={note}
+      >
+        <span className="ps-chat-model-label">Модель</span>
         <div className="ps-chat-model-select-wrap">
           <select
             value={selectedGenerationModel}
@@ -1097,10 +1095,9 @@ export default function PhotoStudioPage() {
           </select>
           <ChevronDown size={14} className="ps-chat-model-select-icon" />
         </div>
-        <div className="ps-chat-model-note">
-          <span>{selectedGenerationModelMeta?.description || defaultGenerationModelMeta?.description || note}</span>
-          <span>{note}</span>
-        </div>
+        <span className={`ps-chat-model-badge${selectedGenerationModel ? ' is-locked' : ''}`}>
+          {selectedGenerationModel ? 'x10' : 'Auto'}
+        </span>
       </div>
     );
   };
@@ -2644,6 +2641,9 @@ export default function PhotoStudioPage() {
                     <Plus size={16} />
                   </button>
                 </div>
+                <div className="ps-mobile-chat-model-row">
+                  {renderGenerationModelPicker('mobile')}
+                </div>
               </div>
 
               <div className="ps-messages ps-mobile-messages" onDragOver={(e) => e.preventDefault()} onDrop={handleDrop}>
@@ -2727,8 +2727,6 @@ export default function PhotoStudioPage() {
                   ))}
                 </div>
               )}
-
-              {renderGenerationModelPicker('mobile')}
 
               {/* Input bar */}
               <form className="ps-mobile-input-bar" onSubmit={(e) => { e.preventDefault(); void handleSend(); }}>
@@ -3714,6 +3712,7 @@ export default function PhotoStudioPage() {
               </div>
             </div>
             <div className="ps-chat-header-right" style={{ display: 'flex', gap: '6px', alignItems: 'center', position: 'relative' }}>
+              {mode === 'chat' ? renderGenerationModelPicker('desktop') : null}
               <div ref={threadDropdownRef} style={{ position: 'relative' }}>
                 <button
                   className="ps-choose-btn"
@@ -3960,8 +3959,6 @@ export default function PhotoStudioPage() {
                   )}
                 </div>
               )}
-
-              {renderGenerationModelPicker('desktop')}
 
               <form className="ps-input" onSubmit={(e) => { e.preventDefault(); void handleSend(); }}>
                 <button type="button" className="ps-icon-btn" onClick={() => fileInputRef.current?.click()} disabled={isStreaming || !canAttachMore}>
