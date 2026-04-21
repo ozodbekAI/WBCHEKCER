@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import logging
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
@@ -11,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db_dependency
 from app.core.dependencies import get_current_user
 from app.controllers.photo_chat_controller import PhotoChatController
+from app.core.config import settings
 from app.services.photo_chat_agent import PhotoChatAgent
 from app.schemas.photo_chat import (
     PhotoChatAssetImportRequest,
@@ -26,6 +30,11 @@ from app.services.photo_error_mapper import map_photo_error
 
 router = APIRouter(prefix="/api/photo", tags=["Photo Chat"])
 logger = logging.getLogger("photo.chat.router")
+
+
+def _sse_message(data: Dict[str, Any]) -> str:
+    payload = json.dumps(data or {}, ensure_ascii=False)
+    return f"event: message\ndata: {payload}\n\n"
 
 
 def _mapped_photo_http_exception(raw_error: Any, *, context: str, default_status: int = 400) -> HTTPException:
@@ -260,19 +269,98 @@ async def chat_stream(
     controller = PhotoChatController()
     payload_dict = payload.model_dump(exclude_none=True)
     payload_dict.setdefault("base_url", _request_base_url(request))
+    request_id = str(payload.request_id or "").strip() or None
+    fallback_thread_id = int(payload.thread_id) if isinstance(payload.thread_id, int) else None
+    keepalive_interval_s = max(5.0, float(settings.PHOTO_CHAT_STREAM_KEEPALIVE_S or 15.0))
 
     async def event_gen() -> AsyncGenerator[str, None]:
+        upstream = controller.chat_stream(user=current_user, db=db, payload=payload_dict)
+        next_chunk_task: Optional[asyncio.Task[str]] = None
         try:
-            async for chunk in controller.chat_stream(user=current_user, db=db, payload=payload_dict):
-                yield chunk
+            while True:
+                if await request.is_disconnected():
+                    logger.info(
+                        "photo chat stream disconnected before next chunk | request_id=%s thread_id=%s",
+                        request_id,
+                        fallback_thread_id,
+                    )
+                    break
+
+                next_chunk_task = asyncio.create_task(upstream.__anext__())
+
+                while True:
+                    done, _pending = await asyncio.wait(
+                        {next_chunk_task},
+                        timeout=keepalive_interval_s,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if next_chunk_task in done:
+                        break
+                    if await request.is_disconnected():
+                        logger.info(
+                            "photo chat stream disconnected during keepalive wait | request_id=%s thread_id=%s",
+                            request_id,
+                            fallback_thread_id,
+                        )
+                        next_chunk_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await next_chunk_task
+                        return
+                    yield _sse_message(
+                        {
+                            "type": "keepalive",
+                            "request_id": request_id,
+                            "thread_id": fallback_thread_id,
+                        }
+                    )
+
+                try:
+                    chunk = await next_chunk_task
+                except StopAsyncIteration:
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        "photo chat stream crashed after response start | request_id=%s thread_id=%s",
+                        request_id,
+                        fallback_thread_id,
+                    )
+                    mapped = map_photo_error(exc, context="chat_stream:stream")
+                    yield _sse_message(
+                        {
+                            "type": "error",
+                            "request_id": request_id,
+                            "thread_id": fallback_thread_id,
+                            "message": mapped.get("message"),
+                            "code": mapped.get("code"),
+                            "retryable": bool(mapped.get("retryable", True)),
+                            "where": mapped.get("where"),
+                            "provider": mapped.get("provider"),
+                            "reason": mapped.get("reason"),
+                            "error": mapped,
+                        }
+                    )
+                    break
+                else:
+                    yield chunk
+                finally:
+                    next_chunk_task = None
         finally:
+            if next_chunk_task is not None and not next_chunk_task.done():
+                next_chunk_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await next_chunk_task
+            with contextlib.suppress(Exception):
+                await upstream.aclose()
             await controller.close()
 
     return StreamingResponse(
         event_gen(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
