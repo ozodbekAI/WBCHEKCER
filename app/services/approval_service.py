@@ -20,6 +20,7 @@ from ..models import (
     IssueStatus,
     User,
 )
+from .card_service import should_refresh_product_dna
 
 
 def _as_text(value: Any) -> str:
@@ -409,6 +410,8 @@ def build_card_update_payload(
 
 
 def apply_card_raw_snapshot(card: Card, raw_data: dict[str, Any]) -> None:
+    if card.product_dna and should_refresh_product_dna(card, next_raw_data=raw_data):
+        card.product_dna = None
     card.raw_data = raw_data
     card.title = (_as_text(raw_data.get("title")) if "title" in raw_data else _as_text(card.title)) or None
     card.description = (_as_text(raw_data.get("description")) if "description" in raw_data else _as_text(card.description)) or None

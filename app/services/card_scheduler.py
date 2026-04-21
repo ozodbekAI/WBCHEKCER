@@ -206,19 +206,8 @@ class CardScheduler:
             for row in result.all()
         }
 
-        # Reset skip flag for all cards we're processing
-        skip_nm_ids = [nm_id for nm_id, v in existing.items() if v["skip"]]
-        if skip_nm_ids:
-            from sqlalchemy import update as sa_update
-            await db.execute(
-                sa_update(Card)
-                .where(Card.store_id == store_id, Card.nm_id.in_(skip_nm_ids))
-                .values(skip_next_reanalyze=False)
-            )
-            await db.commit()
-            logger.debug("[card-scheduler] reset skip_next_reanalyze for %d card(s)", len(skip_nm_ids))
-
         changed = []
+        skipped_to_clear: list[int] = []
         for wb_card in wb_cards:
             nm_id = wb_card.get("nmID")
             if not nm_id:
@@ -237,6 +226,7 @@ class CardScheduler:
                 if db_entry and db_entry["skip"]:
                     # This was updated by us — WB updatedAt changed because of our fix
                     # Still log but don't re-analyze immediately
+                    skipped_to_clear.append(nm_id)
                     logger.info(
                         "[card-scheduler] nm_id=%d updated by us (skip re-analyze), old=%s new=%s",
                         nm_id, (db_entry or {}).get("wb_updated_at"), wb_updated_at
@@ -248,6 +238,15 @@ class CardScheduler:
                         "[card-scheduler] changed nm_id=%d, old=%s new=%s",
                         nm_id, (db_entry or {}).get("wb_updated_at"), wb_updated_at
                     )
+
+        if skipped_to_clear:
+            from sqlalchemy import update as sa_update
+            await db.execute(
+                sa_update(Card)
+                .where(Card.store_id == store_id, Card.nm_id.in_(skipped_to_clear))
+                .values(skip_next_reanalyze=False)
+            )
+            await db.commit()
 
         return changed
 

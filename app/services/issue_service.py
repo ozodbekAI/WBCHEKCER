@@ -495,6 +495,20 @@ async def get_issue_stats(db: AsyncSession, store_id: int) -> dict:
             )
         )
         stats["by_severity"][severity.value] = result.scalar() or 0
+
+    category_rows = await db.execute(
+        select(CardIssue.category, func.count(CardIssue.id))
+        .join(Card)
+        .where(
+            Card.store_id == store_id,
+            CardIssue.status == IssueStatus.PENDING,
+        )
+        .group_by(CardIssue.category)
+    )
+    stats["by_category"] = {
+        (category.value if hasattr(category, "value") else str(category)): int(count or 0)
+        for category, count in category_rows.all()
+    }
     
     # Potential score gain
     result = await db.execute(
@@ -552,6 +566,9 @@ async def get_next_issue(
         .options(selectinload(CardIssue.card))
         .where(*conditions)
         .order_by(
+            Card.critical_issues_count.desc(),
+            Card.warnings_count.desc(),
+            Card.improvements_count.desc(),
             CardIssue.severity.asc(),  # CRITICAL=0 first
             CardIssue.score_impact.desc(),
             CardIssue.id.asc(),

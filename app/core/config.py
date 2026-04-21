@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     # Application
     APP_NAME: str = "WB Card Optimizer"
     APP_VERSION: str = "1.0.0"
+    APP_ENV: str = "development"
     DEBUG: bool = False
     HTTP_DEBUG_LOG: bool = False
     
@@ -147,6 +148,27 @@ class Settings(BaseSettings):
                 return False
         return False
 
+    @field_validator("APP_ENV", mode="before")
+    @classmethod
+    def _normalize_app_env(cls, value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return "development"
+
+        aliases = {
+            "dev": "development",
+            "development": "development",
+            "local": "development",
+            "test": "test",
+            "testing": "test",
+            "prod": "production",
+            "production": "production",
+        }
+        normalized = aliases.get(raw)
+        if normalized is None:
+            raise ValueError("APP_ENV must be one of: development, test, production")
+        return normalized
+
     @field_validator("CORS_ALLOWED_ORIGINS", mode="before")
     @classmethod
     def _parse_cors_allowed_origins(cls, value: Any) -> list[str]:
@@ -174,6 +196,16 @@ class Settings(BaseSettings):
         if value is None:
             return ""
         return str(value).strip().rstrip("/")
+
+    @model_validator(mode="after")
+    def _validate_security_settings(self):
+        insecure_default = "your-super-secret-key-change-in-production"
+        secret = str(self.SECRET_KEY or "").strip()
+        if self.APP_ENV == "production" and (
+            not secret or secret == insecure_default or secret.startswith(insecure_default)
+        ):
+            raise ValueError("SECRET_KEY must be set explicitly outside non-production environments")
+        return self
 
 
 @lru_cache()

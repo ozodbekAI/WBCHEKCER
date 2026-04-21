@@ -1,8 +1,9 @@
-from typing import List, Optional
+import json
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.database import get_db
@@ -21,11 +22,21 @@ from ..services import (
     skip_issue, postpone_issue, get_issue_stats,
     WildberriesAPI, update_store_stats,
 )
-from ..services.card_service import ensure_card_issue_consistency
+from ..services.approval_service import apply_card_raw_snapshot, build_card_update_payload
+from ..services.card_service import (
+    _check_seo_keywords_in_text,
+    _get_subject_keywords,
+    _validate_fix_against_constraints,
+    _validate_title_fix,
+    analyze_card,
+    ensure_card_issue_consistency,
+)
 from ..services.issue_service import (
+    calculate_visible_issue_counts_from_rows,
     get_next_issue, get_card_pending_count, get_fixed_issues_for_store,
     get_queue_progress, mark_applied_to_wb,
 )
+from ..services.text_policy import validate_description
 from ..services.wb_token_access import ensure_store_feature_access, get_store_feature_api_key
 from ..services.workflow_service import create_team_tickets
 
@@ -220,6 +231,255 @@ async def _auto_resolve_if_now_valid(
     return False
 
 
+def _split_manual_multi_value(value: str) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw or raw == "__CLEAR__":
+        return []
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+        if parsed is not None:
+            text = str(parsed).strip()
+            return [text] if text else []
+    except Exception:
+        pass
+
+    if ";" in raw:
+        return [part.strip() for part in raw.split(";") if part.strip()]
+    if "," in raw:
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    return [raw]
+
+
+def _issue_allows_clear(issue: CardIssue) -> bool:
+    if str(issue.code or "").strip().lower() == "wb_wrong_category":
+        return True
+    for detail in (issue.error_details or []):
+        if not isinstance(detail, dict):
+            continue
+        marker = str(detail.get("fix_action") or detail.get("type") or "").strip().lower()
+        if marker in {"clear", "swap", "compound"}:
+            return True
+    return False
+
+
+def _supports_direct_wb_apply(issue: CardIssue) -> bool:
+    fp = str(issue.field_path or "").strip().lower()
+    return (
+        fp == "title"
+        or fp == "description"
+        or fp == "brand"
+        or fp == "subject_name"
+        or fp == "package_type"
+        or fp == "complectation"
+        or fp.startswith("characteristics.")
+        or fp.startswith("dimensions.")
+    )
+
+
+def _extract_compound_changes(issue: CardIssue) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    for detail in (issue.error_details or []):
+        if not isinstance(detail, dict):
+            continue
+        marker = str(detail.get("fix_action") or detail.get("type") or "").strip().lower()
+        if marker != "compound":
+            continue
+        for fix in (detail.get("fixes") or []):
+            field_path = fix.get("field_path")
+            if not field_path:
+                name = str(fix.get("name") or "").strip()
+                lower = name.lower()
+                if lower in {"title", "название", "наименование"}:
+                    field_path = "title"
+                elif lower in {"description", "описание"}:
+                    field_path = "description"
+                else:
+                    field_path = f"characteristics.{name}"
+
+            raw_value = fix.get("value") if fix.get("action") != "clear" else "__CLEAR__"
+            if isinstance(raw_value, list):
+                new_value = json.dumps(raw_value, ensure_ascii=False)
+            elif raw_value is None:
+                new_value = ""
+            else:
+                new_value = str(raw_value)
+
+            changes.append(
+                {
+                    "field_path": field_path,
+                    "new_value": new_value,
+                    "charc_id": fix.get("charc_id", fix.get("charcId")),
+                }
+            )
+    return changes
+
+
+def _change_dedupe_key(change: dict[str, Any]) -> tuple[str, int]:
+    field_path = str(change.get("field_path") or "").strip().lower()
+    try:
+        charc_id = int(change.get("charc_id")) if change.get("charc_id") is not None else 0
+    except (TypeError, ValueError):
+        charc_id = 0
+    return field_path, charc_id
+
+
+def _dedupe_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for change in changes:
+        key = _change_dedupe_key(change)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(change)
+    return deduped
+
+
+def _build_wb_client(store: Store) -> WildberriesAPI:
+    ensure_store_feature_access(store, "cards_write")
+    feature_api_key = get_store_feature_api_key(store, "cards_write")
+    if not feature_api_key:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
+    return WildberriesAPI(feature_api_key)
+
+
+async def _send_card_changes_to_wb(
+    *,
+    store: Store,
+    card,
+    changes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    deduped_changes = _dedupe_changes(changes)
+    if not deduped_changes:
+        raise HTTPException(status_code=400, detail="No supported WB card changes to apply")
+
+    wb_api = _build_wb_client(store)
+    update_payload, next_raw_data = build_card_update_payload(card, deduped_changes)
+    wb_result = await wb_api.update_card(update_payload)
+    if not wb_result.get("success"):
+        error_msg = wb_result.get("error", "Unknown WB error")
+        raise HTTPException(status_code=502, detail=f"WB API error: {error_msg}")
+    return next_raw_data
+
+
+async def _safe_reanalyze_card_after_apply(db: AsyncSession, card) -> None:
+    try:
+        await analyze_card(db, card)
+    except Exception:
+        pending_by_severity = await db.execute(
+            select(
+                CardIssue.severity,
+                CardIssue.code,
+                CardIssue.category,
+                CardIssue.field_path,
+                func.count(),
+            )
+            .where(
+                CardIssue.card_id == card.id,
+                CardIssue.status == IssueStatus.PENDING,
+            )
+            .group_by(CardIssue.severity, CardIssue.code, CardIssue.category, CardIssue.field_path)
+        )
+        counts = calculate_visible_issue_counts_from_rows(pending_by_severity.all())
+        card.critical_issues_count = int(counts.get("critical", 0) or 0)
+        card.warnings_count = int(counts.get("warning", 0) or 0)
+        card.improvements_count = int(counts.get("improvement", 0) or 0)
+        await db.commit()
+
+
+async def _refresh_card_after_wb_apply(
+    db: AsyncSession,
+    card,
+    next_raw_data: Optional[dict[str, Any]],
+) -> None:
+    if next_raw_data is None:
+        return
+    apply_card_raw_snapshot(card, next_raw_data)
+    card.skip_next_reanalyze = True
+    await db.commit()
+    await _safe_reanalyze_card_after_apply(db, card)
+
+
+def _issue_to_fixed_change(issue: CardIssue) -> Optional[dict[str, Any]]:
+    if not issue.fixed_value or not _supports_direct_wb_apply(issue):
+        return None
+    return {
+        "field_path": issue.field_path,
+        "new_value": issue.fixed_value,
+        "charc_id": issue.charc_id,
+    }
+
+
+async def _validate_manual_fixed_value(issue: CardIssue, raw_value: str) -> str:
+    fixed_value = str(raw_value or "").strip()
+    if not fixed_value:
+        raise HTTPException(status_code=400, detail="fixed_value is required")
+
+    if str(issue.code or "").strip().lower().startswith("wb_fixed_"):
+        raise HTTPException(status_code=400, detail="This WB system field cannot be fixed manually")
+
+    if str(issue.source or "").strip().lower() == "fixed_file":
+        expected = str(issue.suggested_value or "").strip()
+        if fixed_value != expected:
+            raise HTTPException(
+                status_code=400,
+                detail="For fixed-file issues use the exact suggested_value",
+            )
+        return fixed_value
+
+    field_path = str(issue.field_path or "").strip().lower()
+    card_payload = issue.card.raw_data if isinstance(issue.card.raw_data, dict) else {}
+
+    if field_path == "title":
+        valid, reason = _validate_title_fix(fixed_value, card_payload)
+        if not valid:
+            raise HTTPException(status_code=400, detail=reason or "Invalid title")
+        return fixed_value
+
+    if field_path == "description":
+        valid, reason = validate_description(fixed_value, card_payload)
+        if not valid:
+            raise HTTPException(status_code=400, detail=reason or "Invalid description")
+
+        keywords = _get_subject_keywords(card_payload)
+        seo_valid, seo_reason = _check_seo_keywords_in_text(fixed_value, keywords, min_count=2)
+        if not seo_valid:
+            raise HTTPException(status_code=400, detail=seo_reason or "Description SEO validation failed")
+        return fixed_value
+
+    if field_path.startswith("characteristics."):
+        if fixed_value == "__CLEAR__" and not _issue_allows_clear(issue):
+            raise HTTPException(status_code=400, detail="Clearing this field is not allowed")
+
+        parsed_values = _split_manual_multi_value(fixed_value)
+        candidate: Any = [] if fixed_value == "__CLEAR__" else parsed_values
+        if isinstance(candidate, list) and len(candidate) == 1:
+            candidate = candidate[0]
+
+        valid, reason, corrected = _validate_fix_against_constraints(
+            value=candidate,
+            allowed_values=list(issue.allowed_values or []),
+            error_details=list(issue.error_details or []),
+            char_name=issue.field_path or issue.title,
+            current_value=issue.current_value,
+            product_dna=str(issue.card.product_dna or ""),
+        )
+        if not valid:
+            raise HTTPException(status_code=400, detail=reason or "Invalid fixed_value")
+
+        final_value = corrected if corrected is not None else candidate
+        if final_value == []:
+            return "__CLEAR__"
+        if isinstance(final_value, list):
+            return json.dumps(final_value, ensure_ascii=False)
+        return str(final_value)
+
+    return fixed_value
+
+
 @router.get("", response_model=IssueListOut)
 async def list_issues(
     store: Store = Depends(get_user_store),
@@ -388,25 +648,41 @@ async def fix_issue_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Issue is not pending or skipped"
         )
-    
-    # Apply fix to WB if requested
+
+    fixed_value = await _validate_manual_fixed_value(issue, fix_data.fixed_value)
+    next_raw_data: Optional[dict[str, Any]] = None
+
     if fix_data.apply_to_wb:
-        # Build update payload based on field_path
-        ensure_store_feature_access(store, "cards_write")
-        feature_api_key = get_store_feature_api_key(store, "cards_write")
-        if not feature_api_key:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
-        wb_api = WildberriesAPI(feature_api_key)
-        # In a real implementation, you would build the proper update payload
-        # For now, just mark as fixed
-    
-    # Mark as fixed
-    updated = await fix_issue(db, issue, fix_data.fixed_value, current_user.id)
-    
+        if not _supports_direct_wb_apply(issue):
+            raise HTTPException(
+                status_code=400,
+                detail="This issue type cannot be applied to WB via /issues/{id}/fix. Use dedicated card/media flow.",
+            )
+
+        changes = [
+            {
+                "field_path": issue.field_path,
+                "new_value": fixed_value,
+                "charc_id": issue.charc_id,
+            }
+        ]
+        changes.extend(_extract_compound_changes(issue))
+        next_raw_data = await _send_card_changes_to_wb(
+            store=store,
+            card=issue.card,
+            changes=changes,
+        )
+
+    updated = await fix_issue(db, issue, fixed_value, current_user.id)
+    response_payload = IssueOut.model_validate(updated)
+
+    if fix_data.apply_to_wb and next_raw_data is not None:
+        await _refresh_card_after_wb_apply(db, issue.card, next_raw_data)
+
     # Update store stats
     await update_store_stats(db, store.id)
-    
-    return IssueOut.model_validate(updated)
+
+    return response_payload
 
 
 @router.post("/{issue_id}/skip", response_model=IssueOut)
@@ -681,8 +957,6 @@ async def apply_all_fixes_to_wb(
     Apply all fixed issues to Wildberries.
     Groups fixes by card and sends batch updates to WB API.
     """
-    from ..services.wb_api import WildberriesAPI
-    
     fixed_issues = await get_fixed_issues_for_store(db, store.id)
     
     if not fixed_issues:
@@ -704,93 +978,43 @@ async def apply_all_fixes_to_wb(
             }
         cards_fixes[card_id]["issues"].append(issue)
     
-    ensure_store_feature_access(store, "cards_write")
-    feature_api_key = get_store_feature_api_key(store, "cards_write")
-    if not feature_api_key:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="WB Content key is not configured")
-    wb_api = WildberriesAPI(feature_api_key)
     applied_ids = []
     errors = []
     
     for card_id, data in cards_fixes.items():
         card = data["card"]
         card_issues = data["issues"]
-        
-        # Build update payload from raw_data + fixes
-        raw = card.raw_data or {}
-        
-        # Apply characteristic fixes
-        characteristics = raw.get("characteristics", [])
+        card_changes = []
+        applicable_ids = []
+        skipped_for_card = 0
         for issue in card_issues:
-            if issue.field_path and issue.field_path.startswith("characteristics.") and issue.fixed_value:
-                char_name = issue.field_path.replace("characteristics.", "")
+            change = _issue_to_fixed_change(issue)
+            if change is None:
+                skipped_for_card += 1
+                continue
+            card_changes.append(change)
+            applicable_ids.append(issue.id)
 
-                def _parse_fixed_value(fv: str) -> list:
-                    """Convert fixed_value string to WB value array."""
-                    try:
-                        import json as _json
-                        val = _json.loads(fv)
-                        if isinstance(val, list):
-                            return val
-                        return [str(val)]
-                    except (Exception,):
-                        pass
-                    if fv == "__CLEAR__":
-                        return []
-                    if ";" in fv:
-                        return [v.strip() for v in fv.split(";") if v.strip()]
-                    if ", " in fv:
-                        return [v.strip() for v in fv.split(", ") if v.strip()]
-                    return [fv]
+        if not card_changes:
+            if skipped_for_card:
+                errors.append(f"Card {card.nm_id}: no supported fixed issues to apply to WB")
+            continue
 
-                matched = False
-                for ch in characteristics:
-                    if ch.get("name") == char_name or (issue.charc_id and str(ch.get("id")) == str(issue.charc_id)):
-                        ch["value"] = _parse_fixed_value(issue.fixed_value)
-                        matched = True
-                        break
-                if not matched and issue.charc_id and issue.fixed_value != "__CLEAR__":
-                    # Add new characteristic that doesn't exist yet
-                    characteristics.append({
-                        "id": issue.charc_id,
-                        "name": char_name,
-                        "value": _parse_fixed_value(issue.fixed_value),
-                    })
-        
-        # Build WB update payload
-        update_payload = {
-            "nmID": card.nm_id,
-            "vendorCode": card.vendor_code or "",
-            "characteristics": characteristics,
-        }
-        
-        # Apply title/description fixes
-        for issue in card_issues:
-            if issue.field_path == "title" and issue.fixed_value:
-                update_payload["title"] = issue.fixed_value
-            elif issue.field_path == "description" and issue.fixed_value:
-                update_payload["description"] = issue.fixed_value
-        
-        # Send to WB
-        result = await wb_api.update_card(update_payload)
-        
-        if result.get("success"):
-            applied_ids.extend([i.id for i in card_issues])
-            # Mark card so scheduler doesn't re-analyze after our fix
-            from sqlalchemy import update as sa_update
-            await db.execute(
-                sa_update(card.__class__)
-                .where(card.__class__.id == card_id)
-                .values(skip_next_reanalyze=True)
+        try:
+            next_raw_data = await _send_card_changes_to_wb(
+                store=store,
+                card=card,
+                changes=card_changes,
             )
-        else:
-            error_msg = result.get("error", "Unknown error")
-            errors.append(f"Card {card.nm_id}: {error_msg}")
+            await mark_applied_to_wb(db, applicable_ids)
+            await _refresh_card_after_wb_apply(db, card, next_raw_data)
+            applied_ids.extend(applicable_ids)
+            if skipped_for_card:
+                errors.append(f"Card {card.nm_id}: skipped {skipped_for_card} unsupported fixed issue(s)")
+        except HTTPException as exc:
+            errors.append(f"Card {card.nm_id}: {exc.detail}")
     
     # Mark applied
-    if applied_ids:
-        await mark_applied_to_wb(db, applied_ids)
-    
     # Update store stats
     await update_store_stats(db, store.id)
     

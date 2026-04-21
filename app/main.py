@@ -42,8 +42,11 @@ DEV_CORS_ORIGINS = [
 
 
 def _get_cors_origins() -> list[str]:
-    # Temporary non-production mode: allow all origins.
-    return ["*"]
+    if settings.CORS_ALLOWED_ORIGINS:
+        return settings.CORS_ALLOWED_ORIGINS
+    if settings.APP_ENV != "production":
+        return DEV_CORS_ORIGINS
+    return []
 
 
 @asynccontextmanager

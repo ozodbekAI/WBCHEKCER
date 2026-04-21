@@ -619,7 +619,7 @@ class CardValidator:
                         name=cm.name,
                         value=None,
                         message=f"Обязательная характеристика «{cm.name}» не заполнена. Без неё товар не попадёт в фильтры WB.",
-                        severity="warning",
+                        severity="critical",
                         category="qualification",
                         errors=[ErrorReason(
                             type="missing_required",
@@ -788,9 +788,8 @@ class CardValidator:
         # Severity logic:
         # - missing_required = critical (blokiruet filtry)
         # - limit/allowed_values = warning (mozhno ispravit')
-        has_limit = any(r.type == "limit" for r in reasons)
-        has_allowed = any(r.type == "allowed_values" for r in reasons)
-        severity = "warning" if (has_limit or has_allowed) else "error"
+        has_missing_required = any(r.type == "missing_required" for r in reasons)
+        severity = "critical" if has_missing_required else "warning"
         
         # Build message
         parts = []

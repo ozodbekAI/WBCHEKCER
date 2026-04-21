@@ -127,6 +127,39 @@ def _extract_photo_urls(raw_data: dict, limit: int = 2) -> List[str]:
     return out
 
 
+def should_refresh_product_dna(
+    card: Card,
+    *,
+    next_raw_data: Optional[dict] = None,
+    next_photos: Optional[List[str]] = None,
+    next_subject_name: Optional[str] = None,
+) -> bool:
+    current_raw = card.raw_data if isinstance(card.raw_data, dict) else {}
+    current_photos = _extract_photo_urls(current_raw, limit=5) or [
+        str(url).strip() for url in (card.photos or []) if str(url).strip()
+    ]
+    current_subject = str(
+        card.subject_name
+        or current_raw.get("subjectName")
+        or current_raw.get("subject_name")
+        or ""
+    ).strip()
+
+    if isinstance(next_raw_data, dict):
+        target_photos = _extract_photo_urls(next_raw_data, limit=5)
+        target_subject = str(
+            next_raw_data.get("subjectName")
+            or next_raw_data.get("subject_name")
+            or next_subject_name
+            or ""
+        ).strip()
+    else:
+        target_photos = [str(url).strip() for url in (next_photos or []) if str(url).strip()]
+        target_subject = str(next_subject_name or "").strip()
+
+    return current_photos != target_photos or current_subject != target_subject
+
+
 def _allowed_values_for_ai(iss: CardIssue) -> List[str]:
     """
     For color fields send only parent color names to AI.
@@ -158,6 +191,20 @@ def _normalize_issue_field_path(name: Optional[str]) -> Optional[str]:
         return raw
 
     return f"characteristics.{raw}"
+
+
+def _issue_restore_key(
+    code: Optional[str],
+    field_path: Optional[str],
+    charc_id: Optional[int],
+) -> tuple[str, str, int]:
+    normalized_code = str(code or "").strip().lower()
+    normalized_field_path = (_normalize_issue_field_path(field_path) or "").strip().lower()
+    try:
+        normalized_charc_id = int(charc_id) if charc_id is not None else 0
+    except (TypeError, ValueError):
+        normalized_charc_id = 0
+    return normalized_code, normalized_field_path, normalized_charc_id
 
 
 def _is_same_issue_field(path_a: Optional[str], path_b: Optional[str]) -> bool:
@@ -1398,6 +1445,13 @@ async def sync_cards_from_wb(
         
         if card:
             # Update existing
+            if card.product_dna and should_refresh_product_dna(
+                card,
+                next_raw_data=card_data.get("raw_data"),
+                next_photos=card_data.get("photos"),
+                next_subject_name=card_data.get("subject_name"),
+            ):
+                card.product_dna = None
             for key, value in card_data.items():
                 setattr(card, key, value)
             card.updated_at = utc_now()
@@ -1487,8 +1541,12 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
             CardIssue.status.in_([IssueStatus.SKIPPED, IssueStatus.POSTPONED]),
         )
     )
-    skipped_map: dict[str, tuple] = {
-        i.code: (i.status, i.postpone_reason, i.postponed_until)
+    skipped_map: dict[tuple[str, str, int], tuple] = {
+        _issue_restore_key(i.code, i.field_path, i.charc_id): (
+            i.status,
+            i.postpone_reason,
+            i.postponed_until,
+        )
         for i in existing_skipped.scalars().all()
     }
 
@@ -1501,15 +1559,17 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     issues: List[CardIssue] = []
     raw_data = card.raw_data or {}
     ai_context = copy.deepcopy(raw_data) if isinstance(raw_data, dict) else {}
-    score_breakdown = {}  # No basic code analysis — AI handles everything
+    score_breakdown = {}
 
-    # ── STEP 0: Basic media validation ────────────────────────────────────
-    # We keep media quantity/video checks deterministic, so UI can surface
-    # them in a dedicated media flow while still treating 0-photo cards as critical.
+    # ── STEP 0: Deterministic basic validation (media + text) ────────────
+    # We keep the key structural checks deterministic so they always feed
+    # the same issue pipeline before the richer AI-assisted stages.
     basic_media_codes = {"no_photos", "few_photos", "add_more_photos", "no_video"}
+    basic_text_codes = _TITLE_CODES | _DESCRIPTION_CODES
+    basic_keep_codes = basic_media_codes | basic_text_codes
     for basic_issue in card_analyzer.analyze_card(card):
         code = str(basic_issue.get("code") or "").strip().lower()
-        if code not in basic_media_codes:
+        if code not in basic_keep_codes:
             continue
 
         severity = basic_issue.get("severity", IssueSeverity.WARNING)
@@ -2428,8 +2488,9 @@ async def analyze_card(db: AsyncSession, card: Card, use_ai: bool = True) -> tup
     # Persist final issue set (after collapse)
     for issue in issues:
         # Restore SKIPPED/POSTPONED status if this issue was previously skipped
-        if issue.code in skipped_map:
-            prev_status, prev_reason, prev_until = skipped_map[issue.code]
+        restore_key = _issue_restore_key(issue.code, issue.field_path, issue.charc_id)
+        if restore_key in skipped_map:
+            prev_status, prev_reason, prev_until = skipped_map[restore_key]
             issue.status = prev_status
             issue.postpone_reason = prev_reason
             issue.postponed_until = prev_until
@@ -2875,7 +2936,7 @@ async def analyze_store_cards(
     db: AsyncSession,
     store_id: int,
     use_ai: bool = True,
-    limit: Optional[int] = 10,  # Default 10 cards for testing
+    limit: Optional[int] = None,
 ) -> dict:
     """Analyze cards in a store. If limit is set, only analyze that many."""
     query = select(Card).where(Card.store_id == store_id)
@@ -2887,43 +2948,10 @@ async def analyze_store_cards(
     total = len(cards)
     analyzed = 0
     total_issues = 0
-    analyzed_ids = []
-    
     for card in cards:
         issues, _tokens = await analyze_card(db, card, use_ai=use_ai)
         analyzed += 1
         total_issues += len(issues)
-        analyzed_ids.append(card.id)
-    
-    # Reset stale counts for non-analyzed cards in this store
-    # (cards not in the batch may have outdated counts with no matching issues)
-    if limit and analyzed_ids:
-        await db.execute(
-            update(Card)
-            .where(
-                Card.store_id == store_id,
-                Card.id.notin_(analyzed_ids),
-            )
-            .values(
-                critical_issues_count=0,
-                warnings_count=0,
-                improvements_count=0,
-                growth_points_count=0,
-            )
-        )
-        # Also delete orphaned issues for non-analyzed cards
-        await db.execute(
-            delete(CardIssue)
-            .where(
-                CardIssue.card_id.in_(
-                    select(Card.id).where(
-                        Card.store_id == store_id,
-                        Card.id.notin_(analyzed_ids),
-                    )
-                )
-            )
-        )
-        await db.commit()
     
     return {
         "total": total,

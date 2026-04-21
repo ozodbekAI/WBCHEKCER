@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, List, Any
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # === Issue Schemas ===
@@ -79,8 +79,16 @@ class IssuesGrouped(BaseModel):
 
 class IssueFixRequest(BaseModel):
     """Request to fix an issue"""
-    fixed_value: str  # The value user chose
+    fixed_value: str = Field(min_length=1, max_length=5000)
     apply_to_wb: bool = True  # Whether to push to WB
+
+    @field_validator("fixed_value", mode="before")
+    @classmethod
+    def _normalize_fixed_value(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("fixed_value is required")
+        return text
 
 
 class IssueSkipRequest(BaseModel):

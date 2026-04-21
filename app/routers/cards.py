@@ -23,6 +23,7 @@ from ..services.card_service import (
     ensure_card_issue_consistency,
     build_description_editor_keywords,
     generate_card_description_suggestion,
+    should_refresh_product_dna,
 )
 from ..services.wb_token_access import ensure_store_feature_access, get_store_feature_api_key
 from ..services.approval_service import (
@@ -353,6 +354,8 @@ def _extract_wb_dimensions(raw_dimensions: Any) -> Dict[str, Any]:
 
 
 def _apply_wb_card_snapshot(card: Card, raw: Dict[str, Any]) -> None:
+    if card.product_dna and should_refresh_product_dna(card, next_raw_data=raw):
+        card.product_dna = None
     photos = _extract_wb_photo_urls(raw.get("photos"))
     videos = _extract_wb_video_urls(raw.get("videos"))
 
@@ -957,6 +960,7 @@ async def sync_card_photos_endpoint(
     else:
         card.photos = final_urls
         card.photos_count = len(final_urls)
+        card.product_dna = None
         raw_data = dict(card.raw_data or {})
         raw_data["photos"] = [{"big": url} for url in final_urls]
         card.raw_data = raw_data
