@@ -26,3 +26,26 @@ def test_map_photo_error_handles_image_size_task_error():
     )
     assert mapped["code"] == "photo_invalid_image_size"
     assert "1:1" in str(mapped["message"])
+
+
+def test_map_photo_error_exposes_gemini_http_details():
+    mapped = map_photo_error(
+        'Gemini error 500: {"error":{"message":"backend exploded"}}',
+        context="chat_stream:generation",
+    )
+    assert mapped["code"] == "photo_gemini_upstream_error"
+    assert mapped["provider"] == "gemini"
+    assert mapped["where"] == "chat_stream:generation:gemini_http"
+    assert mapped["debug"]["provider_status_code"] == 500
+    assert mapped["debug"]["reason"] == "http_error"
+
+
+def test_map_photo_error_exposes_block_reason_details():
+    mapped = map_photo_error(
+        "Gemini API javobni blokladi! Sabab (finishReason): SAFETY",
+        context="chat_stream:generation",
+    )
+    assert mapped["code"] == "photo_generation_blocked"
+    assert mapped["provider"] == "gemini"
+    assert mapped["debug"]["finish_reason"] == "SAFETY"
+    assert mapped["debug"]["where"] == "chat_stream:generation:gemini_finish_reason"

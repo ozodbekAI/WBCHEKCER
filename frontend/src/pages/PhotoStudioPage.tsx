@@ -307,6 +307,24 @@ function buildStreamMediaPhoto(event: any): PhotoMedia | null {
   };
 }
 
+function formatStreamErrorMessage(event: any): string {
+  const base = String(event?.message || event?.content || 'Произошла ошибка');
+  const where = String(event?.where || event?.error?.where || event?.error?.debug?.where || '').trim();
+  const provider = String(event?.provider || event?.error?.provider || event?.error?.debug?.provider || '').trim();
+  const reason = String(event?.reason || event?.error?.reason || event?.error?.debug?.reason || '').trim();
+  const rawExcerpt = String(event?.error?.debug?.raw_error_excerpt || '').trim();
+  const providerStatus = Number(event?.error?.debug?.provider_status_code || 0) || null;
+
+  const details: string[] = [];
+  if (where) details.push(`Этап: ${where}`);
+  if (provider) details.push(`Источник: ${provider}`);
+  if (providerStatus) details.push(`HTTP: ${providerStatus}`);
+  if (reason && reason !== 'unknown_error') details.push(`Причина: ${reason}`);
+  if (rawExcerpt && rawExcerpt !== base) details.push(`Деталь: ${rawExcerpt}`);
+
+  return details.length > 0 ? `${base} | ${details.join(' | ')}` : base;
+}
+
 function StreamActivityIndicator({ mode }: { mode: StreamIndicatorMode }) {
   return (
     <div className="ps-typing">
@@ -1148,7 +1166,7 @@ export default function PhotoStudioPage() {
                   addOrUpdateBot('text');
                 }
                 else if (d.type === 'error' || d.type === 'limit_reached') {
-                  botContent = d.message || d.content || 'Произошла ошибка';
+                  botContent = formatStreamErrorMessage(d);
                   addOrUpdateBot('action-error');
                   receivedComplete = true;
                 }
