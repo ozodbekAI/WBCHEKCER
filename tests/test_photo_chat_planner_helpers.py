@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from pathlib import Path
 import sys
 
@@ -12,7 +13,7 @@ if str(ROOT) not in sys.path:
 
 from app.controllers.photo_chat_controller import PhotoChatController
 from app.services.gemini_api import GeminiApiError, GeminiPart
-from app.services.photo_chat_agent import PhotoChatAgent, resolve_photo_chat_locale
+from app.services.photo_chat_agent import PhotoChatAgent, _normalize_planner_assets, resolve_photo_chat_locale
 
 
 def test_resolve_photo_chat_locale_prefers_thread_locale():
@@ -446,6 +447,151 @@ def test_planner_image_limit_uses_available_image_count_up_to_four():
         recent_image_bytes=[(1, b"a", "image/jpeg"), (2, b"b", "image/jpeg"), (3, b"c", "image/jpeg"), (4, b"d", "image/jpeg"), (5, b"e", "image/jpeg")],
         thread_context={},
     ) == 4
+
+
+def test_normalize_planner_assets_assigns_stable_image_labels():
+    compact = _normalize_planner_assets(
+        [
+            {"asset_id": 15, "seq": 1, "kind": "image", "source": "upload", "caption": "yellow suit"},
+            {"asset_id": 9, "seq": 2, "kind": "image", "source": "upload", "caption": "black dress"},
+            {"asset_id": 7, "seq": 3, "kind": "image", "source": "upload", "caption": "blue suit"},
+        ]
+    )
+
+    assert compact == [
+        {
+            "planner_label": "Image 1",
+            "attachment_index": 1,
+            "asset_id": 15,
+            "seq": 1,
+            "kind": "image",
+            "source": "upload",
+            "caption": "yellow suit",
+        },
+        {
+            "planner_label": "Image 2",
+            "attachment_index": 2,
+            "asset_id": 9,
+            "seq": 2,
+            "kind": "image",
+            "source": "upload",
+            "caption": "black dress",
+        },
+        {
+            "planner_label": "Image 3",
+            "attachment_index": 3,
+            "asset_id": 7,
+            "seq": 3,
+            "kind": "image",
+            "source": "upload",
+            "caption": "blue suit",
+        },
+    ]
+
+
+def test_plan_action_text_includes_ordered_assets_in_context(monkeypatch):
+    class _FakeApi:
+        def __init__(self):
+            self.contents = None
+
+        async def generate_content(self, *, model, contents, generation_config=None, service_tier=None, timeout_s=None, max_retries=None):
+            self.contents = contents
+            return {
+                "candidates": [{"content": {"parts": [{"text": "{}"}], "role": "model"}, "finishReason": "STOP", "index": 0}],
+                "usageMetadata": {},
+            }
+
+        @staticmethod
+        def extract_text_and_images(resp):
+            return json.dumps({"intent": "chat", "assistant_message": "ok"}), []
+
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_TEXT_MODEL", "gemini-3.1-pro-preview")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_TEXT_MODEL_FALLBACK", "gemini-3.1-flash-lite-preview")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_TEXT_SERVICE_TIER", "standard")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_TEXT_TIMEOUT_S", 15)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_TEXT_MAX_RETRIES", 0)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_TEXT_FALLBACK_MAX_RETRIES", 1)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_TEXT_THINKING_LEVEL", "low")
+
+    agent = PhotoChatAgent.__new__(PhotoChatAgent)
+    agent.api = _FakeApi()
+    agent._sem = asyncio.Semaphore(1)
+
+    result = asyncio.run(
+        agent.plan_action_text(
+            user_message="Put the girls from 2 and 3 in front of 1",
+            history=[{"role": "user", "text": "Put the girls from 2 and 3 in front of 1"}],
+            assets=[
+                {"asset_id": 15, "seq": 1, "kind": "image", "source": "upload", "caption": "yellow suit"},
+                {"asset_id": 9, "seq": 2, "kind": "image", "source": "upload", "caption": "black dress"},
+                {"asset_id": 7, "seq": 3, "kind": "image", "source": "upload", "caption": "blue suit"},
+            ],
+            thread_context={"working_asset_ids": [15, 9, 7]},
+            trace_id="planner-text-assets",
+        )
+    )
+
+    prompt_text = agent.api.contents[0]["parts"][0]["text"]
+    payload = json.loads(prompt_text.split("CONTEXT:\n", 1)[1])
+
+    assert result["intent"] == "chat"
+    assert payload["assets"][0]["planner_label"] == "Image 1"
+    assert payload["assets"][1]["planner_label"] == "Image 2"
+    assert payload["assets"][2]["planner_label"] == "Image 3"
+    assert payload["assets"][0]["asset_id"] == 15
+    assert payload["assets"][2]["asset_id"] == 7
+
+
+def test_plan_action_vision_labels_inline_images_using_asset_order(monkeypatch):
+    class _FakeApi:
+        def __init__(self):
+            self.contents = None
+
+        async def generate_content(self, *, model, contents, generation_config=None, service_tier=None, timeout_s=None, max_retries=None):
+            self.contents = contents
+            return {
+                "candidates": [{"content": {"parts": [{"text": "{}"}], "role": "model"}, "finishReason": "STOP", "index": 0}],
+                "usageMetadata": {},
+            }
+
+        @staticmethod
+        def extract_text_and_images(resp):
+            return json.dumps({"intent": "chat", "assistant_message": "ok"}), []
+
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_VISION_MODEL", "gemini-3.1-pro-preview")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_VISION_MODEL_FALLBACK", "gemini-3.1-flash-lite-preview")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_VISION_SERVICE_TIER", "standard")
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_VISION_TIMEOUT_S", 20)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_VISION_MAX_RETRIES", 0)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_VISION_FALLBACK_MAX_RETRIES", 1)
+    monkeypatch.setattr("app.services.photo_chat_agent.settings.GEMINI_VISION_THINKING_LEVEL", "low")
+
+    agent = PhotoChatAgent.__new__(PhotoChatAgent)
+    agent.api = _FakeApi()
+    agent._sem = asyncio.Semaphore(1)
+
+    result = asyncio.run(
+        agent.plan_action_vision(
+            user_message="Use images 2 and 3 in front of image 1",
+            history=[{"role": "user", "text": "Use images 2 and 3 in front of image 1"}],
+            assets=[
+                {"asset_id": 15, "seq": 1, "kind": "image", "source": "upload", "caption": "yellow suit"},
+                {"asset_id": 9, "seq": 2, "kind": "image", "source": "upload", "caption": "black dress"},
+                {"asset_id": 7, "seq": 3, "kind": "image", "source": "upload", "caption": "blue suit"},
+            ],
+            thread_context={"working_asset_ids": [15, 9, 7]},
+            recent_image_bytes=[(9, b"img-2", "image/jpeg"), (7, b"img-3", "image/jpeg")],
+            trace_id="planner-vision-assets",
+        )
+    )
+
+    parts = agent.api.contents[0]["parts"]
+    text_parts = [part["text"] for part in parts if "text" in part]
+
+    assert result["intent"] == "chat"
+    assert any("Image 2 is the next attached image" in text for text in text_parts)
+    assert any("Image 3 is the next attached image" in text for text in text_parts)
+    assert all("asset_id=" not in text for text in text_parts)
 
 
 def test_model_resolution_uses_profile_defaults_and_validates_requested_model(caplog):

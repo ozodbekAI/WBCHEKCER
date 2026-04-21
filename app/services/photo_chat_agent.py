@@ -241,6 +241,10 @@ def _ordered_unique_strings(values: List[Any]) -> List[str]:
     return ordered
 
 
+def _planner_image_label(index: int) -> str:
+    return f"Image {max(1, int(index))}"
+
+
 def _working_asset_count(
     assets: Optional[List[Dict[str, Any]]],
     recent_image_bytes: Optional[List[Tuple[int, bytes, str]]],
@@ -259,9 +263,11 @@ def _actual_model_from_response(resp: Dict[str, Any], fallback: str) -> str:
 
 def _normalize_planner_assets(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     compact: List[Dict[str, Any]] = []
-    for asset in assets:
+    for index, asset in enumerate(assets, 1):
         compact.append(
             {
+                "planner_label": _planner_image_label(index),
+                "attachment_index": index,
                 "asset_id": asset.get("asset_id"),
                 "seq": asset.get("seq"),
                 "kind": asset.get("kind"),
@@ -1110,11 +1116,17 @@ class PhotoChatAgent:
             "    locale\n"
             "  }\n"
             f"{modality_note}\n"
+            "Attachment mapping:\n"
+            "- assets are ordered. The first asset is 'Image 1', the second is 'Image 2', and so on.\n"
+            "- In vision mode, the inline image attachments follow the exact same 'Image N' order as the assets list.\n"
+            "- Users may refer to this order in any language, such as '1 rasm', '2 rasm', 'first image', or 'pervaya kartinka'. Resolve those references to the matching 'Image N' label by position.\n\n"
             "Planning rules:\n"
-            "- Ambiguous, underspecified, or conflicting requests must return intent='question'. Do not guess.\n"
+            "- Return intent='question' only when the requested transformation or target image cannot be determined from user_message, history, assets, and thread_context.\n"
             "- If pending_question is present, treat the user's latest message as a likely answer to that question.\n"
+            "- Short, informal, or ungrammatical phrasing can still be actionable if the requested edit is clear.\n"
             "- For follow-up edits like 'make it warmer', 'change the background', 'same but brighter', or 'use the last result', use thread_context to resolve the target image when it is clear.\n"
             "- If it is not clear which image to edit, return intent='question' and ask which image to use.\n"
+            "- If multiple attached images are supplied and the user describes how they should be combined, arranged, or transferred, treat it as intent='edit_image' when the referenced images are identifiable by order.\n"
             "- Use intent='edit_image' only when an existing image or images should be changed.\n"
             "- Use intent='generate_image' only for brand-new images or when the user explicitly wants a new generation.\n"
             "- Use intent='chat' for normal non-image conversation.\n"
@@ -1155,6 +1167,7 @@ class PhotoChatAgent:
         fallback_model = self._resolve_text_fallback_model(selected_model)
         allow_fallback = True if allow_quality_fallback is None else bool(allow_quality_fallback)
         history_compact = _normalize_planner_history(history, limit=6)
+        assets_compact = _normalize_planner_assets(assets)
         ctx = _normalize_thread_context_for_planner(thread_context)
         response_locale = resolve_photo_chat_locale(
             user_message=user_message,
@@ -1164,7 +1177,7 @@ class PhotoChatAgent:
         response_language = _language_label(response_locale)
         payload = {
             "history": history_compact,
-            "assets": [],
+            "assets": assets_compact,
             "thread_context": ctx,
             "user_message": user_message,
         }
@@ -1260,6 +1273,13 @@ class PhotoChatAgent:
             "thread_context": ctx,
             "user_message": user_message,
         }
+        asset_label_by_id: Dict[int, str] = {}
+        for asset in assets_compact:
+            try:
+                asset_id = int(asset.get("asset_id"))
+            except (TypeError, ValueError):
+                continue
+            asset_label_by_id[asset_id] = str(asset.get("planner_label") or "").strip() or _planner_image_label(len(asset_label_by_id) + 1)
         parts = [{
             "text": self._planner_instruction(
                 response_language=response_language,
@@ -1267,16 +1287,17 @@ class PhotoChatAgent:
                 use_vision=True,
             ) + "\n\nCONTEXT:\n" + json.dumps(payload, ensure_ascii=False)
         }]
-        for asset_id, img_bytes, mime_type in limited_images:
+        for index, (asset_id, img_bytes, mime_type) in enumerate(limited_images, 1):
             try:
                 safe_bytes, safe_mime = _ensure_reasonable_image_bytes(img_bytes)
+                planner_label = asset_label_by_id.get(int(asset_id)) or _planner_image_label(index)
+                parts.append({"text": f"{planner_label} is the next attached image. Keep this exact label for references."})
                 parts.append({
                     "inline_data": {
                         "mime_type": safe_mime if safe_mime.startswith("image/") else (mime_type or "image/jpeg"),
                         "data": b64encode_bytes(safe_bytes),
                     }
                 })
-                parts.append({"text": f"[This is asset_id={asset_id}]"})
             except Exception as exc:
                 logger.warning("[%s] plan_action_vision: failed to include image asset_id=%s: %s", trace_id, asset_id, exc)
 
